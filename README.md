@@ -2,9 +2,11 @@
 
 BiblioForge is a multi-format document text extraction and automatic organization tool with smart metadata parsing. It extracts text from various document formats (PDF, EPUB, DJVU, MOBI, HTML, etc.) and intelligently organizes them by author and title using AI-powered content analysis.
 
+Note: This is unfinished, unstable WORK IN PROGRESS. Use or adapt at your own risk.
+
 ## Features
 
-- Extract text from multiple document formats (PDF, EPUB, DJVU, MOBI, TXT, HTML)
+- Extract text from multiple document formats (PDF, EPUB, DJVU, MOBI, TXT, HTML, DOCX, etc)
 - Intelligently organize files based on content analysis
 - Multiple extraction methods for each format with smart fallbacks
 - OCR capabilities for scanned documents
