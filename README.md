@@ -35,6 +35,16 @@ pip install camelot-py opencv-python chardet ftfy lxml
 
 ### 2. System Dependencies
 
+For the very versatile Calibre ebook-converter:
+
+```bash
+$ python -m venv venv
+$ . venv/bin/activate
+(venv) $ git clone https://github.com/gryf/ebook-converter
+(venv) $ cd ebook-converter
+(venv) $ pip install -e .
+```
+
 #### macOS:
 
 ```bash
