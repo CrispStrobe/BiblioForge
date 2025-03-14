@@ -805,7 +805,22 @@ class ExtractionManager:
         '.md': 'Text',
         '.html': 'HTML',
         '.htm': 'HTML',
-        '.xhtml': 'HTML'
+        '.xhtml': 'HTML',
+        '.docx': 'Text',  # Use Text extractor but with Calibre as method
+        '.doc': 'Text',   # Use Text extractor but with Calibre as method
+        '.rtf': 'Text',   # Use Text extractor but with Calibre as method
+        '.fb2': 'Text',   # Use Text extractor but with Calibre as method
+        '.pdb': 'Text',   # Use Text extractor but with Calibre as method
+        '.lit': 'Text',   # Use Text extractor but with Calibre as method
+        '.odt': 'Text',   # Use Text extractor but with Calibre as method
+        '.lrf': 'Text',   # Use Text extractor but with Calibre as method
+        '.cbz': 'Text',   # Use Text extractor but with Calibre as method
+        '.cbr': 'Text',   # Use Text extractor but with Calibre as method
+        '.azw3': 'MOBI',  # Use MOBI extractor but with Calibre as method
+        '.azw4': 'MOBI',  # Use MOBI extractor but with Calibre as method
+        '.chm': 'Text',   # Use Text extractor but with Calibre as method
+        '.snb': 'Text',   # Use Text extractor but with Calibre as method
+        '.tcr': 'Text',   # Use Text extractor but with Calibre as method
     }
 
     def __init__(self, debug: bool = False):
@@ -850,7 +865,7 @@ class ExtractionManager:
             'gs': False,
             'djvutxt': False,  # For DJVU
             'ddjvu': False,    # For DJVU conversion
-            'ebook-convert': False  # For Calibre/MOBI
+            'ebook-converter': False  # For Calibre/MOBI
         }
         
         for binary in binaries:
@@ -927,6 +942,7 @@ class ExtractionManager:
         ocr_method: Optional[str] = None,
         password: Optional[str] = None,
         extract_tables: bool = False,
+        force_ocr: bool = False,
         sort: bool = False,     # with callback for sort processing
         llm_provider = None,      
         rename_script_path: Optional[str] = None,
@@ -975,8 +991,10 @@ class ExtractionManager:
                     # Only pass ocr_method to PDFExtractor
                     if ocr_method:
                         extraction_kwargs['ocr_method'] = ocr_method
+                    extraction_kwargs['force_ocr'] = force_ocr  # Add this line
                     if extract_tables:
                         extraction_kwargs['extract_tables'] = extract_tables
+                
                 
                 text = extractor.extract_text(
                     input_path,
@@ -1455,16 +1473,18 @@ class MOBIExtractor:
             self._available_methods = {
                 'mobi': self._import_cache.is_available('mobi'),
                 'kindleunpack': self._import_cache.is_available('kindleunpack'),
-                'calibre': self._check_calibre(),
+                'calibre': self._check_calibre_available(), 
                 'zipfile': True  # Basic fallback always available
             }
         return self._available_methods
 
-    def _check_calibre(self) -> bool:
-        """Check if calibre command line tools are available"""
+    def _check_calibre_available(self):
+        """Check if Calibre converter is available"""
         try:
-            import shutil
-            return shutil.which('ebook-convert') is not None
+            for bin_name in ['ebook-converter', 'ebook-convert']:
+                if shutil.which(bin_name):
+                    return True
+            return False
         except:
             return False
 
@@ -1655,40 +1675,66 @@ class MOBIExtractor:
             return ""
 
     def extract_with_calibre(self, mobi_path: str, progress_callback=None) -> str:
-        """Extract text using Calibre's ebook-convert tool"""
+        """Extract text using Calibre's ebook-converter"""
         try:
-            import tempfile
             import subprocess
-            import os
+            import tempfile
             
-            # Create a temporary file for the extracted text
+            # Check if ebook-converter or ebook-convert is available
+            calibre_bin = None
+            for bin_name in ['ebook-converter', 'ebook-convert']:
+                try:
+                    calibre_bin = shutil.which(bin_name)
+                    if calibre_bin:
+                        break
+                except:
+                    pass
+            
+            if not calibre_bin:
+                logging.debug("Calibre ebook-converter/ebook-convert not found")
+                return ""
+                
+            # Create temporary output file
             with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temp:
-                txt_path = temp.name
+                output_path = temp.name
+                
+            # Run Calibre to convert to text
+            cmd = [calibre_bin, mobi_path, output_path]
             
-            # Use ebook-convert to convert MOBI to TXT
-            cmd = ['ebook-convert', mobi_path, txt_path]
-            process = subprocess.run(cmd, capture_output=True, text=True)
+            logging.debug(f"Running Calibre command: {' '.join(cmd)}")
+            
+            process = subprocess.run(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                text=True,
+                check=False  # Don't raise exception on error
+            )
             
             if process.returncode != 0:
-                raise RuntimeError(f"ebook-convert failed: {process.stderr}")
-            
-            # Read the output file
-            with open(txt_path, 'r', encoding='utf-8', errors='replace') as f:
-                text = f.read()
-            
-            # Clean up temporary file
-            try:
-                os.unlink(txt_path)
-            except:
-                pass
-            
-            if progress_callback:
-                progress_callback(1)
+                logging.warning(f"Calibre conversion returned error: {process.stderr}")
                 
-            return text
-            
+            # Read the output file if it exists
+            if os.path.exists(output_path):
+                with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+                    
+                # Clean up temporary file
+                try:
+                    os.unlink(output_path)
+                except:
+                    pass
+                    
+                if progress_callback:
+                    progress_callback(1)
+                    
+                return text
+            else:
+                logging.warning(f"Calibre output file not created: {output_path}")
+                return ""
+                
         except Exception as e:
-            logging.debug(f"Calibre conversion failed: {e}")
+            logging.debug(f"Calibre extraction failed: {e}")
             return ""
 
     def extract_with_zipfile(self, mobi_path: str, progress_callback=None) -> str:
@@ -2061,10 +2107,23 @@ class TextExtractor:
         Returns:
             Extracted text
         """
-        methods = ['charset_detection', 'encoding_detection', 'direct']
+        # Determine if we should use Calibre based on file extension
+        file_ext = os.path.splitext(txt_path)[1].lower()
+        try_calibre_first = file_ext in ['.docx', '.doc', '.rtf', '.fb2', '.pdb', '.lit', 
+                                         '.odt', '.lrf', '.cbz', '.cbr', '.chm', '.snb', '.tcr']
         
-        # Reorder methods if preferred method is specified
-        if preferred_method and preferred_method in methods:
+        # Override preferred_method if file extension suggests Calibre
+        if try_calibre_first and not preferred_method:
+            preferred_method = 'calibre'
+        
+        # If user explicitly asks for calibre, use it
+        if preferred_method == 'calibre':
+            methods = ['calibre', 'charset_detection', 'encoding_detection', 'direct']
+        else:
+            methods = ['charset_detection', 'encoding_detection', 'direct', 'calibre']
+        
+        # Reorder methods if preferred method is specified (but not 'calibre', handled above)
+        if preferred_method and preferred_method != 'calibre':
             methods.insert(0, methods.pop(methods.index(preferred_method)))
 
         text = ""
@@ -2107,6 +2166,69 @@ class TextExtractor:
             return text
         except Exception as e:
             logging.debug(f"Direct text extraction failed: {e}")
+            return ""
+        
+    def extract_with_calibre(self, txt_path: str, progress_callback=None) -> str:
+        """Extract text using Calibre's ebook-converter"""
+        try:
+            import subprocess
+            import tempfile
+            
+            # Check if ebook-converter or ebook-convert is available
+            calibre_bin = None
+            for bin_name in ['ebook-converter', 'ebook-convert']:
+                try:
+                    calibre_bin = shutil.which(bin_name)
+                    if calibre_bin:
+                        break
+                except:
+                    pass
+            
+            if not calibre_bin:
+                logging.debug("Calibre ebook-converter/ebook-convert not found")
+                return ""
+                
+            # Create temporary output file
+            with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temp:
+                output_path = temp.name
+                
+            # Run Calibre to convert to text
+            cmd = [calibre_bin, txt_path, output_path]
+            
+            logging.debug(f"Running Calibre command: {' '.join(cmd)}")
+            
+            process = subprocess.run(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                text=True,
+                check=False  # Don't raise exception on error
+            )
+            
+            if process.returncode != 0:
+                logging.warning(f"Calibre conversion returned error: {process.stderr}")
+                
+            # Read the output file if it exists
+            if os.path.exists(output_path):
+                with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+                    
+                # Clean up temporary file
+                try:
+                    os.unlink(output_path)
+                except:
+                    pass
+                    
+                if progress_callback:
+                    progress_callback(1)
+                    
+                return text
+            else:
+                logging.warning(f"Calibre output file not created: {output_path}")
+                return ""
+                
+        except Exception as e:
+            logging.debug(f"Calibre extraction failed: {e}")
             return ""
 
     def extract_with_charset_detection(self, txt_path: str, progress_callback=None) -> str:
@@ -2175,12 +2297,23 @@ class HTMLExtractor:
         """Lazy load available methods"""
         if self._available_methods is None:
             self._available_methods = {
+                'calibre': self._check_calibre_available(),
                 'bs4': self._import_cache.is_available('bs4'),
                 'html2text': self._import_cache.is_available('html2text'),
                 'lxml': self._import_cache.is_available('lxml'),
                 'regex': True  # Basic regex is always available
             }
         return self._available_methods
+    
+    def check_calibre_available(self):
+        """Check if Calibre converter is available"""
+        try:
+            for bin_name in ['ebook-converter', 'ebook-convert']:
+                if shutil.which(bin_name):
+                    return True
+            return False
+        except:
+            return False
 
     def extract_text(self, html_path: str, preferred_method: Optional[str] = None,
                     progress_callback: Optional[Callable] = None, **kwargs) -> str:
@@ -2379,9 +2512,20 @@ class EPUBExtractor:
                 'ebooklib': self._import_cache.is_available('ebooklib'),
                 'bs4': self._import_cache.is_available('bs4'),
                 'html2text': self._import_cache.is_available('html2text'),
+                'calibre': self._check_calibre_available(),  
                 'zipfile': True  # Basic fallback always available
             }
         return self._available_methods
+    
+    def _check_calibre_available(self):
+        """Check if Calibre converter is available"""
+        try:
+            for bin_name in ['ebook-converter', 'ebook-convert']:
+                if shutil.which(bin_name):
+                    return True
+            return False
+        except:
+            return False
 
     def extract_text(self, epub_path: str, preferred_method: Optional[str] = None,
                     progress_callback: Optional[Callable] = None) -> str:
@@ -2396,7 +2540,7 @@ class EPUBExtractor:
         Returns:
             Extracted text
         """
-        methods = ['ebooklib', 'bs4', 'zipfile']
+        methods = ['ebooklib', 'bs4', 'calibre', 'zipfile']
         if preferred_method:
             if preferred_method not in methods:
                 raise ValueError(f"Invalid method: {preferred_method}")
@@ -2496,6 +2640,69 @@ class EPUBExtractor:
                 pbar.update(1)
         
         return '\n\n'.join(text_parts)
+    
+    def extract_with_calibre(self, epub_path: str, progress_callback=None) -> str:
+        """Extract text using Calibre's ebook-converter"""
+        try:
+            import subprocess
+            import tempfile
+            
+            # Check if ebook-converter or ebook-convert is available
+            calibre_bin = None
+            for bin_name in ['ebook-converter', 'ebook-convert']:
+                try:
+                    calibre_bin = shutil.which(bin_name)
+                    if calibre_bin:
+                        break
+                except:
+                    pass
+            
+            if not calibre_bin:
+                logging.debug("Calibre ebook-converter/ebook-convert not found")
+                return ""
+                
+            # Create temporary output file
+            with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temp:
+                output_path = temp.name
+                
+            # Run Calibre to convert to text
+            cmd = [calibre_bin, epub_path, output_path]
+            
+            logging.debug(f"Running Calibre command: {' '.join(cmd)}")
+            
+            process = subprocess.run(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                text=True,
+                check=False  # Don't raise exception on error
+            )
+            
+            if process.returncode != 0:
+                logging.warning(f"Calibre conversion returned error: {process.stderr}")
+                
+            # Read the output file if it exists
+            if os.path.exists(output_path):
+                with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+                    
+                # Clean up temporary file
+                try:
+                    os.unlink(output_path)
+                except:
+                    pass
+                    
+                if progress_callback:
+                    progress_callback(1)
+                    
+                return text
+            else:
+                logging.warning(f"Calibre output file not created: {output_path}")
+                return ""
+                
+        except Exception as e:
+            logging.debug(f"Calibre extraction failed: {e}")
+            return ""
 
     def extract_with_bs4(self, epub_path: str, progress_callback=None) -> str:
         """Extract using BeautifulSoup with zipfile and progress bars"""
@@ -2964,7 +3171,7 @@ class PDFExtractor:
         return self._available_methods
 
     def extract_text(self, pdf_path: str, preferred_method: Optional[str] = None,
-                ocr_method: Optional[str] = None,
+                ocr_method: Optional[str] = None, force_ocr: bool = False,
                 progress_callback: Optional[Callable] = None, **kwargs) -> str:
         """Extract text with optimized fallback methods"""
         if not os.path.exists(pdf_path):
@@ -2975,6 +3182,11 @@ class PDFExtractor:
         
         # Define OCR methods
         ocr_methods = ['tesseract', 'easyocr', 'paddleocr', 'doctr', 'kraken', 'kraken_cli']
+
+        # If force_ocr is True, skip non-OCR methods entirely
+        if force_ocr:
+            methods = []  # Skip standard extraction methods
+            logging.info("Force OCR enabled - using only OCR methods")
 
         # If a specific OCR method is provided, prioritize it
         if ocr_method and ocr_method != 'auto':
@@ -3045,10 +3257,14 @@ class PDFExtractor:
                     if progress_callback and current_method == method:
                         progress_callback(1, None)
 
-            # Only try OCR as a last resort
-            if not text_parts and self._might_need_ocr(pdf_path):
+            # Only try OCR as a last resort, or enforced
+            if force_ocr or (not text_parts and self._might_need_ocr(pdf_path)):
+        
                 if self._debug:
-                    logging.info("Initial extraction insufficient, trying OCR methods...")
+                    if force_ocr:
+                        logging.debug("Force OCR enabled - using OCR methods")
+                    else:
+                        logging.debug("Initial extraction insufficient, trying OCR methods...")
                 
                 for method in ocr_methods:
                     if method not in self._initialized_methods and not self._is_method_available(method):
@@ -3057,7 +3273,7 @@ class PDFExtractor:
                     try:
                         current_method = method
                         if self._debug:
-                            logging.info(f"Trying OCR with {method}...")
+                            logging.debug(f"Trying OCR with {method}...")
                         
                         if progress_callback:
                             progress_callback(0, method)
@@ -5525,6 +5741,7 @@ class DocumentProcessor:
                 ocr_method: Optional[str] = None,
                 password: Optional[str] = None,
                 extract_tables: bool = False,  
+                force_ocr: bool = False,
                 max_workers: int = None,
                 noskip: bool = False,
                 sort: bool = False,                
@@ -5569,6 +5786,7 @@ class DocumentProcessor:
                         ocr_method,  # note: we must be very specific about the correct position
                         password,    # because there are no named parameters for future executions!
                         extract_tables,
+                        force_ocr,
                         noskip,
                         sort,                     
                         rename_script_path,       
@@ -5908,6 +6126,7 @@ class DocumentProcessor:
                 ocr_method: Optional[str] = None,
                 password: Optional[str] = None,
                 extract_tables: bool = False,
+                force_ocr: bool = False,
                 noskip: bool = False,
                 sort: bool = False,
                 rename_script_path: str = None,
@@ -6041,7 +6260,7 @@ class DocumentProcessor:
                     
             # Extract text if we couldn't reuse existing
             if not reused_text:
-                logging.debug(f"Goint to extract {input_file} -> {output_path}")
+                logging.debug(f"Going to extract {input_file} -> {output_path}")
                     
                 text = self.manager.extract(
                     input_file,
@@ -6050,6 +6269,7 @@ class DocumentProcessor:
                     ocr_method=ocr_method,
                     password=password,
                     extract_tables=extract_tables,
+                    force_ocr=force_ocr, 
                     **kwargs
                 )
 
@@ -7424,6 +7644,12 @@ def main():
         help="Sort and rename files based on content analysis from LLM"
     )
 
+    parser.add_argument(
+        '--force-ocr',
+        action='store_true',
+        help="Force OCR processing even if text layer extraction would work"
+    )
+
     # arguments for renaming control
     parser.add_argument(
         '--execute-rename',
@@ -7763,6 +7989,7 @@ def main():
                 ocr_method=args.ocr_method,
                 password=args.password,
                 extract_tables=args.tables,
+                force_ocr=args.force_ocr,
                 max_workers=args.workers,
                 noskip=args.noskip,
                 sort=args.sort,
