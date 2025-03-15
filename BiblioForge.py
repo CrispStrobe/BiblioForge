@@ -1298,13 +1298,13 @@ class ExtractionManager:
                 extractor.set_password(password)
             
             # Log extraction details clearly
-            logging.info(f"Extracting text from: {input_path}")
+            logging.debug(f"Extracting text from: {input_path}")
             if method:
-                logging.info(f"Preferred method: {method}")
+                logging.debug(f"Preferred method: {method}")
             if ocr_method:
-                logging.info(f"OCR method: {ocr_method}")
+                logging.debug(f"OCR method: {ocr_method}")
             if force_ocr:
-                logging.info("Force OCR mode enabled")
+                logging.debug("Force OCR mode enabled")
                 
             # Create a progress bar with explicit total and careful setup
             pbar = tqdm(
@@ -1369,7 +1369,8 @@ class ExtractionManager:
             if not self._validate_text(text):
                 logging.warning("Extracted text may be of low quality")
             else:
-                logging.info(f"Successfully extracted text ({len(text)} characters)")
+                if self._debug:
+                    logging.info(f"Successfully extracted text ({len(text)} characters)")
             
             # Handle sorting if requested
             if sort and llm_provider and rename_script_path and text:
@@ -3841,23 +3842,29 @@ class PDFExtractor:
         
         # Log clearly which method we're prioritizing
         if preferred_method:
-            print(f"EXTRACT: Preferred extraction method: {preferred_method}")
+            if self._debug:
+                print(f"EXTRACT: Preferred extraction method: {preferred_method}")
         
         # Special case for calibre preference
         if preferred_method == 'calibre':
-            print("EXTRACT: Calibre specifically requested, checking availability")
+            if self._debug:
+                print("EXTRACT: Calibre specifically requested, checking availability")
             if self._check_calibre_available():
-                print("EXTRACT: Calibre is available, trying it directly")
+                if self._debug:
+                    print("EXTRACT: Calibre is available, trying it directly")
                 try:
                     # Try calibre method directly
                     text = self.extract_with_calibre(pdf_path, progress_callback)
                     if text and len(text.strip()) > 100:  # Meaningful content check
-                        print(f"EXTRACT: Calibre succeeded with {len(text)} characters - returning immediately")
+                        if self._debug:
+                            print(f"EXTRACT: Calibre succeeded with {len(text)} characters - returning immediately")
                         return text
                     else:
-                        print("EXTRACT: Calibre returned empty or too little text, trying fallbacks")
+                        if self._debug:
+                            print("EXTRACT: Calibre returned empty or too little text, trying fallbacks")
                 except Exception as e:
-                    print(f"EXTRACT: Calibre extraction failed with error: {e}")
+                    if self._debug:
+                        print(f"EXTRACT: Calibre extraction failed with error: {e}")
         
         # Start with core methods first, but respect preferred_method
         methods = list(self.CORE_METHODS)  # Make a copy
@@ -3873,29 +3880,35 @@ class PDFExtractor:
                 method_available = self._is_method_available(preferred_method)
                 
                 if method_available:
-                    print(f"EXTRACT: Method {preferred_method} is available")
+                    if self._debug:
+                        print(f"EXTRACT: Method {preferred_method} is available")
                     
                     # If it's a core method, prioritize in core methods
                     if preferred_method in self.CORE_METHODS:
                         if preferred_method in methods:
                             methods.remove(preferred_method)
                         methods.insert(0, preferred_method)
-                        print(f"EXTRACT: Prioritizing core method: {preferred_method}")
+                        if self._debug:
+                            print(f"EXTRACT: Prioritizing core method: {preferred_method}")
                     # If it's an OCR method, prioritize in OCR methods
                     elif preferred_method in self.OCR_METHODS:
                         if preferred_method in ocr_methods:
                             ocr_methods.remove(preferred_method)
                         ocr_methods.insert(0, preferred_method)
-                        print(f"EXTRACT: Prioritizing OCR method: {preferred_method}")
+                        if self._debug:
+                            print(f"EXTRACT: Prioritizing OCR method: {preferred_method}")
                     else:
-                        print(f"EXTRACT: Method '{preferred_method}' is not recognized")
+                        if self._debug:
+                            print(f"EXTRACT: Method '{preferred_method}' is not recognized")
                 else:
-                    print(f"EXTRACT: Method {preferred_method} is not available")
+                    if self._debug:
+                        print(f"EXTRACT: Method {preferred_method} is not available")
 
         # If force_ocr is True, skip non-OCR methods entirely
         if force_ocr:
             methods = []  # Skip standard extraction methods
-            print("EXTRACT: Force OCR enabled - using only OCR methods")
+            if self._debug:
+                print("EXTRACT: Force OCR enabled - using only OCR methods")
 
         # If a specific OCR method is provided, prioritize it
         if ocr_method and ocr_method != 'auto':
@@ -3908,16 +3921,20 @@ class PDFExtractor:
                     ocr_methods.remove(ocr_method)
                 # Add it to the front of OCR methods
                 ocr_methods.insert(0, ocr_method)
-                print(f"EXTRACT: Prioritizing OCR method: {ocr_method}")
+                if self._debug:
+                    print(f"EXTRACT: Prioritizing OCR method: {ocr_method}")
             else:
-                print(f"EXTRACT: OCR method {ocr_method} is not available")
+                if self._debug:
+                    print(f"EXTRACT: OCR method {ocr_method} is not available")
         
         # Log which methods we have initialized
-        print(f"EXTRACT: Initialized methods: {', '.join(sorted(self._initialized_methods))}")
+        if self._debug:
+            print(f"EXTRACT: Initialized methods: {', '.join(sorted(self._initialized_methods))}")
         
         # Log the methods we're going to try in order
-        print(f"EXTRACT: Will try these core methods: {', '.join(methods)}")
-        print(f"EXTRACT: Will try these OCR methods if needed: {', '.join(ocr_methods)}")
+        if self._debug:
+            print(f"EXTRACT: Will try these core methods: {', '.join(methods)}")
+            print(f"EXTRACT: Will try these OCR methods if needed: {', '.join(ocr_methods)}")
         
         text_parts = []
         current_method = None
@@ -3927,29 +3944,34 @@ class PDFExtractor:
             for method in methods:
                 # Skip calibre as we already tried it if it was preferred
                 if method == 'calibre' and preferred_method == 'calibre':
-                    print("EXTRACT: Skipping calibre as we already tried it")
+                    if self._debug:
+                        print("EXTRACT: Skipping calibre as we already tried it")
                     continue
                     
                 # Skip methods that aren't initialized
                 if method not in self._initialized_methods:
-                    print(f"EXTRACT: Skipping {method} - not initialized")
+                    if self._debug:
+                        print(f"EXTRACT: Skipping {method} - not initialized")
                     continue
                     
                 # Skip methods that don't have an implementation
                 if not hasattr(self, f'extract_with_{method}'):
-                    print(f"EXTRACT: Method {method} doesn't have an implementation - skipping")
+                    if self._debug:
+                        print(f"EXTRACT: Method {method} doesn't have an implementation - skipping")
                     continue
                     
                 try:
                     current_method = method
-                    print(f"EXTRACT: Trying extraction with {method}...")
+                    if self._debug:
+                        print(f"EXTRACT: Trying extraction with {method}...")
                     
                     # Signal start of extraction with this method
                     if progress_callback:
                         try:
                             progress_callback(0, method)
                         except Exception as e:
-                            print(f"EXTRACT: Progress callback error: {e}")
+                            if self._debug:
+                                print(f"EXTRACT: Progress callback error: {e}")
                     
                     extraction_func = getattr(self, f'extract_with_{method}')
                     
@@ -3960,10 +3982,12 @@ class PDFExtractor:
                             lambda n: progress_callback(n, method) if progress_callback else None
                         )
                     except KeyboardInterrupt:
-                        print("\nEXTRACT: Interrupted by user.")
+                        if self._debug:
+                            print("\nEXTRACT: Interrupted by user.")
                         raise
                     except Exception as extract_error:
-                        print(f"EXTRACT: Error during {method} extraction: {extract_error}")
+                        if self._debug:
+                            print(f"EXTRACT: Error during {method} extraction: {extract_error}")
                         # Try to ensure progress callback completion
                         if progress_callback:
                             try:
@@ -3975,12 +3999,15 @@ class PDFExtractor:
                     if text and text.strip():
                         text_parts.append(text.strip())
                         quality = self._assess_text_quality(text)
-                        print(f"EXTRACT: Text quality with {method}: {quality:.2f}")
+                        if self._debug:
+                            print(f"EXTRACT: Text quality with {method}: {quality:.2f}")
                         if quality > 0.7:  # Good enough quality
-                            print(f"EXTRACT: Got good quality text from {method}, stopping here")
+                            if self._debug:
+                                print(f"EXTRACT: Got good quality text from {method}, stopping here")
                             break
                     else:
-                        print(f"EXTRACT: No text extracted with {method}")
+                        if self._debug:
+                            print(f"EXTRACT: No text extracted with {method}")
                     
                 except KeyboardInterrupt:
                     raise
@@ -3997,34 +4024,40 @@ class PDFExtractor:
 
             # Only try OCR if we didn't get good quality text or force_ocr is enabled
             if force_ocr or (not text_parts and self._might_need_ocr(pdf_path)):
-                print(f"EXTRACT: {'Forcing OCR' if force_ocr else 'No good text extracted, trying OCR methods'}...")
+                if self._debug:
+                    print(f"EXTRACT: {'Forcing OCR' if force_ocr else 'No good text extracted, trying OCR methods'}...")
                 
                 for method in ocr_methods:
                     # Skip methods that are in the failed methods set
                     if method in self._ocr_failed_methods:
-                        print(f"EXTRACT: Skipping {method} - previously failed")
+                        if self._debug:
+                            print(f"EXTRACT: Skipping {method} - previously failed")
                         continue
                     
                     # Pre-check if method is initialized or can be initialized
                     if not self._init_ocr(method):
-                        print(f"EXTRACT: Skipping {method} - initialization failed")
+                        if self._debug:
+                            print(f"EXTRACT: Skipping {method} - initialization failed")
                         continue
                     
                     # Skip methods that don't have an implementation
                     if not hasattr(self, f'extract_with_{method}'):
-                        print(f"EXTRACT: Method {method} doesn't have an implementation - skipping")
+                        if self._debug:
+                            print(f"EXTRACT: Method {method} doesn't have an implementation - skipping")
                         continue
                     
                     try:
                         current_method = method
-                        print(f"EXTRACT: Trying OCR with {method}...")
+                        if self._debug:
+                            print(f"EXTRACT: Trying OCR with {method}...")
                         
                         # Signal start of extraction with this method
                         if progress_callback:
                             try:
                                 progress_callback(0, method)
                             except Exception as e:
-                                print(f"EXTRACT: Progress callback error: {e}")
+                                if self._debug:
+                                    print(f"EXTRACT: Progress callback error: {e}")
                         
                         # Verify tesseract is available if using tesseract
                         if method == 'tesseract':
@@ -4034,7 +4067,8 @@ class PDFExtractor:
                                 self._pytesseract is not None
                             )
                             if not tesseract_available:
-                                print("EXTRACT: Tesseract not properly available, skipping")
+                                if self._debug:
+                                    print("EXTRACT: Tesseract not properly available, skipping")
                                 self._ocr_failed_methods.add('tesseract')
                                 continue
                         
@@ -4063,7 +4097,8 @@ class PDFExtractor:
                         
                         if text and text.strip():
                             text_parts.append(text.strip())
-                            print(f"EXTRACT: Successfully extracted text using {method}")
+                            if self._debug:
+                                print(f"EXTRACT: Successfully extracted text using {method}")
                             break  # One successful OCR method is enough
                         else:
                             print(f"EXTRACT: No text extracted with {method}")
@@ -4093,7 +4128,8 @@ class PDFExtractor:
             return ""
         else:
             total_chars = sum(len(part) for part in text_parts)
-            print(f"EXTRACT: Successfully extracted {total_chars} characters using {current_method}")
+            if self._debug:
+                print(f"EXTRACT: Successfully extracted {total_chars} characters using {current_method}")
 
         return "\n\n".join(text_parts).strip()
 
@@ -4288,7 +4324,8 @@ class PDFExtractor:
         import os
         import shutil
         
-        print("CALIBRE: Starting extraction")
+        if self._debug:
+            print("CALIBRE: Starting extraction")
         
         # Find calibre binary
         calibre_bin = None
@@ -4297,7 +4334,8 @@ class PDFExtractor:
         if hasattr(self, '_binary_paths') and self._binary_paths:
             calibre_bin = self._binary_paths.get('ebook-converter')
             if calibre_bin:
-                print(f"CALIBRE: Using binary from _binary_paths: {calibre_bin}")
+                if self._debug:
+                    print(f"CALIBRE: Using binary from _binary_paths: {calibre_bin}")
         
         # Check PATH
         if not calibre_bin:
@@ -4305,11 +4343,13 @@ class PDFExtractor:
                 path = shutil.which(binary_name)
                 if path:
                     calibre_bin = path
-                    print(f"CALIBRE: Found in PATH: {calibre_bin}")
+                    if self._debug:
+                        print(f"CALIBRE: Found in PATH: {calibre_bin}")
                     break
         
         if not calibre_bin:
-            print("CALIBRE: Binary not found!")
+            if self._debug:
+                print("CALIBRE: Binary not found!")
             return ""
         
         # Create temporary output file
@@ -4318,7 +4358,8 @@ class PDFExtractor:
             with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as tmp:
                 temp_output = tmp.name
         
-            print(f"CALIBRE: Running command: {calibre_bin} {pdf_path} {temp_output}")
+            if self._debug:
+                print(f"CALIBRE: Running command: {calibre_bin} {pdf_path} {temp_output}")
             
             # Use the tracked process function instead of subprocess.run
             result = run_process(
@@ -4331,14 +4372,16 @@ class PDFExtractor:
             # Check result
             if result.returncode != 0:
                 print(f"CALIBRE ERROR: Command failed with code {result.returncode}")
-                print(f"CALIBRE STDERR: {result.stderr}")
+                if self._debug:
+                    print(f"CALIBRE STDERR: {result.stderr}")
                 return ""
             
             # Read output file
             if os.path.exists(temp_output):
                 with open(temp_output, 'r', encoding='utf-8', errors='replace') as f:
                     text = f.read()
-                    print(f"CALIBRE: Successfully extracted {len(text)} characters")
+                    if self._debug:
+                        print(f"CALIBRE: Successfully extracted {len(text)} characters")
                     return text
             else:
                 print(f"CALIBRE ERROR: Output file not created: {temp_output}")
@@ -8889,7 +8932,7 @@ def main():
                     try:
                         from openai import OpenAI
                         OpenAI(base_url="http://localhost:11434/v1/", api_key="ollama")
-                        logging.info("OpenAI client for Ollama is available")
+                        logging.debug("OpenAI client for Ollama is available")
                     except ImportError:
                         logging.error("OpenAI client not available. Install with 'pip install openai'")
                         logging.error("Proceeding without sorting functionality")
