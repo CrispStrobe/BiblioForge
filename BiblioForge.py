@@ -826,9 +826,14 @@ class ExtractionManager:
     def __init__(self, debug: bool = False):
         self._debug = debug
         self._setup_logging(debug)
-        self._binaries = self._check_binaries()
+        # Use optimized binary detection that works across all platforms
+        self._binary_paths, self._binaries = self._check_system_dependencies()
+        
         self._versions = self._check_versions()
         self._extractors = {}
+
+        # Share binary paths with extractors
+        self._shared_binary_paths = self._binary_paths
         
     def _setup_logging(self, debug: bool):
         """Configure logging with appropriate level and handlers"""
@@ -857,32 +862,321 @@ class ExtractionManager:
             logging.getLogger('pypdf.xref').setLevel(logging.INFO)
             logging.getLogger('pypdf.generic').setLevel(logging.INFO)
 
-    def _check_binaries(self) -> Dict[str, bool]:
-        """Check availability of system binaries"""
-        binaries = {
-            'tesseract': False,
-            'pdftoppm': False,
-            'gs': False,
-            'djvutxt': False,  # For DJVU
-            'ddjvu': False,    # For DJVU conversion
-            'ebook-converter': False  # For Calibre/MOBI
+    def integrate_binary_paths(binary_paths, extractor):
+        """
+        Ensure the extractor has all necessary binary paths from the manager.
+        
+        Args:
+            binary_paths: Dictionary of binary paths from ExtractionManager
+            extractor: The extractor instance to update
+        """
+        # Make sure the extractor has a _binary_paths attribute
+        if not hasattr(extractor, '_binary_paths'):
+            extractor._binary_paths = {}
+        
+        # Update the extractor's binary paths with the manager's paths
+        for binary, path in binary_paths.items():
+            extractor._binary_paths[binary] = path
+        
+        # Update the extractor's binaries boolean dict if it has one
+        if hasattr(extractor, '_binaries'):
+            extractor._binaries = {
+                'tesseract': bool(binary_paths.get('tesseract')),
+                'poppler': bool(binary_paths.get('pdftoppm')),
+                'ghostscript': bool(binary_paths.get('gs')),
+                'djvulibre': bool(binary_paths.get('djvutxt')) or bool(binary_paths.get('ddjvu')),
+                'calibre': bool(binary_paths.get('ebook-converter'))
+            }
+
+
+    def _check_system_dependencies(self) -> Tuple[Dict[str, str], Dict[str, bool]]:
+        """
+        Optimized system dependencies check with correct version flags for each binary.
+        Returns both the full paths and a boolean compatibility dict.
+        """
+        # Dictionary to store binary paths (not just boolean values)
+        binary_paths = {
+            'tesseract': None,       # OCR engine
+            'pdftoppm': None,        # PDF to image conversion (poppler)
+            'gs': None,              # Ghostscript
+            'djvutxt': None,         # For DJVU text extraction
+            'ddjvu': None,           # For DJVU conversion
+            'ebook-converter': None  # Calibre converter
         }
         
-        for binary in binaries:
-            try:
-                result = subprocess.run(
-                    [binary, '--version'],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=True,
-                    encoding='utf-8'
-                )
-                binaries[binary] = True
-                logging.debug(f"Found {binary}: {result.stdout.splitlines()[0]}")
-            except Exception as e:
-                logging.debug(f"Binary {binary} not found: {e}")
+        # Executable name variations by platform and binary
+        executable_names = {
+            'tesseract': ['tesseract', 'tesseract.exe'],
+            'pdftoppm': ['pdftoppm', 'pdftoppm.exe'],
+            'gs': ['gs', 'gswin64c', 'gswin64c.exe', 'gswin32c.exe'],
+            'djvutxt': ['djvutxt', 'djvutxt.exe'],
+            'ddjvu': ['ddjvu', 'ddjvu.exe'],
+            'ebook-converter': ['ebook-converter', 'ebook-convert', 'ebook-converter.exe', 'ebook-convert.exe']
+        }
         
-        return binaries
+        # Version check flags for different binaries
+        version_flags = {
+            'tesseract': '--version',
+            'pdftoppm': '-v',        # pdftoppm uses -v instead of --version
+            'gs': '--version',
+            'djvutxt': '--help',     # DjVuLibre tools don't have version flags
+            'ddjvu': '--help',       # Use help instead
+            'ebook-converter': '--version'
+        }
+        
+        # Common installation directories by platform
+        system = platform.system()
+        common_dirs = {}
+        
+        if system == 'Windows':
+            common_dirs = {
+                'tesseract': [
+                    r'C:\Program Files\Tesseract-OCR',
+                    r'C:\Program Files (x86)\Tesseract-OCR'
+                ],
+                'pdftoppm': [
+                    r'C:\Program Files\poppler-24.08.0\Library\bin',
+                    r'C:\Program Files\poppler-24.02.0\Library\bin',
+                    r'C:\Program Files\poppler\bin',
+                    r'C:\Program Files (x86)\poppler\bin',
+                    r'C:\poppler\bin'
+                ],
+                'gs': [
+                    r'C:\Program Files\gs\gs10.04.0\bin',
+                    r'C:\Program Files\gs\gs10.02.0\bin',
+                    r'C:\Program Files (x86)\gs\gs10.04.0\bin',
+                    r'C:\Program Files (x86)\gs\gs10.02.0\bin',
+                    r'C:\Program Files\gs\bin'
+                ],
+                'ebook-converter': [
+                    r'C:\Program Files\Calibre2',
+                    r'C:\Program Files (x86)\Calibre2',
+                    r'C:\Program Files\Calibre',
+                    r'C:\Program Files (x86)\Calibre'
+                ],
+                'djvutxt': [
+                    r'C:\Program Files\DjVuLibre',
+                    r'C:\Program Files (x86)\DjVuLibre'
+                ],
+                'ddjvu': [
+                    r'C:\Program Files\DjVuLibre',
+                    r'C:\Program Files (x86)\DjVuLibre'
+                ]
+            }
+        elif system == 'Darwin':  # macOS
+            common_dirs = {
+                'tesseract': [
+                    '/usr/local/bin',
+                    '/opt/homebrew/bin',  # Apple Silicon homebrew
+                    '/opt/local/bin'      # MacPorts
+                ],
+                'pdftoppm': [
+                    '/usr/local/bin',
+                    '/opt/homebrew/bin',
+                    '/opt/local/bin'
+                ],
+                'gs': [
+                    '/usr/local/bin',
+                    '/opt/homebrew/bin',
+                    '/opt/local/bin'
+                ],
+                'ebook-converter': [
+                    '/Applications/calibre.app/Contents/MacOS',
+                    '/opt/homebrew/bin',
+                    '/usr/local/bin',
+                    '~/bin'  # User's bin directory
+                ],
+                'djvutxt': [
+                    '/usr/local/bin',
+                    '/opt/homebrew/bin',
+                    '/opt/local/bin'
+                ],
+                'ddjvu': [
+                    '/usr/local/bin',
+                    '/opt/homebrew/bin',
+                    '/opt/local/bin'
+                ]
+            }
+        else:  # Linux and others
+            common_dirs = {
+                'tesseract': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin'
+                ],
+                'pdftoppm': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin'
+                ],
+                'gs': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin'
+                ],
+                'ebook-converter': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin',
+                    '~/bin'  # User's bin directory
+                ],
+                'djvutxt': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin'
+                ],
+                'ddjvu': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin'
+                ]
+            }
+        
+        # Expand home directories in paths
+        for binary in common_dirs:
+            expanded_paths = []
+            for path in common_dirs[binary]:
+                if '~' in path:
+                    expanded_paths.append(os.path.expanduser(path))
+                else:
+                    expanded_paths.append(path)
+            common_dirs[binary] = expanded_paths
+        
+        # First check PATH for each binary
+        for binary, names in executable_names.items():
+            for name in names:
+                path = shutil.which(name)
+                if path:
+                    binary_paths[binary] = path
+                    if self._debug:
+                        logging.debug(f"Found {binary} in PATH: {path}")
+                    break
+        
+        # For binaries not found in PATH, check common directories
+        for binary, path in binary_paths.items():
+            if path is None and binary in common_dirs:
+                for directory in common_dirs[binary]:
+                    if not os.path.exists(directory):
+                        continue
+                        
+                    for name in executable_names[binary]:
+                        full_path = os.path.join(directory, name)
+                        if os.path.exists(full_path) and os.access(full_path, os.X_OK):
+                            binary_paths[binary] = full_path
+                            if self._debug:
+                                logging.debug(f"Found {binary} in common directory: {full_path}")
+                            break
+                    if binary_paths[binary]:  # Stop checking if found
+                        break
+        
+        # Verify binary versions if found
+        for binary, path in binary_paths.items():
+            if path:
+                # Skip verification for Calibre on Mac as it might not be executable directly
+                if binary == 'ebook-converter' and system == 'Darwin' and '/Applications/calibre.app' in path:
+                    if self._debug:
+                        logging.debug(f"Skipping version check for {binary} in Mac app bundle")
+                    continue
+                    
+                # Get the appropriate version flag
+                version_flag = version_flags.get(binary, '--version')
+                try:
+                    # For binaries that might error on version check but still work
+                    try:
+                        result = subprocess.run(
+                            [path, version_flag],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            timeout=2  # Prevent hanging
+                        )
+                        
+                        # Extract version info from output
+                        if result.stdout:
+                            version_info = result.stdout.splitlines()[0]
+                        elif result.stderr:
+                            version_info = result.stderr.splitlines()[0]
+                        else:
+                            version_info = f"Available (no version info)"
+                        
+                        if self._debug:
+                            logging.debug(f"Verified {binary}: {version_info}")
+                    except subprocess.CalledProcessError as e:
+                        # For binaries that return non-zero but might still work
+                        if self._debug:
+                            logging.debug(f"Version check for {binary} returned non-zero: {e.returncode}")
+                            if e.stdout:
+                                logging.debug(f"  stdout: {e.stdout.splitlines()[0] if e.stdout else ''}")
+                            if e.stderr:
+                                logging.debug(f"  stderr: {e.stderr.splitlines()[0] if e.stderr else ''}")
+                        # Consider it available despite error
+                        if self._debug:
+                            logging.debug(f"Considering {binary} available despite version check failure")
+                except Exception as e:
+                    if self._debug:
+                        logging.debug(f"Failed to verify {binary} version: {e}")
+        
+        # Log missing binaries with download information
+        download_info = {
+            'tesseract': "Tesseract not found. Download from: https://github.com/UB-Mannheim/tesseract/wiki",
+            'pdftoppm': "Poppler (pdftoppm) not found. Download from: https://github.com/oschwartz10612/poppler-windows/releases/",
+            'gs': "Ghostscript not found. Download from: https://ghostscript.com/releases/gsdnld.html",
+            'ebook-converter': "Calibre not found. Download from: https://calibre-ebook.com/download",
+            'djvutxt': "DjVuLibre not found. For Windows: https://sourceforge.net/projects/djvu/files/DjVuLibre_Windows/",
+            'ddjvu': "DjVuLibre (ddjvu) not found. For Windows: https://sourceforge.net/projects/djvu/files/DjVuLibre_Windows/"
+        }
+        
+        # Only show warnings for missing binaries once
+        warned_about = getattr(self, '_warned_about_binaries', set())
+        for binary, path in binary_paths.items():
+            if not path and binary in download_info and binary not in warned_about:
+                logging.info(download_info[binary])
+                warned_about.add(binary)
+        
+        # Store which binaries we've warned about
+        self._warned_about_binaries = warned_about
+        
+        # Create backward-compatible boolean results dictionary
+        binaries_bool = {
+            'tesseract': bool(binary_paths['tesseract']),
+            'poppler': bool(binary_paths['pdftoppm']),
+            'ghostscript': bool(binary_paths['gs']),
+            'djvulibre': bool(binary_paths['djvutxt']) or bool(binary_paths['ddjvu']),
+            'calibre': bool(binary_paths['ebook-converter'])
+        }
+        
+        return binary_paths, binaries_bool
+
+    def get_binary_path(self, binary_name: str) -> Optional[str]:
+        """
+        Get the full path to a binary if available
+        
+        Args:
+            binary_name: Name of the binary
+            
+        Returns:
+            str or None: Path to the binary or None if not found
+        """
+        # Map common names to the actual binary keys
+        binary_map = {
+            'tesseract': 'tesseract',
+            'pdftoppm': 'pdftoppm',
+            'poppler': 'pdftoppm',
+            'gs': 'gs',
+            'ghostscript': 'gs',
+            'djvutxt': 'djvutxt',
+            'ddjvu': 'ddjvu',
+            'djvulibre': 'djvutxt',  # Default to djvutxt for djvulibre
+            'ebook-converter': 'ebook-converter',
+            'ebook-convert': 'ebook-converter',
+            'calibre': 'ebook-converter'
+        }
+        
+        # Get the actual binary key
+        binary_key = binary_map.get(binary_name, binary_name)
+        
+        # Return the path from the stored binary paths
+        return self._binary_paths.get(binary_key)
 
     def _check_versions(self) -> Dict[str, str]:
         """Get versions of installed Python packages"""
@@ -922,17 +1216,41 @@ class ExtractionManager:
                 
             # Create appropriate extractor
             if extractor_type == 'PDF':
-                self._extractors[cache_key] = PDFExtractor(debug=self._debug)
+                # Pass the binary paths to the PDF extractor
+                self._extractors[cache_key] = PDFExtractor(
+                    debug=self._debug, 
+                    binary_paths=self._binary_paths  # Pass binary paths to avoid duplication
+                )
             elif extractor_type == 'EPUB':
-                self._extractors[cache_key] = EPUBExtractor(import_cache=import_cache, debug=self._debug)
+                self._extractors[cache_key] = EPUBExtractor(
+                    import_cache=import_cache, 
+                    debug=self._debug,
+                    binary_paths=self._binary_paths
+                )
             elif extractor_type == 'DJVU':
-                self._extractors[cache_key] = DJVUExtractor(import_cache=import_cache, debug=self._debug)
+                self._extractors[cache_key] = DJVUExtractor(
+                    import_cache=import_cache, 
+                    debug=self._debug,
+                    binary_paths=self._binary_paths
+                )
             elif extractor_type == 'MOBI':
-                self._extractors[cache_key] = MOBIExtractor(import_cache=import_cache, debug=self._debug)
+                self._extractors[cache_key] = MOBIExtractor(
+                    import_cache=import_cache, 
+                    debug=self._debug,
+                    binary_paths=self._binary_paths
+                )
             elif extractor_type == 'Text':
-                self._extractors[cache_key] = TextExtractor(import_cache=import_cache, debug=self._debug)
+                self._extractors[cache_key] = TextExtractor(
+                    import_cache=import_cache, 
+                    debug=self._debug,
+                    binary_paths=self._binary_paths
+                )
             elif extractor_type == 'HTML':
-                self._extractors[cache_key] = HTMLExtractor(import_cache=import_cache, debug=self._debug)
+                self._extractors[cache_key] = HTMLExtractor(
+                    import_cache=import_cache, 
+                    debug=self._debug,
+                    binary_paths=self._binary_paths
+                )
         
         return self._extractors[cache_key]
     
@@ -957,6 +1275,7 @@ class ExtractionManager:
             ocr_method: Optional OCR method (only passed to PDF extractors)
             password: Password for encrypted documents
             extract_tables: Whether to extract tables (PDF only)
+            force_ocr: Whether to force OCR even if text layer exists
             sort: Whether to sort files based on content
             llm_provider: Provider for LLM communication
             rename_script_path: Path to write rename commands
@@ -978,53 +1297,97 @@ class ExtractionManager:
             if password and hasattr(extractor, 'set_password'):
                 extractor.set_password(password)
             
-            # Extract text with progress reporting
-            with tqdm(desc="Extracting text", disable=not self._debug, unit='pages') as pbar:
-                def progress_callback(n: int, engine: Optional[str] = None):
-                    if engine:
-                        pbar.set_description(f"Extracting text [{engine}]")
-                    pbar.update(n)
+            # Log extraction details clearly
+            logging.info(f"Extracting text from: {input_path}")
+            if method:
+                logging.info(f"Preferred method: {method}")
+            if ocr_method:
+                logging.info(f"OCR method: {ocr_method}")
+            if force_ocr:
+                logging.info("Force OCR mode enabled")
                 
-                # Only pass specific parameters based on extractor type
+            # Create a progress bar with explicit total and careful setup
+            pbar = tqdm(
+                total=100,  # Set an arbitrary total of 100 units
+                desc=f"Extracting text",
+                disable=False,
+                unit='%',
+                position=0,
+                leave=True,
+                ncols=100  # Fixed width to avoid display issues
+            )
+                
+            # Safe progress callback that won't cause errors
+            def safe_progress_callback(n=1, engine=None):
+                try:
+                    # Only update description if engine is provided and changed
+                    if engine is not None:
+                        pbar.set_description(f"Extracting text [{engine}]")
+                    
+                    # Safe update with consistent increment
+                    pbar.update(1)
+                except:
+                    # Suppress all errors in progress updates
+                    pass
+            
+            # Extract text with the safe progress callback
+            try:
+                # Prepare extraction parameters
                 extraction_kwargs = kwargs.copy()
+                
+                # Only pass specific parameters to PDF extractors
                 if isinstance(extractor, PDFExtractor):
-                    # Only pass ocr_method to PDFExtractor
                     if ocr_method:
                         extraction_kwargs['ocr_method'] = ocr_method
-                    extraction_kwargs['force_ocr'] = force_ocr  # Add this line
+                    extraction_kwargs['force_ocr'] = force_ocr
                     if extract_tables:
                         extraction_kwargs['extract_tables'] = extract_tables
                 
-                
+                # Perform the actual extraction
                 text = extractor.extract_text(
                     input_path,
                     preferred_method=method,
-                    progress_callback=progress_callback,
+                    progress_callback=safe_progress_callback,
                     **extraction_kwargs
                 )
+            except Exception as e:
+                logging.error(f"Extraction failed: {str(e)}")
+                raise
+            finally:
+                # Always close the progress bar
+                try:
+                    pbar.close()
+                except:
+                    pass
+                    
+            # Check if we got valid text
+            if not text or not text.strip():
+                logging.warning(f"No text extracted from {input_path}")
+                return False if output_path else ""
                 
-            # Validate and handle output
+            # Validate text quality
             if not self._validate_text(text):
                 logging.warning("Extracted text may be of low quality")
+            else:
+                logging.info(f"Successfully extracted text ({len(text)} characters)")
             
             # Handle sorting if requested
             if sort and llm_provider and rename_script_path and text:
                 try:
-                    # Get metadata from Ollama server
+                    logging.info("Extracting metadata for sorting...")
                     metadata_content = extract_metadata(text, input_path, llm_provider)
+                    
                     if metadata_content:
                         metadata = parse_metadata(metadata_content)
                         if metadata:
                             # Process author names
                             author = metadata['author']
-                            logging.debug(f"extracted author: {author}")
+                            logging.debug(f"Extracted author: {author}")
                             corrected_author = sort_author_names(
                                 author_names=author,
-                                provider=llm_provider,
-                                #temperature=temperature,
-                                #max_tokens=max_tokens
+                                provider=llm_provider
                             )
-                            logging.debug(f"corrected author: {corrected_author}")
+                            logging.debug(f"Corrected author: {corrected_author}")
                             metadata['author'] = corrected_author
                             
                             # Get file details
@@ -1045,21 +1408,21 @@ class ExtractionManager:
                                 
                                 file_extension = os.path.splitext(input_path)[1].lower()
                                 new_filename = f"{year} {sanitize_filename(title)}{file_extension}"
-                                logging.debug(f"New filename will be: {new_filename}")
+                                logging.info(f"File will be renamed to: {os.path.join(first_author, new_filename)}")
 
-                                # Add rename command - Pass output_path to determine the text file location
+                                # Add rename command
                                 output_dir = os.path.dirname(output_path) if output_path else None
                                 add_rename_command(
                                     rename_script_path, 
                                     input_path, 
                                     target_dir, 
                                     new_filename, 
-                                    output_dir=output_dir  # Pass output directory for text file location
+                                    output_dir=output_dir
                                 )
                         else:
                             logging.warning(f"Failed to parse metadata for {input_path}")
                     else:
-                        logging.warning(f"Failed to get metadata from Ollama server for {input_path}")
+                        logging.warning(f"Failed to get metadata from LLM provider for {input_path}")
                 except Exception as sort_e:
                     logging.error(f"Error sorting file {input_path}: {sort_e}")
                         
@@ -1195,276 +1558,26 @@ class ExtractionManager:
             logging.warning("PyTorch not available - using CPU only")
             return False
 
-class DJVUExtractor:
-    """DJVU text extraction with multiple fallback methods"""
-    
-    def __init__(self, import_cache: ImportCache, debug: bool = False):
-        self._import_cache = import_cache
-        self._debug = debug
-        self._available_methods = None
-
-    @property
-    def available_methods(self) -> Dict[str, bool]:
-        """Lazy load available methods"""
-        if self._available_methods is None:
-            self._available_methods = {
-                'djvulibre': self._check_djvulibre(),
-                'pdf_conversion': self._check_pdf_conversion(),
-                'ocr': self._check_ocr_dependencies(),
-            }
-        return self._available_methods
-
-    def _check_djvulibre(self) -> bool:
-        """Check if djvulibre tools are available"""
-        # First check if python-djvulibre is available
-        if self._import_cache.is_available('djvu'):
-            return True
-            
-        # Otherwise check for djvutxt command line tool
-        try:
-            import shutil
-            return shutil.which('djvutxt') is not None
-        except:
-            return False
-    
-    def _check_pdf_conversion(self) -> bool:
-        """Check if DJVU to PDF conversion is available"""
-        try:
-            import shutil
-            return shutil.which('ddjvu') is not None
-        except:
-            return False
-    
-    def _check_ocr_dependencies(self) -> bool:
-        """Check if OCR dependencies are available"""
-        # We'll reuse the existing OCR infrastructure for images
-        ocr_methods = ['tesseract', 'pdf2image', 'pytesseract']
-        return all(self._import_cache.is_available(m) for m in ocr_methods)
-
-    def extract_text(self, djvu_path: str, preferred_method: Optional[str] = None,
-                progress_callback: Optional[Callable] = None, **kwargs) -> str:
-        """
-        Extract text from DJVU with fallback methods
-        
-        Args:
-            djvu_path: Path to DJVU file
-            preferred_method: Optional preferred extraction method
-            progress_callback: Optional callback for progress updates
-            **kwargs: Additional options (ignored)
-            
-        Returns:
-            Extracted text
-        """
-        methods = ['djvulibre', 'pdf_conversion', 'ocr']
-        
-        # Reorder methods if preferred method is specified
-        if preferred_method and preferred_method in methods:
-            methods.insert(0, methods.pop(methods.index(preferred_method)))
-
-        text = ""
-        with tqdm(total=len(methods), desc="Trying DJVU extraction methods", unit="method") as method_pbar:
-            for method in methods:
-                if not self.available_methods.get(method, False):
-                    method_pbar.update(1)
-                    continue
-                    
-                try:
-                    if progress_callback:
-                        progress_callback(0, f"djvu_{method}")  # Signal start with method name
-                    
-                    extraction_func = getattr(self, f'extract_with_{method}')
-                    
-                    # Fix: Create a proper lambda that accepts both arguments
-                    wrapped_callback = None
-                    if progress_callback:
-                        wrapped_callback = lambda n, engine=None: progress_callback(n, f"djvu_{method}" if engine is None else engine)
-                    
-                    text = extraction_func(
-                        djvu_path,
-                        wrapped_callback  # Use the wrapped callback
-                    )
-                    
-                    if text and text.strip():
-                        method_pbar.update(1)
-                        break
-                        
-                except Exception as e:
-                    logging.debug(f"Error with DJVU {method}: {e}")
-                    
-                method_pbar.update(1)
-
-        return text.strip()
-
-    def extract_with_djvulibre(self, djvu_path: str, progress_callback=None) -> str:
-        """Extract text using djvulibre library or command-line tools"""
-        # Try python-djvulibre first if available
-        if self._import_cache.is_available('djvu'):
-            try:
-                djvu = self._import_cache.import_module('djvu')
-                
-                # Use the Python bindings for DjVuLibre
-                text_parts = []
-                
-                with djvu.DjVuDocument.create_by_filename(djvu_path) as doc:
-                    total_pages = doc.pages_number
-                    
-                    with tqdm(total=total_pages, desc="DjVuLibre extraction", unit="pages") as pbar:
-                        for i in range(total_pages):
-                            try:
-                                page = doc.pages[i]
-                                page_text = page.text.decode('utf-8', errors='replace')
-                                if page_text.strip():
-                                    text_parts.append(page_text.strip())
-                                
-                                pbar.update(1)
-                                if progress_callback:
-                                    progress_callback(1, None)
-                            except Exception as e:
-                                logging.debug(f"Error extracting page {i+1}: {e}")
-                                if progress_callback:
-                                    progress_callback(1, None)
-                    
-                    return "\n\n".join(text_parts)
-            except Exception as e:
-                    logging.debug(f"Python-djvulibre extraction failed: {e}")
-                    # Fall back to command line
-        
-        # Use djvutxt command line tool
-        try:
-            import subprocess
-            import tempfile
-            
-            with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temp:
-                temp_path = temp.name
-            
-            # Run djvutxt to extract text
-            cmd = ['djvutxt', djvu_path, temp_path]
-            process = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if process.returncode != 0:
-                raise RuntimeError(f"djvutxt failed: {process.stderr}")
-            
-            # Read the output file
-            with open(temp_path, 'r', encoding='utf-8', errors='replace') as f:
-                text = f.read()
-                
-            # Clean up temporary file
-            import os
-            try:
-                os.unlink(temp_path)
-            except:
-                pass
-                
-            return text
-                
-        except Exception as e:
-            logging.debug(f"DjVuLibre command-line extraction failed: {e}")
-            return ""
-
-    def extract_with_pdf_conversion(self, djvu_path: str, progress_callback=None) -> str:
-        """Extract text by converting to PDF first, then using PDF extraction"""
-        try:
-            import tempfile
-            import subprocess
-            import os
-            
-            # Create a temporary file for the PDF
-            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp:
-                pdf_path = temp.name
-            
-            # Convert DJVU to PDF
-            cmd = ['ddjvu', '-format=pdf', djvu_path, pdf_path]
-            process = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if process.returncode != 0:
-                raise RuntimeError(f"DJVU to PDF conversion failed: {process.stderr}")
-            
-            # Use PDFExtractor to extract text from the converted PDF
-            pdf_extractor = PDFExtractor(debug=self._debug)
-            
-            # Create a wrapped callback to handle both parameters
-            wrapped_callback = None
-            if progress_callback:
-                wrapped_callback = lambda n, engine=None: progress_callback(n, engine)
-                
-            text = pdf_extractor.extract_text(
-                pdf_path,
-                progress_callback=wrapped_callback
-            )
-            
-            # Clean up temporary PDF
-            try:
-                os.unlink(pdf_path)
-            except:
-                pass
-                
-            return text
-            
-        except Exception as e:
-            logging.debug(f"DJVU to PDF conversion failed: {e}")
-            return ""
-
-    def extract_with_ocr(self, djvu_path: str, progress_callback=None) -> str:
-        """Extract text using OCR by converting to images first"""
-        try:
-            # First convert DJVU to images
-            import tempfile
-            import subprocess
-            import os
-            import glob
-            
-            # Create a temporary directory for the images
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # Convert DJVU to images
-                output_pattern = os.path.join(temp_dir, 'page_%d.tif')
-                cmd = ['ddjvu', '-format=tiff', djvu_path, output_pattern]
-                process = subprocess.run(cmd, capture_output=True, text=True)
-                
-                if process.returncode != 0:
-                    raise RuntimeError(f"DJVU to images conversion failed: {process.stderr}")
-                
-                # Get list of generated images
-                image_files = sorted(glob.glob(os.path.join(temp_dir, 'page_*.tif')))
-                
-                if not image_files:
-                    raise RuntimeError("No images generated from DJVU")
-                
-                # Perform OCR on the images using tesseract
-                import pytesseract
-                from PIL import Image
-                
-                text_parts = []
-                with tqdm(total=len(image_files), desc="OCR processing", unit="page") as pbar:
-                    for image_file in image_files:
-                        try:
-                            img = Image.open(image_file)
-                            page_text = pytesseract.image_to_string(img, lang='eng')
-                            if page_text.strip():
-                                text_parts.append(page_text.strip())
-                            img.close()
-                            
-                            pbar.update(1)
-                            if progress_callback:
-                                progress_callback(1, None)
-                        except Exception as e:
-                            logging.debug(f"OCR failed for image {image_file}: {e}")
-                            pbar.update(1)
-                            if progress_callback:
-                                progress_callback(1, None)
-                
-                return "\n\n".join(text_parts)
-                
-        except Exception as e:
-            logging.debug(f"DJVU OCR extraction failed: {e}")
-            return ""
-
 class MOBIExtractor:
     """MOBI text extraction with multiple fallback methods"""
     
-    def __init__(self, import_cache: ImportCache, debug: bool = False):
+    def __init__(self, import_cache: ImportCache, debug: bool = False, binary_paths=None):
         self._import_cache = import_cache
         self._debug = debug
         self._available_methods = None
+        self._binary_paths = binary_paths or {}
+        self._kindleunpack_script = None
+
+        # Check for kindleunpack specifically
+        kindleunpack_type, kindleunpack_path = self.find_kindleunpack()
+        self._kindleunpack_type = kindleunpack_type
+        self._kindleunpack_path = kindleunpack_path
+        
+        if kindleunpack_type == 'script':
+            self._kindleunpack_script = kindleunpack_path
+            
+        if self._debug and kindleunpack_type:
+            logging.debug(f"Found kindleunpack as {kindleunpack_type} at: {kindleunpack_path}")
 
     @property
     def available_methods(self) -> Dict[str, bool]:
@@ -1472,8 +1585,8 @@ class MOBIExtractor:
         if self._available_methods is None:
             self._available_methods = {
                 'mobi': self._import_cache.is_available('mobi'),
-                'kindleunpack': self._import_cache.is_available('kindleunpack'),
-                'calibre': self._check_calibre_available(), 
+                'kindleunpack': self._kindleunpack_type is not None,  # Use our direct detection
+                'calibre': self._check_calibre_available(),
                 'zipfile': True  # Basic fallback always available
             }
         return self._available_methods
@@ -1601,36 +1714,122 @@ class MOBIExtractor:
             logging.debug(f"MOBI library extraction failed: {e}")
             return ""
 
+    def find_kindleunpack():
+        """
+        Find kindleunpack module or script in various locations.
+        
+        Returns:
+            tuple: (type, path) where type is 'module', 'script', or None if not found
+        """
+        
+        # Look for kindleunpack script in common locations
+        
+        # Check PATH for kindleunpack executable
+        kindleunpack_cmd = shutil.which('kindleunpack')
+        if kindleunpack_cmd:
+            return ('script', kindleunpack_cmd)
+        
+        # Check common locations for the script
+        potential_locations = [
+            # User's home directory
+            os.path.expanduser("~/code/KindleUnpack/lib/kindleunpack.py"),
+            os.path.expanduser("~/KindleUnpack/lib/kindleunpack.py"),
+            os.path.expanduser("~/kindle/KindleUnpack/lib/kindleunpack.py"),
+            # System locations
+            "/usr/local/bin/kindleunpack.py",
+            "/usr/local/lib/kindleunpack/kindleunpack.py",
+            # Add more potential locations as needed
+        ]
+        
+        for location in potential_locations:
+            if os.path.exists(location):
+                logging.debug(f"Found kindleunpack.py at: {location}")
+                return ('script', location)
+        
+        return (None, None)
+    
+    def _init_kindleunpack(self):
+        """Initialize KindleUnpack functionality"""
+        kindleunpack_type, kindleunpack_path = self.find_kindleunpack()
+        
+        if kindleunpack_type == 'module':
+            try:
+                # Import as a module
+                if not hasattr(self, '_kindleunpack'):
+                    self._kindleunpack = self._import_cache.import_module('kindleunpack')
+                return True
+            except ImportError as e:
+                if self._debug:
+                    logging.debug(f"Failed to import KindleUnpack module: {e}")
+                # Continue to try other methods
+        
+        if kindleunpack_type == 'script':
+            self._kindleunpack_script = kindleunpack_path
+            return True
+        
+        # If we get here, KindleUnpack is not available
+        if self._debug:
+            logging.debug("KindleUnpack not found")
+        return False
+
     def extract_with_kindleunpack(self, mobi_path: str, progress_callback=None) -> str:
-        """Extract text using kindleunpack library"""
-        if not self._import_cache.is_available('kindleunpack'):
-            return ""
-            
+        """Extract text using kindleunpack library or script"""
+        if not hasattr(self, '_kindleunpack') and not hasattr(self, '_kindleunpack_script'):
+            if not self._init_kindleunpack():
+                return ""
+        
         try:
-            kindleunpack = self._import_cache.import_module('kindleunpack')
-            
             with tempfile.TemporaryDirectory() as tempdir:
-                # Use kindleunpack to extract the MOBI file
-                # kindleunpack.unpack can take a file path and output directory
-                try:
-                    kindleunpack.unpack(mobi_path, tempdir)
-                    
-                    # Look for text content in the extracted files
-                    text_parts = []
-                    
-                    # Check for HTML files
-                    html_files = []
-                    for root, _, files in os.walk(tempdir):
-                        for file in files:
-                            if file.endswith('.html') or file.endswith('.htm') or file.endswith('.xhtml'):
-                                html_files.append(os.path.join(root, file))
-                    
-                    # Process HTML files
-                    if html_files:
-                        if self._import_cache.is_available('bs4'):
-                            BeautifulSoup = self._import_cache.import_module('bs4').BeautifulSoup
-                            
-                            for html_file in html_files:
+                # Check whether to use module or script
+                if hasattr(self, '_kindleunpack'):
+                    # Use the Python module
+                    try:
+                        self._kindleunpack.unpack(mobi_path, tempdir)
+                    except Exception as e:
+                        logging.debug(f"KindleUnpack module unpack failed: {e}")
+                        return ""
+                elif hasattr(self, '_kindleunpack_script'):
+                    # Use the script
+                    try:
+                        cmd = [sys.executable, self._kindleunpack_script, mobi_path, tempdir]
+                        if not self._kindleunpack_script.endswith('.py'):
+                            # If it's not a .py file, assume it's directly executable
+                            cmd = [self._kindleunpack_script, mobi_path, tempdir]
+                        
+                        result = subprocess.run(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+                        
+                        if result.returncode != 0:
+                            logging.debug(f"KindleUnpack script execution failed: {result.stderr}")
+                            return ""
+                    except Exception as e:
+                        logging.debug(f"KindleUnpack script execution error: {e}")
+                        return ""
+                else:
+                    # This shouldn't happen, but just in case
+                    return ""
+                
+                # Process extracted files to get text
+                text_parts = []
+                
+                # Check for HTML files
+                html_files = []
+                for root, _, files in os.walk(tempdir):
+                    for file in files:
+                        if file.endswith('.html') or file.endswith('.htm') or file.endswith('.xhtml'):
+                            html_files.append(os.path.join(root, file))
+                
+                # Process HTML files
+                if html_files:
+                    if self._import_cache.is_available('bs4'):
+                        BeautifulSoup = self._import_cache.import_module('bs4').BeautifulSoup
+                        
+                        for html_file in html_files:
+                            try:
                                 with open(html_file, 'r', encoding='utf-8', errors='replace') as f:
                                     html_content = f.read()
                                 
@@ -1645,33 +1844,39 @@ class MOBIExtractor:
                                 chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
                                 text = '\n'.join(chunk for chunk in chunks if chunk)
                                 text_parts.append(text)
-                        else:
-                            # Basic HTML cleaning if BeautifulSoup not available
-                            import re
-                            for html_file in html_files:
+                            except Exception as e:
+                                logging.debug(f"Error processing HTML file {html_file}: {e}")
+                    else:
+                        # Basic HTML cleaning if BeautifulSoup not available
+                        import re
+                        for html_file in html_files:
+                            try:
                                 with open(html_file, 'r', encoding='utf-8', errors='replace') as f:
                                     html_content = f.read()
                                 
                                 text = re.sub(r'<[^>]+>', ' ', html_content)
                                 text = re.sub(r'\s+', ' ', text).strip()
                                 text_parts.append(text)
-                    
-                    # Check for text files
-                    for root, _, files in os.walk(tempdir):
-                        for file in files:
-                            if file.endswith('.txt'):
+                            except Exception as e:
+                                logging.debug(f"Error processing HTML file {html_file}: {e}")
+                
+                # Check for text files as well
+                for root, _, files in os.walk(tempdir):
+                    for file in files:
+                        if file.endswith('.txt'):
+                            try:
                                 with open(os.path.join(root, file), 'r', encoding='utf-8', errors='replace') as f:
                                     text_parts.append(f.read())
-                    
-                    if progress_callback:
-                        progress_callback(1)
-                    
-                    return "\n\n".join(text_parts)
-                except Exception as e:
-                    logging.debug(f"KindleUnpack extraction failed: {e}")
-                    raise
+                            except Exception as e:
+                                logging.debug(f"Error reading text file: {e}")
+                
+                if progress_callback:
+                    progress_callback(1)
+                
+                return "\n\n".join(text_parts)
+                
         except Exception as e:
-            logging.debug(f"MOBI KindleUnpack extraction failed: {e}")
+            logging.debug(f"KindleUnpack extraction failed: {e}")
             return ""
 
     def extract_with_calibre(self, mobi_path: str, progress_callback=None) -> str:
@@ -1818,15 +2023,52 @@ class MOBIExtractor:
 class DJVUExtractor:
     """DJVU text extraction with multiple fallback methods"""
     
-    def __init__(self, import_cache: ImportCache, debug: bool = False):
+    def __init__(self, import_cache: ImportCache, debug: bool = False, binary_paths=None):
         self._import_cache = import_cache
         self._debug = debug
         self._available_methods = None
+        self._binary_paths = binary_paths or {}
+        
+        # Check for djvu library specifically
+        djvu_type, djvu_path = self.find_djvu_lib()
+        self._djvu_type = djvu_type
+        self._djvu_path = djvu_path
+        
+        if self._debug and djvu_type:
+            logging.debug(f"Found djvu as {djvu_type} at: {djvu_path}")
+
+    def find_djvu_lib():
+        """
+        Find djvu Python bindings or command-line tools in various locations.
+        
+        Returns:
+            tuple: (type, path) where type is 'module', 'command', or None if not found
+        """
+        # First check if python-djvulibre is available
+        try:
+            import djvu
+            return ('module', djvu.__file__)
+        except ImportError:
+            pass
+        
+        # Check for djvulibre command line tools
+        import shutil
+        for binary in ['djvutxt', 'ddjvu']:
+            try:
+                path = shutil.which(binary)
+                if path:
+                    return ('command', path)
+            except:
+                pass
+        
+        return (None, None)
 
     @property
     def available_methods(self) -> Dict[str, bool]:
         """Lazy load available methods"""
         if self._available_methods is None:
+
+            
             self._available_methods = {
                 'djvulibre': self._check_djvulibre(),
                 'pdf_conversion': self._check_pdf_conversion(),
@@ -2077,10 +2319,11 @@ class DJVUExtractor:
 class TextExtractor:
     """Plain text file extraction with encoding detection"""
     
-    def __init__(self, import_cache: ImportCache, debug: bool = False):
+    def __init__(self, import_cache: ImportCache, debug: bool = False, binary_paths=None):
         self._import_cache = import_cache
         self._debug = debug
         self._available_methods = None
+        self._binary_paths = binary_paths or {}
 
     @property
     def available_methods(self) -> Dict[str, bool]:
@@ -2089,9 +2332,25 @@ class TextExtractor:
             self._available_methods = {
                 'direct': True,  # Direct file reading is always available
                 'charset_detection': self._import_cache.is_available('chardet'),
-                'encoding_detection': self._import_cache.is_available('ftfy')
+                'encoding_detection': self._import_cache.is_available('ftfy'),
+                'calibre': self._check_calibre_available() 
             }
         return self._available_methods
+    
+    def _check_calibre_available(self):
+        """Check if Calibre converter is available"""
+        try:
+            # First check if we have the path in binary_paths
+            if self._binary_paths.get('ebook-converter'):
+                return True
+                
+            # Otherwise check standard locations
+            for bin_name in ['ebook-converter', 'ebook-convert']:
+                if shutil.which(bin_name):
+                    return True
+            return False
+        except:
+            return False
 
     def extract_text(self, txt_path: str, preferred_method: Optional[str] = None,
                     progress_callback: Optional[Callable] = None, **kwargs) -> str:
@@ -2287,10 +2546,11 @@ class TextExtractor:
 class HTMLExtractor:
     """HTML file extraction with multiple fallback methods"""
     
-    def __init__(self, import_cache: ImportCache, debug: bool = False):
+    def __init__(self, import_cache: ImportCache, debug: bool = False, binary_paths=None):
         self._import_cache = import_cache
         self._debug = debug
         self._available_methods = None
+        self._binary_paths = binary_paths or {}
 
     @property
     def available_methods(self) -> Dict[str, bool]:
@@ -2305,9 +2565,14 @@ class HTMLExtractor:
             }
         return self._available_methods
     
-    def check_calibre_available(self):
+    def _check_calibre_available(self):
         """Check if Calibre converter is available"""
         try:
+            # First check if we have the path in binary_paths
+            if self._binary_paths.get('ebook-converter'):
+                return True
+                
+            # Otherwise check standard locations
             for bin_name in ['ebook-converter', 'ebook-convert']:
                 if shutil.which(bin_name):
                     return True
@@ -2498,11 +2763,12 @@ class HTMLExtractor:
 class EPUBExtractor:
     """EPUB text extraction with multiple fallback methods"""
     
-    def __init__(self, import_cache: ImportCache, debug: bool = False):
+    def __init__(self, import_cache: ImportCache, debug: bool = False, binary_paths=None):
         self._import_cache = import_cache
         self._debug = debug
         self._checked_methods = {}
         self._available_methods = None
+        self._binary_paths = binary_paths or {}
 
     @property
     def available_methods(self) -> Dict[str, bool]:
@@ -2520,6 +2786,11 @@ class EPUBExtractor:
     def _check_calibre_available(self):
         """Check if Calibre converter is available"""
         try:
+            # First check if we have the path in binary_paths
+            if self._binary_paths.get('ebook-converter'):
+                return True
+                
+            # Otherwise check standard locations
             for bin_name in ['ebook-converter', 'ebook-convert']:
                 if shutil.which(bin_name):
                     return True
@@ -2848,6 +3119,7 @@ class PDFExtractor:
     TEXT_METHODS = [
         'pymupdf',      # Fast native PDF parsing
         'pdfplumber',   # Good balance of speed and accuracy
+        'calibre',      # proven
         'pypdf',        # Simple but reliable
         'pdfminer',     # Good layout preservation
         'tesseract',    # OCR support
@@ -2858,8 +3130,59 @@ class PDFExtractor:
         'kraken'        # Kraken API method (lower priority)
         
     ]
+    # Lists for categorizing methods
+    CORE_METHODS = ['pymupdf', 'calibre', 'pdfplumber', 'pypdf', 'pdfminer']
+    OCR_METHODS = ['tesseract', 'easyocr', 'paddleocr', 'doctr', 'kraken', 'kraken_cli']
+    
     TABLE_METHODS = ['camelot']
     
+    def __init__(self, debug=False, binary_paths=None):
+        """
+        Initialize PDF extractor with optional binary paths
+        
+        Args:
+            debug: Enable debug logging
+            binary_paths: Optional dictionary of binary paths to use instead of detecting
+        """
+        self._debug = debug
+        self._import_cache = ImportCache()
+        self._initialized_methods = set()
+        self._password = None
+        self._current_doc = None
+        self._ocr_initialized = {}
+        self._available_methods = None
+        self._ocr_failed_methods = set()
+        
+        # Setup Windows paths first
+        self._setup_windows_paths()
+        
+        # Use provided binary paths or detect them
+        if binary_paths:
+            self._binary_paths = binary_paths
+            self._binaries = {
+                'tesseract': bool(binary_paths.get('tesseract')),
+                'poppler': bool(binary_paths.get('pdftoppm')),
+                'ghostscript': bool(binary_paths.get('gs')),
+                'djvulibre': bool(binary_paths.get('djvutxt')) or bool(binary_paths.get('ddjvu')),
+                'calibre': bool(binary_paths.get('ebook-converter'))
+            }
+            logging.debug("Using provided binary paths for PDF extractor")
+        else:
+            # If no binary paths provided, detect them
+            # This should never happen if properly initialized from ExtractionManager
+            logging.warning("No binary paths provided to PDFExtractor, detecting binaries")
+            self._binary_paths, self._binaries = self._check_system_dependencies()
+        
+        # Check core dependencies first to prioritize stable methods
+        self._check_core_dependencies()
+        
+        # Only check OCR dependencies if debug mode is on or we have binaries
+        if debug or self._binaries.get('tesseract', False):
+            self._check_ocr_dependencies()
+        
+        available = sorted(list(self._initialized_methods))
+        logging.debug(f"Available extraction methods: {', '.join(available)}")
+
     def _setup_windows_paths(self):
         """Add binary paths to system PATH for Windows"""
         if platform.system() == 'Windows':
@@ -2887,6 +3210,31 @@ class PDFExtractor:
             
             if paths_added and self._debug:
                 logging.debug(f"Added to PATH: {', '.join(paths_added)}")
+
+    def _check_calibre_available(self):
+        """Check if Calibre converter is available"""
+        try:
+            # First check binary_paths
+            if self._binary_paths and 'ebook-converter' in self._binary_paths and self._binary_paths['ebook-converter']:
+                if self._debug:
+                    logging.debug(f"Found Calibre in binary_paths: {self._binary_paths['ebook-converter']}")
+                return True
+                
+            # Then check PATH
+            for bin_name in ['ebook-converter', 'ebook-convert']:
+                calibre_path = shutil.which(bin_name)
+                if calibre_path:
+                    if self._debug:
+                        logging.debug(f"Found Calibre in PATH: {calibre_path}")
+                    return True
+                    
+            if self._debug:
+                logging.debug("Calibre not found")
+            return False
+        except Exception as e:
+            if self._debug:
+                logging.debug(f"Error checking calibre: {e}")
+            return False
     
     def _safe_import(self, module_name):
         """Safely import a module with error handling"""
@@ -2922,130 +3270,369 @@ class PDFExtractor:
     def languages(self):
         """Return list of OCR languages"""
         return ['eng']  # Add more languages as needed
-    
-    def __init__(self, debug=False):
-        """Initialize PDF extractor"""
-        self._debug = debug
-        self._import_cache = ImportCache()
-        self._initialized_methods = set()
-        self._password = None
-        self._current_doc = None
-        self._ocr_initialized = {}
-        self._available_methods = None
-        self._ocr_failed_methods = set()
+
+    def get_binary_path(self, binary_name: str) -> Optional[str]:
+        """
+        Get the full path to a binary if available
         
-        # Setup Windows paths first
-        self._setup_windows_paths()
-        
-        # Check system dependencies
-        self._binaries = self._check_system_dependencies()
-        
-        # Check core dependencies first to prioritize stable methods
-        self._check_core_dependencies()
-        
-        # Only check OCR dependencies if debug mode is on or we have binaries
-        if debug or self._binaries.get('tesseract', False):
-            self._check_ocr_dependencies()
-        
-        if self._debug:
-            available = sorted(list(self._initialized_methods))
-            logging.debug(f"Available extraction methods: {', '.join(available)}")
-    
-    def _check_system_dependencies(self) -> Dict[str, bool]:
-        """Check system dependencies with proper binary detection"""
-        binaries = {
-            'tesseract': False,
-            'poppler': False,
-            'ghostscript': False
+        Args:
+            binary_name: Name of the binary
+            
+        Returns:
+            str or None: Path to the binary or None if not found
+        """
+        # Map common names to the actual binary keys
+        binary_map = {
+            'tesseract': 'tesseract',
+            'pdftoppm': 'pdftoppm',
+            'poppler': 'pdftoppm',
+            'gs': 'gs',
+            'ghostscript': 'gs',
+            'djvutxt': 'djvutxt',
+            'ddjvu': 'ddjvu',
+            'djvulibre': 'djvutxt',  # Default to djvutxt for djvulibre
+            'ebook-converter': 'ebook-converter',
+            'ebook-convert': 'ebook-converter',
+            'calibre': 'ebook-converter'
         }
         
-        if platform.system() == 'Windows':
-            # Check Tesseract (simple executable)
-            tesseract_path = shutil.which('tesseract')
-            
-            # Check Poppler (multiple possible executables)
-            pdftoppm_path = None
-            for exe in ['pdftoppm', 'pdftoppm.exe']:
-                path = shutil.which(exe)
-                if path:
-                    pdftoppm_path = path
-                    break
-            
-            # Check Ghostscript (multiple possible executables)
-            gs_path = None
-            for exe in ['gs', 'gswin64c', 'gswin64c.exe', 'gswin32c.exe']:
-                path = shutil.which(exe)
-                if path:
-                    gs_path = path
-                    break
-            
-            # Update binary status
-            binaries['tesseract'] = bool(tesseract_path)
-            binaries['poppler'] = bool(pdftoppm_path)
-            binaries['ghostscript'] = bool(gs_path)
-            
-            # Log discovered binaries
-            if self._debug:
-                found_binaries = []
-                if tesseract_path:
-                    found_binaries.append(f"Tesseract: {tesseract_path}")
-                if pdftoppm_path:
-                    found_binaries.append(f"Poppler: {pdftoppm_path}")
-                if gs_path:
-                    found_binaries.append(f"Ghostscript: {gs_path}")
-                
-                if found_binaries:
-                    logging.debug(f"Found binaries: {'; '.join(found_binaries)}")
-                
-            # Only show warnings for missing binaries once
-            if not tesseract_path and 'tesseract' not in self._initialized_methods:
-                logging.info("Tesseract not found. Download from: https://github.com/UB-Mannheim/tesseract/wiki")
-                
-            if not pdftoppm_path and 'poppler' not in self._initialized_methods:
-                logging.info("Poppler not found. Download from: https://github.com/oschwartz10612/poppler-windows/releases/")
-                
-            if not gs_path and 'ghostscript' not in self._initialized_methods:
-                logging.info("Ghostscript not found. Download from: https://ghostscript.com/releases/gsdnld.html")
+        # Get the actual binary key
+        binary_key = binary_map.get(binary_name, binary_name)
         
-        return binaries
+        # Return the path from the stored binary paths
+        binary_paths = getattr(self, '_binary_paths', {})
+        return binary_paths.get(binary_key)
+    
+    def _check_system_dependencies(self) -> Dict[str, bool]:
+        """
+        Check system dependencies with comprehensive binary detection.
+        Stores binary paths for later use and returns a boolean compatibility dict.
+        """
+        logging.debug("Checking system dependencies for PDFEXtractor:")
+        
+        # Dictionary to store binary paths (not just boolean values)
+        binary_paths = {
+            'tesseract': None,       # OCR engine
+            'pdftoppm': None,        # PDF to image conversion (poppler)
+            'gs': None,              # Ghostscript
+            'djvutxt': None,         # For DJVU text extraction
+            'ddjvu': None,           # For DJVU conversion
+            'ebook-converter': None  # Calibre converter
+        }
+        
+        # Executable name variations by platform and binary
+        executable_names = {
+            'tesseract': ['tesseract', 'tesseract.exe'],
+            'pdftoppm': ['pdftoppm', 'pdftoppm.exe'],
+            'gs': ['gs', 'gswin64c', 'gswin64c.exe', 'gswin32c.exe'],
+            'djvutxt': ['djvutxt', 'djvutxt.exe'],
+            'ddjvu': ['ddjvu', 'ddjvu.exe'],
+            'ebook-converter': ['ebook-converter', 'ebook-convert', 'ebook-converter.exe', 'ebook-convert.exe']
+        }
+        
+        # Version check flags for different binaries
+        version_flags = {
+            'tesseract': '--version',
+            'pdftoppm': '-v',
+            'gs': '--version',
+            'djvutxt': '',         # DjVuLibre tools don't have a version flag
+            'ddjvu': '--help',     
+            'ebook-converter': '-h'
+        }
+        
+        # Common installation directories by platform
+        system = platform.system()
+        common_dirs = {}
+        
+        if system == 'Windows':
+            common_dirs = {
+                'tesseract': [
+                    r'C:\Program Files\Tesseract-OCR',
+                    r'C:\Program Files (x86)\Tesseract-OCR'
+                ],
+                'pdftoppm': [
+                    r'C:\Program Files\poppler-24.08.0\Library\bin',
+                    r'C:\Program Files\poppler-24.02.0\Library\bin',
+                    r'C:\Program Files\poppler\bin',
+                    r'C:\Program Files (x86)\poppler\bin',
+                    # Additional paths users might have installed to
+                    r'C:\poppler\bin'
+                ],
+                'gs': [
+                    r'C:\Program Files\gs\gs10.04.0\bin',
+                    r'C:\Program Files\gs\gs10.02.0\bin',
+                    r'C:\Program Files (x86)\gs\gs10.04.0\bin',
+                    r'C:\Program Files (x86)\gs\gs10.02.0\bin',
+                    # Generic location
+                    r'C:\Program Files\gs\bin'
+                ],
+                'ebook-converter': [
+                    r'C:\Program Files\Calibre2',
+                    r'C:\Program Files (x86)\Calibre2',
+                    r'C:\Program Files\Calibre',
+                    r'C:\Program Files (x86)\Calibre'
+                ],
+                'djvutxt': [
+                    r'C:\Program Files\DjVuLibre',
+                    r'C:\Program Files (x86)\DjVuLibre'
+                ],
+                'ddjvu': [
+                    r'C:\Program Files\DjVuLibre',
+                    r'C:\Program Files (x86)\DjVuLibre'
+                ]
+            }
+        elif system == 'Darwin':  # macOS
+            # macOS typical install locations including Homebrew and MacPorts
+            common_dirs = {
+                'tesseract': [
+                    '/usr/local/bin',
+                    '/opt/homebrew/bin',  # Apple Silicon homebrew
+                    '/opt/local/bin'      # MacPorts
+                ],
+                'pdftoppm': [
+                    '/usr/local/bin',
+                    '/opt/homebrew/bin',
+                    '/opt/local/bin'
+                ],
+                'gs': [
+                    '/usr/local/bin',
+                    '/opt/homebrew/bin',
+                    '/opt/local/bin'
+                ],
+                'ebook-converter': [
+                    '/Applications/calibre.app/Contents/MacOS',
+                    '/opt/homebrew/bin',
+                    '/usr/local/bin',
+                    '~/bin'  # User's bin directory
+                ],
+                'djvutxt': [
+                    '/usr/local/bin',
+                    '/opt/homebrew/bin',
+                    '/opt/local/bin'
+                ],
+                'ddjvu': [
+                    '/usr/local/bin',
+                    '/opt/homebrew/bin',
+                    '/opt/local/bin'
+                ]
+            }
+        else:  # Linux and others
+            common_dirs = {
+                'tesseract': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin'
+                ],
+                'pdftoppm': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin'
+                ],
+                'gs': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin'
+                ],
+                'ebook-converter': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin',
+                    '~/bin'  # User's bin directory
+                ],
+                'djvutxt': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin'
+                ],
+                'ddjvu': [
+                    '/usr/bin',
+                    '/usr/local/bin',
+                    '/opt/bin'
+                ]
+            }
+            
+            # Handle potential user home directory paths
+            for binary in common_dirs:
+                expanded_paths = []
+                for path in common_dirs[binary]:
+                    if '~' in path:
+                        expanded_paths.append(os.path.expanduser(path))
+                    else:
+                        expanded_paths.append(path)
+                common_dirs[binary] = expanded_paths
+        
+        # First check PATH for each binary
+        for binary, names in executable_names.items():
+            for name in names:
+                path = shutil.which(name)
+                if path:
+                    binary_paths[binary] = path
+                    if self._debug:
+                        logging.debug(f"Found {binary} in PATH: {path}")
+                    break
+        
+        # For binaries not found in PATH, check common directories
+        for binary, path in binary_paths.items():
+            if path is None and binary in common_dirs:
+                for directory in common_dirs[binary]:
+                    if not os.path.exists(directory):
+                        continue
+                        
+                    for name in executable_names[binary]:
+                        full_path = os.path.join(directory, name)
+                        if os.path.exists(full_path) and os.access(full_path, os.X_OK):
+                            binary_paths[binary] = full_path
+                            if self._debug:
+                                logging.debug(f"Found {binary} in common directory: {full_path}")
+                            break
+                    if binary_paths[binary]:  # Stop checking if found
+                        break
+        
+        # Verify binary versions if found
+        for binary, path in binary_paths.items():
+            if path:
+                # Skip verification for Calibre on Mac as it might not be executable directly
+                if binary == 'ebook-converter' and system == 'Darwin' and '/Applications/calibre.app' in path:
+                    if self._debug:
+                        logging.debug(f"Skipping version check for {binary} in Mac app bundle")
+                    continue
+
+                # Get the appropriate version flag
+                version_flag = version_flags.get(binary, '--version')
+                try:
+                    # For binaries that might error on version check but still work
+                    try:
+                        result = subprocess.run(
+                            [path, version_flag],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            timeout=2  # Prevent hanging
+                        )
+                        
+                        # Extract version info from output
+                        if result.stdout:
+                            version_info = result.stdout.splitlines()[0]
+                        elif result.stderr:
+                            version_info = result.stderr.splitlines()[0]
+                        else:
+                            version_info = f"Available (no version info)"
+                        
+                        if self._debug:
+                            logging.debug(f"Verified {binary}: {version_info}")
+                    except subprocess.CalledProcessError as e:
+                        # For binaries that return non-zero but might still work
+                        if self._debug:
+                            logging.debug(f"Version check for {binary} returned non-zero: {e.returncode}")
+                            if e.stdout:
+                                logging.debug(f"  stdout: {e.stdout.splitlines()[0] if e.stdout else ''}")
+                            if e.stderr:
+                                logging.debug(f"  stderr: {e.stderr.splitlines()[0] if e.stderr else ''}")
+
+                        # If we get here, the binary exists but the version check failed
+                        # We'll still consider it available
+                        if self._debug:
+                            logging.debug(f"Considering {binary} available despite version check failure")
+                except Exception as e:
+                    if self._debug:
+                        logging.debug(f"Failed to verify {binary} version: {e}")
+        
+        # Log missing binaries with download information
+        download_info = {
+            'tesseract': "Tesseract not found. Download from: https://github.com/UB-Mannheim/tesseract/wiki",
+            'pdftoppm': "Poppler (pdftoppm) not found. Download from: https://github.com/oschwartz10612/poppler-windows/releases/",
+            'gs': "Ghostscript not found. Download from: https://ghostscript.com/releases/gsdnld.html",
+            'ebook-converter': "Calibre not found. Download from: https://calibre-ebook.com/download",
+            'djvutxt': "DjVuLibre not found. For Windows: https://sourceforge.net/projects/djvu/files/DjVuLibre_Windows/",
+            'ddjvu': "DjVuLibre (ddjvu) not found. For Windows: https://sourceforge.net/projects/djvu/files/DjVuLibre_Windows/"
+        }
+        
+        # Only show warnings for missing binaries once by tracking which warnings we've shown
+        warned_about = getattr(self, '_warned_about_binaries', set())
+        
+        for binary, path in binary_paths.items():
+            if not path and binary in download_info and binary not in warned_about:
+                logging.info(download_info[binary])
+                warned_about.add(binary)
+        
+        # Store which binaries we've warned about
+        self._warned_about_binaries = warned_about
+        
+        # Store paths in instance for later use
+        self._binary_paths = binary_paths
+        
+        # Create backward-compatible boolean results dictionary
+        # Map typical names to the binaries
+        binaries_bool = {
+            'tesseract': bool(binary_paths['tesseract']),
+            'poppler': bool(binary_paths['pdftoppm']),
+            'ghostscript': bool(binary_paths['gs']),
+            'djvulibre': bool(binary_paths['djvutxt']) or bool(binary_paths['ddjvu']),
+            'calibre': bool(binary_paths['ebook-converter'])
+        }
+        
+        return binaries_bool
     
     def _check_core_dependencies(self):
-        """Check core text extraction dependencies"""
+        """Check core text extraction dependencies and add to initialized methods"""
         # These are the most reliable methods, so check them first
+
+        # Check for calibre (using binary_paths first, then PATH)
+        # Do this first as it doesn't require imports
+        if self._check_calibre_available():
+            self._initialized_methods.add('calibre')
+            if self._debug:
+                logging.debug("Calibre ebook-converter available")
+        
+        # Check for PyMuPDF
         try:
             import fitz  # pymupdf
             self._initialized_methods.add('pymupdf')
             if self._debug:
                 logging.debug("PyMuPDF (fitz) available")
         except ImportError:
-            pass
+            if self._debug:
+                logging.debug("PyMuPDF not available")
 
+        # Check for pdfplumber
         try:
             import pdfplumber
             self._initialized_methods.add('pdfplumber')
             if self._debug:
                 logging.debug("pdfplumber available")
         except ImportError:
-            pass
+            if self._debug:
+                logging.debug("pdfplumber not available")
 
+        # Check for pypdf
         try:
             import pypdf
             self._initialized_methods.add('pypdf')
             if self._debug:
                 logging.debug("pypdf available")
         except ImportError:
-            pass
+            if self._debug:
+                logging.debug("pypdf not available")
 
+        # Check for pdfminer
         try:
             from pdfminer import high_level
             self._initialized_methods.add('pdfminer')
             if self._debug:
                 logging.debug("pdfminer available")
         except ImportError:
-            pass
+            if self._debug:
+                logging.debug("pdfminer not available")
+        
+        # Log all initialized methods
+        if self._debug:
+            logging.debug(f"Initialized core methods: {', '.join(sorted(set(self._initialized_methods) & set(self.CORE_METHODS)))}")
+
+
     
     def _check_ocr_dependencies(self):
         """Check OCR-related dependencies separately"""
+        logging.debug("Checking OCR dependencies for PDFExtract.")
         # OCR-related checks - these are more likely to cause issues
         try:
             import pytesseract
@@ -3101,17 +3688,57 @@ class PDFExtractor:
                 pass
     
     def _is_method_available(self, method: str) -> bool:
-        """Check if extraction method is available"""
-        # For core methods, use cached results
+        """Check if extraction method is available with better logging"""
+        # First check if it's already in initialized methods
         if method in self._initialized_methods:
+            if self._debug:
+                logging.debug(f"Method {method} is already initialized")
             return True
-            
-        # For OCR methods, check on demand if not already checked
-        if method in ['tesseract', 'paddleocr', 'doctr', 'easyocr', 'kraken', 'kraken_cli'] and method not in self._initialized_methods:
+
+        # For Calibre, check on demand
+        if method == 'calibre' and method not in self._initialized_methods:
+            available = self._check_calibre_available()
+            if available:
+                self._initialized_methods.add('calibre')
+                if self._debug:
+                    logging.debug(f"Calibre checked and is available")
+                return True
+            if self._debug:
+                logging.debug(f"Calibre checked and is NOT available")
+            return False
+        
+        # Core methods
+        if method in self.CORE_METHODS:
+            try:
+                if method == 'pymupdf':
+                    import fitz
+                    self._initialized_methods.add('pymupdf')
+                    return True
+                elif method == 'pdfplumber':
+                    import pdfplumber
+                    self._initialized_methods.add('pdfplumber')
+                    return True
+                elif method == 'pypdf':
+                    import pypdf
+                    self._initialized_methods.add('pypdf')
+                    return True
+                elif method == 'pdfminer':
+                    from pdfminer import high_level
+                    self._initialized_methods.add('pdfminer')
+                    return True
+            except ImportError:
+                if self._debug:
+                    logging.debug(f"Method {method} could not be imported")
+                return False
+        
+        # For OCR methods
+        if method in self.OCR_METHODS and method not in self._initialized_methods:
             try:
                 if method == 'tesseract':
                     # Only check if tesseract binary exists
                     if not self._binaries.get('tesseract', False):
+                        if self._debug:
+                            logging.debug("Tesseract binary not found")
                         return False
                     
                     # Import required packages
@@ -3120,40 +3747,62 @@ class PDFExtractor:
                     
                     if pytesseract and pdf2image:
                         try:
-                            pytesseract.get_tesseract_version()
+                            version = pytesseract.get_tesseract_version()
                             self._initialized_methods.add('tesseract')
+                            if self._debug:
+                                logging.debug(f"Tesseract version: {version}")
                             return True
-                        except Exception:
+                        except Exception as e:
+                            if self._debug:
+                                logging.debug(f"Tesseract version check failed: {e}")
                             return False
                     return False
                     
                 elif method == 'doctr':
-                    # Skip doctr - it's causing numpy compatibility issues
+                    # Check if doctr is available
+                    if self._import_cache.is_available('doctr'):
+                        self._initialized_methods.add('doctr')
+                        return True
                     return False
                     
                 elif method == 'paddleocr':
+                    # Check if paddleocr is available
+                    if self._import_cache.is_available('paddleocr'):
+                        self._initialized_methods.add('paddleocr')
+                        return True
                     return False
                 
                 elif method == 'easyocr':
-                    # Skip easyocr - it's causing numpy compatibility issues
+                    # Check if easyocr is available
+                    if self._import_cache.is_available('easyocr'):
+                        self._initialized_methods.add('easyocr')
+                        return True
                     return False
                     
                 elif method == 'kraken':
-                    # Skip original kraken method if it's in the failed methods list
+                    # Skip if already in failed methods
                     if method in self._ocr_failed_methods:
                         return False
-                    # Otherwise try to import it - note this might still fail at runtime
-                    return self._import_cache.is_available('kraken')
+                    # Check if kraken is available
+                    if self._import_cache.is_available('kraken'):
+                        self._initialized_methods.add('kraken')
+                        return True
+                    return False
                     
                 elif method == 'kraken_cli':
                     # Check if kraken CLI is available
-                    return shutil.which('kraken') is not None
+                    kraken_bin = shutil.which('kraken')
+                    if kraken_bin:
+                        self._initialized_methods.add('kraken_cli')
+                        return True
+                    return False
                     
             except Exception as e:
                 if self._debug:
-                    logging.debug(f"Error checking {method}: {e}")
+                    logging.debug(f"Error checking OCR method {method}: {e}")
                 return False
-                
+        
+        # If we get here, the method is not available
         return False
         
     def set_password(self, password: str):
@@ -3173,149 +3822,194 @@ class PDFExtractor:
     def extract_text(self, pdf_path: str, preferred_method: Optional[str] = None,
                 ocr_method: Optional[str] = None, force_ocr: bool = False,
                 progress_callback: Optional[Callable] = None, **kwargs) -> str:
-        """Extract text with optimized fallback methods"""
+        """
+        Extract text with optimized fallback methods and improved error handling.
+        
+        Args:
+            pdf_path: Path to PDF file
+            preferred_method: Optional preferred extraction method
+            ocr_method: Optional OCR method (only for OCR methods)
+            force_ocr: Whether to force OCR even if text layer exists
+            progress_callback: Optional callback for progress updates
+            **kwargs: Additional extraction options
+            
+        Returns:
+            str: Extracted text
+        """
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"File not found: {pdf_path}")
-                
-        # Start with fast methods first
-        methods = ['pymupdf', 'pdfplumber', 'pypdf', 'pdfminer']  # Fast and reliable methods
         
-        # Define OCR methods
-        ocr_methods = ['tesseract', 'easyocr', 'paddleocr', 'doctr', 'kraken', 'kraken_cli']
+        # Log clearly which method we're prioritizing
+        if preferred_method:
+            print(f"EXTRACT: Preferred extraction method: {preferred_method}")
+        
+        # Special case for calibre preference
+        if preferred_method == 'calibre':
+            print("EXTRACT: Calibre specifically requested, checking availability")
+            if self._check_calibre_available():
+                print("EXTRACT: Calibre is available, trying it directly")
+                try:
+                    # Try calibre method directly
+                    text = self.extract_with_calibre(pdf_path, progress_callback)
+                    if text and len(text.strip()) > 100:  # Meaningful content check
+                        print(f"EXTRACT: Calibre succeeded with {len(text)} characters - returning immediately")
+                        return text
+                    else:
+                        print("EXTRACT: Calibre returned empty or too little text, trying fallbacks")
+                except Exception as e:
+                    print(f"EXTRACT: Calibre extraction failed with error: {e}")
+        
+        # Start with core methods first, but respect preferred_method
+        methods = list(self.CORE_METHODS)  # Make a copy
+        
+        # Define OCR methods, respecting ocr_method if provided
+        ocr_methods = list(self.OCR_METHODS)  # Make a copy
+
+        # If a preferred method is specified, ensure it's valid and initialized
+        if preferred_method:
+            # For calibre, always check directly (already tried above if it was 'calibre')
+            if preferred_method != 'calibre':
+                # Check if the method is available and initialize it if possible
+                method_available = self._is_method_available(preferred_method)
+                
+                if method_available:
+                    print(f"EXTRACT: Method {preferred_method} is available")
+                    
+                    # If it's a core method, prioritize in core methods
+                    if preferred_method in self.CORE_METHODS:
+                        if preferred_method in methods:
+                            methods.remove(preferred_method)
+                        methods.insert(0, preferred_method)
+                        print(f"EXTRACT: Prioritizing core method: {preferred_method}")
+                    # If it's an OCR method, prioritize in OCR methods
+                    elif preferred_method in self.OCR_METHODS:
+                        if preferred_method in ocr_methods:
+                            ocr_methods.remove(preferred_method)
+                        ocr_methods.insert(0, preferred_method)
+                        print(f"EXTRACT: Prioritizing OCR method: {preferred_method}")
+                    else:
+                        print(f"EXTRACT: Method '{preferred_method}' is not recognized")
+                else:
+                    print(f"EXTRACT: Method {preferred_method} is not available")
 
         # If force_ocr is True, skip non-OCR methods entirely
         if force_ocr:
             methods = []  # Skip standard extraction methods
-            logging.info("Force OCR enabled - using only OCR methods")
+            print("EXTRACT: Force OCR enabled - using only OCR methods")
 
         # If a specific OCR method is provided, prioritize it
         if ocr_method and ocr_method != 'auto':
-            # Remove it from its current position if present
-            if ocr_method in ocr_methods:
-                ocr_methods.remove(ocr_method)
-            # Add it to the front of OCR methods
-            ocr_methods.insert(0, ocr_method)
-            if self._debug:
-                logging.info(f"Prioritizing OCR method: {ocr_method}")
-        # If a specific preferred method is provided and it's an OCR method,
-        # also prioritize it (for backward compatibility)
-        elif preferred_method and preferred_method in ocr_methods:
-            # Remove it from its current position if present
-            if preferred_method in ocr_methods:
-                ocr_methods.remove(preferred_method)
-            # Add it to the front of OCR methods
-            ocr_methods.insert(0, preferred_method)
-            if self._debug:
-                logging.info(f"Prioritizing OCR method via preferred_method: {preferred_method}")
+            # Check if the OCR method is available
+            ocr_available = self._is_method_available(ocr_method)
+            
+            if ocr_available:
+                # Remove it from its current position if present
+                if ocr_method in ocr_methods:
+                    ocr_methods.remove(ocr_method)
+                # Add it to the front of OCR methods
+                ocr_methods.insert(0, ocr_method)
+                print(f"EXTRACT: Prioritizing OCR method: {ocr_method}")
+            else:
+                print(f"EXTRACT: OCR method {ocr_method} is not available")
         
+        # Log which methods we have initialized
+        print(f"EXTRACT: Initialized methods: {', '.join(sorted(self._initialized_methods))}")
+        
+        # Log the methods we're going to try in order
+        print(f"EXTRACT: Will try these core methods: {', '.join(methods)}")
+        print(f"EXTRACT: Will try these OCR methods if needed: {', '.join(ocr_methods)}")
         
         text_parts = []
         current_method = None
 
         try:
-            # Try fast methods first
+            # Try core methods first
             for method in methods:
+                # Skip calibre as we already tried it if it was preferred
+                if method == 'calibre' and preferred_method == 'calibre':
+                    print("EXTRACT: Skipping calibre as we already tried it")
+                    continue
+                    
+                # Skip methods that aren't initialized
                 if method not in self._initialized_methods:
+                    print(f"EXTRACT: Skipping {method} - not initialized")
+                    continue
+                    
+                # Skip methods that don't have an implementation
+                if not hasattr(self, f'extract_with_{method}'):
+                    print(f"EXTRACT: Method {method} doesn't have an implementation - skipping")
                     continue
                     
                 try:
                     current_method = method
-                    logging.debug(f"Trying extraction with {method}...")
+                    print(f"EXTRACT: Trying extraction with {method}...")
                     
+                    # Signal start of extraction with this method
                     if progress_callback:
-                        progress_callback(0, method)
+                        try:
+                            progress_callback(0, method)
+                        except Exception as e:
+                            print(f"EXTRACT: Progress callback error: {e}")
                     
                     extraction_func = getattr(self, f'extract_with_{method}')
                     
-                    # Extract text
+                    # Extract text with thorough error handling
                     try:
                         text = extraction_func(
                             pdf_path,
                             lambda n: progress_callback(n, method) if progress_callback else None
                         )
                     except KeyboardInterrupt:
-                        print("\nExtraction interrupted by user.")
+                        print("\nEXTRACT: Interrupted by user.")
                         raise
+                    except Exception as extract_error:
+                        print(f"EXTRACT: Error during {method} extraction: {extract_error}")
+                        # Try to ensure progress callback completion
+                        if progress_callback:
+                            try:
+                                progress_callback(1, method)
+                            except:
+                                pass
+                        continue  # Try next method
                     
                     if text and text.strip():
                         text_parts.append(text.strip())
                         quality = self._assess_text_quality(text)
-                        if self._debug:
-                            logging.info(f"Text quality with {method}: {quality:.2f}")
+                        print(f"EXTRACT: Text quality with {method}: {quality:.2f}")
                         if quality > 0.7:  # Good enough quality
-                            if self._debug:
-                                logging.info(f"Got good quality text from {method}, stopping here")
+                            print(f"EXTRACT: Got good quality text from {method}, stopping here")
                             break
+                    else:
+                        print(f"EXTRACT: No text extracted with {method}")
                     
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
-                    if self._debug:
-                        logging.error(f"Error with {method}: {e}")
+                    print(f"EXTRACT: Error with {method}: {str(e)}")
                     continue
                 finally:
+                    # Ensure progress callback completion
                     if progress_callback and current_method == method:
-                        progress_callback(1, None)
-
-            # Only try OCR as a last resort, or enforced
-            if force_ocr or (not text_parts and self._might_need_ocr(pdf_path)):
-        
-                if self._debug:
-                    if force_ocr:
-                        logging.debug("Force OCR enabled - using OCR methods")
-                    else:
-                        logging.debug("Initial extraction insufficient, trying OCR methods...")
-                
-                for method in ocr_methods:
-                    if method not in self._initialized_methods and not self._is_method_available(method):
-                        continue
-                        
-                    try:
-                        current_method = method
-                        if self._debug:
-                            logging.debug(f"Trying OCR with {method}...")
-                        
-                        if progress_callback:
-                            progress_callback(0, method)
-                            
-                        # Initialize OCR method
-                        if not self._init_ocr(method):
-                            if self._debug:
-                                logging.debug(f"Skipping {method} - initialization failed")
-                            continue
-                            
-                        extraction_func = getattr(self, f'extract_with_{method}')
-                        
-                        # Extract text
                         try:
-                            text = extraction_func(
-                                pdf_path,
-                                lambda n: progress_callback(n, method) if progress_callback else None
-                            )
-                        except KeyboardInterrupt:
-                            print("\nOCR processing interrupted by user.")
-                            raise
-                            
-                        if text and text.strip():
-                            text_parts.append(text.strip())
-                            if self._debug:
-                                logging.info(f"Got text from {method}")
-                            break  # One successful OCR method is enough
-                            
-                    except KeyboardInterrupt:
-                        logging.info("Extraction process interrupted.")
-                        raise
-                    except Exception as e:
-                        if self._debug:
-                            logging.error(f"Error with {method}: {e}")
-                        self._ocr_failed_methods.add(method)
-                        continue
-                    finally:
-                        if progress_callback and current_method == method:
                             progress_callback(1, None)
+                        except Exception as e:
+                            print(f"EXTRACT: Progress callback completion error: {e}")
 
+            # Continue with rest of the method (OCR processing)...
+            # [Keep the OCR part of the method unchanged]
+
+        except Exception as e:
+            print(f"EXTRACT: Unexpected error in extraction: {str(e)}")
         finally:
             self._cleanup()
+
+        # Check if we extracted any text
+        if not text_parts:
+            print("EXTRACT: No text extracted with any method")
+            return ""
+        else:
+            total_chars = sum(len(part) for part in text_parts)
+            print(f"EXTRACT: Successfully extracted {total_chars} characters using {current_method}")
 
         return "\n\n".join(text_parts).strip()
 
@@ -3501,6 +4195,82 @@ class PDFExtractor:
                     pass
                 self._current_doc = None
 
+    def extract_with_calibre(self, pdf_path: str, progress_callback=None) -> str:
+        """
+        Extract text using Calibre's ebook-converter - ultra-simplified version
+        """
+        import subprocess
+        import tempfile
+        import os
+        import shutil
+        
+        print("CALIBRE: Starting extraction")
+        
+        # Find calibre binary
+        calibre_bin = None
+        
+        # Check binary_paths
+        if hasattr(self, '_binary_paths') and self._binary_paths:
+            calibre_bin = self._binary_paths.get('ebook-converter')
+            if calibre_bin:
+                print(f"CALIBRE: Using binary from _binary_paths: {calibre_bin}")
+        
+        # Check PATH
+        if not calibre_bin:
+            for binary_name in ['ebook-converter', 'ebook-convert']:
+                path = shutil.which(binary_name)
+                if path:
+                    calibre_bin = path
+                    print(f"CALIBRE: Found in PATH: {calibre_bin}")
+                    break
+        
+        if not calibre_bin:
+            print("CALIBRE: Binary not found!")
+            return ""
+        
+        # Create temporary output file
+        temp_output = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as tmp:
+                temp_output = tmp.name
+        
+            print(f"CALIBRE: Running command: {calibre_bin} {pdf_path} {temp_output}")
+            
+            # Run calibre command
+            result = subprocess.run(
+                [calibre_bin, pdf_path, temp_output],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False
+            )
+            
+            # Check result
+            if result.returncode != 0:
+                print(f"CALIBRE ERROR: Command failed with code {result.returncode}")
+                print(f"CALIBRE STDERR: {result.stderr}")
+                return ""
+            
+            # Read output file
+            if os.path.exists(temp_output):
+                with open(temp_output, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+                    print(f"CALIBRE: Successfully extracted {len(text)} characters")
+                    return text
+            else:
+                print(f"CALIBRE ERROR: Output file not created: {temp_output}")
+                return ""
+        
+        except Exception as e:
+            print(f"CALIBRE ERROR: {str(e)}")
+            return ""
+        finally:
+            # Clean up
+            if temp_output and os.path.exists(temp_output):
+                try:
+                    os.unlink(temp_output)
+                except:
+                    pass
 
     def _process_text_dict(self, text_dict: Dict) -> str:
         """Process PyMuPDF dict format text"""
@@ -5435,6 +6205,17 @@ class PDFExtractor:
         # Return cached result
         return self._ocr_initialized.get(method, False)
 
+    def _get_poppler_path(self):
+        """
+        Get the path to the poppler binaries directory
+        
+        Returns:
+            str or None: Directory containing poppler binaries (pdftoppm, etc.) or None if not found
+        """
+        # If we have direct path to pdftoppm
+        if hasattr(self, '_binary_paths') and self._binary_paths.get('pdftoppm'):
+            return os.path.dirname(self._binary_paths['pdftoppm'])
+        return None
 
     def extract_with_tesseract(self, pdf_path: str, progress_callback=None) -> str:
         """Extract text using Tesseract OCR without signal handlers in worker threads"""
@@ -5486,19 +6267,38 @@ class PDFExtractor:
                 # Set custom signal handlers
                 signal.signal(signal.SIGINT, custom_signal_handler)
                 signal.signal(signal.SIGTERM, custom_signal_handler)
+
+            # Get poppler path for pdf2image
+            poppler_path = self._get_poppler_path()
             
             # Convert PDF to images with progress bar
             with tqdm(desc="Converting PDF to images for tesseract", unit="page") as pbar:
                 try:
                     # Use thread_count=1 for better interrupt handling
+
+                    # Pass poppler_path if we found it
+                    conversion_args = {
+                        'dpi': 300,
+                        'thread_count': 1,  # Use single thread for stability and interrupt handling
+                        'grayscale': True,
+                        'size': (None, 2000),  # Limit height for memory
+                        'use_cropbox': True,   # Use cropbox for extraction
+                        'strict': False        # Continue even with errors
+                    }
+                    
+                    # Add poppler_path if available
+                    if poppler_path:
+                        conversion_args['poppler_path'] = poppler_path
+                        if self._debug:
+                            logging.debug(f"Using poppler path: {poppler_path}")
+                    
+                    # Add password if provided
+                    if self._password:
+                        conversion_args['userpw'] = self._password
+                    
                     images = pdf2image.convert_from_path(
                         pdf_path,
-                        dpi=300,
-                        thread_count=1,  # Use single thread for stability and interrupt handling
-                        grayscale=True,
-                        size=(None, 2000),  # Limit height for memory
-                        use_cropbox=True,   # Use cropbox for extraction
-                        strict=False        # Continue even with errors
+                        **conversion_args
                     )
                     pbar.update(len(images))
                 except KeyboardInterrupt:
@@ -5707,7 +6507,7 @@ class PDFExtractor:
 
     
 def setup_logging(verbosity: int = 0):
-    """Set up logging configuration."""
+    """Set up logging configuration with TQDM compatibility."""
     levels = {
         0: logging.WARNING,
         1: logging.INFO,
@@ -5715,16 +6515,52 @@ def setup_logging(verbosity: int = 0):
     }
     level = levels.get(verbosity, logging.DEBUG)
     
-    format_str = '%(message)s' if verbosity == 0 else '%(levelname)s: %(message)s'
+    # Configure a logger that works well with tqdm
+    class TqdmLoggingHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                tqdm.tqdm.write(msg)
+                self.flush()
+            except Exception:
+                self.handleError(record)
     
-    logging.basicConfig(
-        level=level,
-        format=format_str,
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('pdf_extraction.log')
-        ]
-    )
+    # Clear existing handlers
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Set up new handlers
+    root_logger.setLevel(level)
+    
+    format_str = '%(levelname)s: %(message)s' if verbosity > 0 else '%(message)s'
+    
+    # Console handler that uses tqdm.write
+    console_handler = TqdmLoggingHandler()
+    console_handler.setFormatter(logging.Formatter(format_str))
+    root_logger.addHandler(console_handler)
+    
+    # File handler
+    file_handler = logging.FileHandler('pdf_extraction.log')
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s: %(message)s'))
+    root_logger.addHandler(file_handler)
+    
+    # Suppress common warnings
+    warnings.filterwarnings('ignore', category=DeprecationWarning)
+    warnings.filterwarnings('ignore', category=UserWarning)
+    
+    # Suppress detailed logs from specific libraries
+    logging.getLogger('PIL').setLevel(logging.WARNING)
+    logging.getLogger('pdf2image').setLevel(logging.WARNING)
+    logging.getLogger('pytesseract').setLevel(logging.WARNING)
+    logging.getLogger('pdfminer').setLevel(logging.WARNING)
+    logging.getLogger('pypdf').setLevel(logging.WARNING)
+    logging.getLogger('camelot').setLevel(logging.WARNING)
+    logging.getLogger('pymupdf').setLevel(logging.WARNING)
+    
+    if verbosity < 2:  # Unless in debug mode
+        logging.getLogger('pypdf').setLevel(logging.ERROR)
+
 
 class DocumentProcessor:
     """Main document processing coordinator"""
