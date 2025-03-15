@@ -3995,8 +3995,92 @@ class PDFExtractor:
                         except Exception as e:
                             print(f"EXTRACT: Progress callback completion error: {e}")
 
-            # Continue with rest of the method (OCR processing)...
-            # [Keep the OCR part of the method unchanged]
+            # Only try OCR if we didn't get good quality text or force_ocr is enabled
+            if force_ocr or (not text_parts and self._might_need_ocr(pdf_path)):
+                print(f"EXTRACT: {'Forcing OCR' if force_ocr else 'No good text extracted, trying OCR methods'}...")
+                
+                for method in ocr_methods:
+                    # Skip methods that are in the failed methods set
+                    if method in self._ocr_failed_methods:
+                        print(f"EXTRACT: Skipping {method} - previously failed")
+                        continue
+                    
+                    # Pre-check if method is initialized or can be initialized
+                    if not self._init_ocr(method):
+                        print(f"EXTRACT: Skipping {method} - initialization failed")
+                        continue
+                    
+                    # Skip methods that don't have an implementation
+                    if not hasattr(self, f'extract_with_{method}'):
+                        print(f"EXTRACT: Method {method} doesn't have an implementation - skipping")
+                        continue
+                    
+                    try:
+                        current_method = method
+                        print(f"EXTRACT: Trying OCR with {method}...")
+                        
+                        # Signal start of extraction with this method
+                        if progress_callback:
+                            try:
+                                progress_callback(0, method)
+                            except Exception as e:
+                                print(f"EXTRACT: Progress callback error: {e}")
+                        
+                        # Verify tesseract is available if using tesseract
+                        if method == 'tesseract':
+                            tesseract_available = (
+                                self._binaries.get('tesseract', False) and 
+                                hasattr(self, '_pytesseract') and 
+                                self._pytesseract is not None
+                            )
+                            if not tesseract_available:
+                                print("EXTRACT: Tesseract not properly available, skipping")
+                                self._ocr_failed_methods.add('tesseract')
+                                continue
+                        
+                        extraction_func = getattr(self, f'extract_with_{method}')
+                        
+                        # Extract text with thorough error handling
+                        try:
+                            text = extraction_func(
+                                pdf_path,
+                                lambda n: progress_callback(n, method) if progress_callback else None
+                            )
+                        except KeyboardInterrupt:
+                            print("\nEXTRACT: OCR interrupted by user.")
+                            raise
+                        except Exception as extract_error:
+                            print(f"EXTRACT: Error during {method} OCR: {extract_error}")
+                            # Mark this method as failed
+                            self._ocr_failed_methods.add(method)
+                            # Try to ensure progress callback completion
+                            if progress_callback:
+                                try:
+                                    progress_callback(1, method)
+                                except:
+                                    pass
+                            continue  # Try next OCR method
+                        
+                        if text and text.strip():
+                            text_parts.append(text.strip())
+                            print(f"EXTRACT: Successfully extracted text using {method}")
+                            break  # One successful OCR method is enough
+                        else:
+                            print(f"EXTRACT: No text extracted with {method}")
+                            
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as e:
+                        print(f"EXTRACT: Error with {method}: {str(e)}")
+                        self._ocr_failed_methods.add(method)
+                        continue
+                    finally:
+                        # Ensure progress callback completion
+                        if progress_callback and current_method == method:
+                            try:
+                                progress_callback(1, None)
+                            except Exception as e:
+                                print(f"EXTRACT: Progress callback completion error: {e}")
 
         except Exception as e:
             print(f"EXTRACT: Unexpected error in extraction: {str(e)}")
@@ -4197,7 +4281,7 @@ class PDFExtractor:
 
     def extract_with_calibre(self, pdf_path: str, progress_callback=None) -> str:
         """
-        Extract text using Calibre's ebook-converter - ultra-simplified version
+        Extract text using Calibre's ebook-converter with tracked process for Ctrl+C handling
         """
         import subprocess
         import tempfile
@@ -4236,13 +4320,12 @@ class PDFExtractor:
         
             print(f"CALIBRE: Running command: {calibre_bin} {pdf_path} {temp_output}")
             
-            # Run calibre command
-            result = subprocess.run(
+            # Use the tracked process function instead of subprocess.run
+            result = run_process(
                 [calibre_bin, pdf_path, temp_output],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                check=False
+                text=True
             )
             
             # Check result
@@ -7324,14 +7407,15 @@ class DocumentProcessor:
 # Keep the global signal handler for setting the shutdown_flag
 # Keep track of any OCR subprocesses
 ocr_processes = []
+active_processes = []  # Track all active subprocesses
+extraction_in_progress = threading.Event()  # Flag to indicate extraction is in progress
 
 def signal_handler(signum, frame):
     """
     Enhanced signal handler for SIGINT, SIGTERM, and other interrupt signals.
-    Sets the shutdown flag and logs the interrupt event.
-    Also attempts to terminate any running OCR processes.
+    Sets the shutdown flag and immediately terminates any running processes.
     """
-    global ocr_processes
+    global active_processes, extraction_in_progress
     
     if not shutdown_flag.is_set():  # Only log once
         signal_name = {
@@ -7340,49 +7424,95 @@ def signal_handler(signum, frame):
             signal.SIGTSTP: "SIGTSTP (Ctrl+Z)"
         }.get(signum, f"Signal {signum}")
         
-        logging.info(f"Received {signal_name}. Initiating graceful shutdown...")
+        logging.info(f"Received {signal_name}. Initiating forceful shutdown...")
         
-        # Try to terminate any active OCR processes
-        for proc in ocr_processes:
+        # Set shutdown flag
+        shutdown_flag.set()
+        
+        # Immediately terminate all tracked processes
+        for proc in list(active_processes):
             if proc and proc.poll() is None:  # If process exists and is still running
                 try:
+                    logging.info(f"Terminating process {proc.pid}")
                     proc.terminate()
-                    logging.info(f"Terminated OCR process {proc.pid}")
+                    
+                    # Give it a short time to terminate gracefully
+                    for _ in range(5):  # Wait up to 0.5 seconds
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(0.1)
+                    
+                    # If still running, force kill
+                    if proc.poll() is None:
+                        if platform.system() != 'Windows':
+                            logging.info(f"Forcefully killing process {proc.pid}")
+                            os.kill(proc.pid, signal.SIGKILL)
+                        else:
+                            logging.info(f"Forcefully terminating process {proc.pid}")
+                            proc.kill()
                 except Exception as e:
                     logging.error(f"Failed to terminate process: {e}")
         
-        # Also try to find and kill tesseract processes based on name
-        if platform.system() != 'Windows':
-            try:
-                # Find all tesseract processes
-                procs = subprocess.run(
-                    ["pkill", "-f", "tesseract"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                logging.info("Attempted to terminate tesseract processes")
-            except Exception as e:
-                logging.debug(f"Could not kill tesseract processes: {e}")
-        else:
-            try:
-                # Windows version
-                subprocess.run(
-                    ["taskkill", "/F", "/IM", "tesseract.exe"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                logging.info("Attempted to terminate tesseract processes")
-            except Exception as e:
-                logging.debug(f"Could not kill tesseract processes: {e}")
+        # Clean up active_processes list
+        active_processes.clear()
         
-        # Set the flag last
-        shutdown_flag.set()
+        # Set extraction_in_progress to false
+        extraction_in_progress.clear()
 
-# Register global handlers outside main()
+# Register enhanced signal handlers
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 if platform.system() != 'Windows':
     signal.signal(signal.SIGTSTP, signal_handler)
+
+def run_process(cmd, **kwargs):
+    """
+    Run a subprocess and track it for proper Ctrl+C handling.
+    
+    Args:
+        cmd: Command to run (list of strings)
+        **kwargs: Additional arguments for subprocess.run
+        
+    Returns:
+        subprocess.CompletedProcess: The completed process object
+    """
+    global active_processes
+    
+    # Set extraction in progress
+    extraction_in_progress.set()
+    
+    # Start the process
+    process = subprocess.Popen(
+        cmd,
+        stdout=kwargs.get('stdout', subprocess.PIPE),
+        stderr=kwargs.get('stderr', subprocess.PIPE),
+        text=kwargs.get('text', True)
+    )
+    
+    # Add to active processes list
+    active_processes.append(process)
+    
+    try:
+        # Wait for process to complete
+        stdout, stderr = process.communicate()
+        
+        # Create a CompletedProcess object similar to subprocess.run
+        result = subprocess.CompletedProcess(
+            args=cmd,
+            returncode=process.returncode,
+            stdout=stdout,
+            stderr=stderr
+        )
+        
+        return result
+    finally:
+        # Remove from active processes list
+        if process in active_processes:
+            active_processes.remove(process)
+        
+        # If this was the last process, clear the extraction flag
+        if not active_processes:
+            extraction_in_progress.clear()
 
 def is_file_in_rename_script(rename_script_path, input_file):
     """
@@ -8613,8 +8743,8 @@ def main():
     )
     
     try:
-        # Build list of supported extensions
-        supported_extensions = list(ExtractionManager.SUPPORTED_EXTENSIONS.keys())
+        # Build list of supported extensions (ensure they're all lowercase for comparison)
+        supported_extensions = [ext.lower() for ext in ExtractionManager.SUPPORTED_EXTENSIONS.keys()]
         
         # Debug print to see what extensions are supported
         logging.debug(f"Supported extensions: {supported_extensions}")
