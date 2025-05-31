@@ -1603,7 +1603,7 @@ class MOBIExtractor:
             return False
 
     def extract_text(self, mobi_path: str, preferred_method: Optional[str] = None,
-                    progress_callback: Optional[Callable] = None, **kwargs) -> str:
+                     progress_callback: Optional[Callable] = None, **kwargs) -> str:
         """
         Extract text from MOBI with fallback methods
         
@@ -1715,7 +1715,7 @@ class MOBIExtractor:
             logging.debug(f"MOBI library extraction failed: {e}")
             return ""
 
-    def find_kindleunpack():
+    def find_kindleunpack(self): # <<< MODIFIED HERE: Added 'self'
         """
         Find kindleunpack module or script in various locations.
         
@@ -2038,7 +2038,7 @@ class DJVUExtractor:
         if self._debug and djvu_type:
             logging.debug(f"Found djvu as {djvu_type} at: {djvu_path}")
 
-    def find_djvu_lib():
+    def find_djvu_lib(self): # <<< MODIFIED HERE: Added 'self'
         """
         Find djvu Python bindings or command-line tools in various locations.
         
@@ -2047,7 +2047,7 @@ class DJVUExtractor:
         """
         # First check if python-djvulibre is available
         try:
-            import djvu
+            import djvu # This import should ideally use self._import_cache if available
             return ('module', djvu.__file__)
         except ImportError:
             pass
@@ -2230,7 +2230,12 @@ class DJVUExtractor:
                 pdf_path = temp.name
             
             # Convert DJVU to PDF
-            cmd = ['ddjvu', '-format=pdf', djvu_path, pdf_path]
+            ddjvu_bin = self._binary_paths.get('ddjvu') or shutil.which('ddjvu')
+            if not ddjvu_bin:
+                logging.warning("ddjvu binary not found for PDF conversion.")
+                return ""
+
+            cmd = [ddjvu_bin, '-format=pdf', djvu_path, pdf_path]
             process = subprocess.run(cmd, capture_output=True, text=True)
             
             if process.returncode != 0:
@@ -2243,7 +2248,7 @@ class DJVUExtractor:
             # But avoid circular imports, so we'll create it dynamically
             text = ""
             try:
-                pdf_extractor = PDFExtractor(debug=self._debug)
+                pdf_extractor = PDFExtractor(debug=self._debug, binary_paths=self._binary_paths)
                 text = pdf_extractor.extract_text(
                     pdf_path,
                     progress_callback=progress_callback
@@ -2762,308 +2767,511 @@ class HTMLExtractor:
             return ""
 
 class EPUBExtractor:
-    """EPUB text extraction with multiple fallback methods"""
-    
-    def __init__(self, import_cache: ImportCache, debug: bool = False, binary_paths=None):
+    def __init__(self, import_cache: 'ImportCache', debug: bool = False, binary_paths: Optional[Dict[str, str]] = None):
         self._import_cache = import_cache
         self._debug = debug
-        self._checked_methods = {}
-        self._available_methods = None
-        self._binary_paths = binary_paths or {}
+        self._available_methods: Optional[Dict[str, bool]] = None
+        self._binary_paths: Dict[str, str] = binary_paths or {}
+
+        self.h = None  # html2text instance
+        if self._import_cache.is_available('html2text'):
+            try:
+                self.h = self._import_cache.import_module('html2text').HTML2Text()
+                self.h.ignore_links = True
+                self.h.ignore_images = True
+                self.h.ignore_tables = False  # Keep tables for more content
+                self.h.body_width = 0  # No wrap
+                self.h.unicode_snob = True  # Better unicode handling
+                self.h.escape_snob = True  # Escape special chars
+                if self._debug:
+                    logging.debug("EPUBExtractor: html2text initialized successfully.")
+            except Exception as e_html2text:
+                if self._debug:
+                    logging.error(f"EPUBExtractor: Failed to initialize html2text: {e_html2text}", exc_info=self._debug)
+                self.h = None
+        elif self._debug:
+            logging.debug("EPUBExtractor: html2text module not available.")
+
+    def _get_module_or_log(self, module_name: str, method_context: str, file_basename: str) -> Optional[Any]:
+        """Helper to import module and log if unavailable for a given method."""
+        if not self._import_cache.is_available(module_name):
+            logging.warning(f"{method_context} method for '{file_basename}': '{module_name}' dependency not available. Cannot use this method.")
+            return None
+        try:
+            return self._import_cache.import_module(module_name)
+        except Exception as e:
+            logging.error(f"{method_context} method for '{file_basename}': Failed to import '{module_name}': {e}", exc_info=self._debug)
+            return None
 
     @property
     def available_methods(self) -> Dict[str, bool]:
-        """Lazy load available methods"""
         if self._available_methods is None:
+            can_ebooklib = self._import_cache.is_available('ebooklib') and \
+                           self._import_cache.is_available('bs4')
+            
+            can_bs4 = self._import_cache.is_available('bs4') and \
+                      self._import_cache.is_available('zipfile') and \
+                      self.h is not None
+            
+            can_epub2txt = self._import_cache.is_available('epub2txt')
+            can_calibre = self._check_calibre_available()
+            can_zipfile = self._import_cache.is_available('zipfile')
+
             self._available_methods = {
-                'ebooklib': self._import_cache.is_available('ebooklib'),
-                'bs4': self._import_cache.is_available('bs4'),
-                'html2text': self._import_cache.is_available('html2text'),
-                'calibre': self._check_calibre_available(),  
-                'zipfile': True  # Basic fallback always available
+                'ebooklib': can_ebooklib,
+                'bs4': can_bs4,
+                'epub2txt': can_epub2txt,
+                'calibre': can_calibre,
+                'zipfile': can_zipfile
             }
+            if self._debug:
+                logging.debug(f"EPUBExtractor available_methods check results: {self._available_methods}")
         return self._available_methods
-    
-    def _check_calibre_available(self):
-        """Check if Calibre converter is available"""
-        try:
-            # First check if we have the path in binary_paths
-            if self._binary_paths.get('ebook-converter'):
+
+    def _check_calibre_available(self) -> bool:
+        binary_paths_dict = getattr(self, '_binary_paths', {}) or {}
+        calibre_bin = binary_paths_dict.get('ebook-converter')
+        if calibre_bin and os.path.exists(calibre_bin): # Also check existence
+            if self._debug: logging.debug(f"Calibre (ebook-converter) found via _binary_paths for EPUB: {calibre_bin}")
+            return True
+        
+        for bin_name in ['ebook-converter', 'ebook-convert']:
+            found_path = shutil.which(bin_name)
+            if found_path:
+                if self._debug: logging.debug(f"Calibre ({bin_name}) found via shutil.which for EPUB: {found_path}")
+                # Optionally store this found path if not already in _binary_paths
+                if 'ebook-converter' not in binary_paths_dict or not binary_paths_dict.get('ebook-converter'):
+                    self._binary_paths['ebook-converter'] = found_path
                 return True
-                
-            # Otherwise check standard locations
-            for bin_name in ['ebook-converter', 'ebook-convert']:
-                if shutil.which(bin_name):
-                    return True
-            return False
-        except:
-            return False
+        if self._debug: logging.debug("Calibre binary not found for EPUBExtractor.")
+        return False
 
     def extract_text(self, epub_path: str, preferred_method: Optional[str] = None,
-                    progress_callback: Optional[Callable] = None) -> str:
-        """
-        Extract text with fallback methods and progress reporting
+                     progress_callback: Optional[Callable] = None) -> str:
+        # Default method order: dedicated libraries first, then general tools, then raw.
+        methods = ['ebooklib', 'bs4', 'epub2txt', 'calibre', 'zipfile']
         
-        Args:
-            epub_path: Path to EPUB file
-            preferred_method: Optional preferred extraction method
-            progress_callback: Optional callback for progress updates
-            
-        Returns:
-            Extracted text
-        """
-        methods = ['ebooklib', 'bs4', 'calibre', 'zipfile']
+        file_basename = os.path.basename(epub_path) # For logging
+        logging.info(f"Starting EPUB extraction for: '{file_basename}'")
+
         if preferred_method:
             if preferred_method not in methods:
-                raise ValueError(f"Invalid method: {preferred_method}")
-            methods.insert(0, methods.pop(methods.index(preferred_method)))
+                logging.warning(f"Invalid preferred method for EPUB '{file_basename}': {preferred_method}. Using default order: {methods}")
+            else:
+                methods.remove(preferred_method)
+                methods.insert(0, preferred_method)
+                logging.info(f"Using preferred method '{preferred_method}'. New EPUB method order: {methods}")
+        else:
+            logging.info(f"Using default EPUB method order: {methods}")
 
-        text = ""
-        with tqdm(total=len(methods), desc="Trying extraction methods", unit="method") as method_pbar:
-            for method in methods:
-                if not self.available_methods.get(method, False):
+
+        extracted_text_content = ""
+
+        # tqdm for iterating through methods for this specific EPUB file
+        with tqdm(total=len(methods), desc=f"EPUB Methods ({file_basename})", unit="mthd", leave=False, position=1) as method_pbar:
+            for method_name in methods:
+                if shutdown_flag.is_set():
+                    logging.info(f"Shutdown flag detected during EPUB method loop for '{file_basename}'. Aborting further methods.")
+                    break
+                
+                method_pbar.set_description(f"EPUB Method [{method_name}] ({file_basename})")
+
+                if not self.available_methods.get(method_name):
+                    logging.info(f"EPUB method '{method_name}' for '{file_basename}' is not available or its dependencies are missing. Skipping.")
                     method_pbar.update(1)
                     continue
-                    
+
+                logging.info(f"Attempting EPUB '{file_basename}' with method: {method_name}")
+                current_method_text = ""
                 try:
+                    if progress_callback: progress_callback(1, f"epub_try_{method_name}")
+
+                    extraction_func = getattr(self, f'extract_with_{method_name}')
+                    
+                    internal_cb = None
                     if progress_callback:
-                        progress_callback(0, method)  # Signal start with method name
-                    
-                    extraction_func = getattr(self, f'extract_with_{method}')
-                    text = extraction_func(
-                        epub_path,
-                        lambda n: progress_callback(n, method) if progress_callback else None
-                    )
-                    
-                    if text and text.strip():
+                        internal_cb = lambda n_fixed_increment, step_desc=method_name: progress_callback(n_fixed_increment, f"epub_{step_desc}_item")
+
+                    current_method_text = extraction_func(epub_path, internal_cb)
+
+                    if current_method_text and current_method_text.strip():
+                        extracted_text_content = current_method_text.strip()
+                        logging.info(f"SUCCESS: Extracted {len(extracted_text_content)} chars from EPUB '{file_basename}' using: {method_name}")
+                        if progress_callback: progress_callback(100, f"epub_done_{method_name}") 
                         method_pbar.update(1)
-                        break
-                        
+                        break 
+                    else:
+                        logging.warning(f"EPUB method '{method_name}' returned NO TEXT for '{file_basename}'.")
+                        if progress_callback: progress_callback(0, f"epub_empty_{method_name}")
+
+
+                except KeyboardInterrupt:
+                    logging.info(f"EPUB extraction with '{method_name}' for '{file_basename}' interrupted by user.")
+                    if progress_callback: progress_callback(0, f"epub_intr_{method_name}")
+                    raise
                 except Exception as e:
-                    logging.debug(f"Error with {method}: {e}")
-                    
+                    logging.warning(f"Error during EPUB extraction with method '{method_name}' for '{file_basename}': {str(e)}")
+                    if self._debug:
+                        logging.debug(f"Traceback for EPUB method '{method_name}' failure on '{file_basename}':", exc_info=True)
+                    if progress_callback: progress_callback(0, f"epub_err_{method_name}")
+                
                 method_pbar.update(1)
-
-        return text.strip()
-
-    def extract_with_ebooklib(self, epub_path: str, progress_callback=None) -> str:
-        """Extract using ebooklib with BeautifulSoup parsing and progress bars"""
-        ebooklib = self._import_cache.import_module('ebooklib')
-        BeautifulSoup = self._import_cache.import_module('bs4').BeautifulSoup
         
-        text_parts = []
+        if not extracted_text_content:
+            logging.warning(f"FINAL WARNING: No text extracted from EPUB '{file_basename}' after all attempts.")
+        return extracted_text_content
+
+    def extract_with_ebooklib(self, epub_path: str, progress_callback: Optional[Callable] = None) -> str:
+        file_basename = os.path.basename(epub_path)
+        logging.info(f"Ebooklib: Starting extraction for '{file_basename}'.")
+
+        ebooklib_module = self._get_module_or_log('ebooklib', 'Ebooklib', file_basename)
+        epub_module = self._get_module_or_log('ebooklib.epub', 'Ebooklib', file_basename)
+        BeautifulSoup = self._get_module_or_log('bs4', 'Ebooklib', file_basename)
+
+        if not all([ebooklib_module, epub_module, BeautifulSoup]):
+            if progress_callback: progress_callback(100, "ebooklib_deps_missing")
+            return ""
+        
+        text_parts: List[str] = []
         book = None
+        processed_item_count = 0
         
         try:
-            with tqdm(desc="Loading EPUB", unit="file") as pbar:
-                book = ebooklib.epub.read_epub(epub_path)
-                pbar.update(1)
+            book = epub_module.read_epub(epub_path)
+            items_in_spine_order = []
+            if book.spine:
+                item_map = {item.id: item for item in book.items}
+                for item_id, _ in book.spine: # Ensure we only process IDs present in items
+                    item_from_map = item_map.get(item_id)
+                    if item_from_map and item_from_map.get_type() == ebooklib_module.ITEM_DOCUMENT:
+                        items_in_spine_order.append(item_from_map)
             
-            items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+            items_to_process = items_in_spine_order or list(book.get_items_of_type(ebooklib_module.ITEM_DOCUMENT))
             
-            with tqdm(total=len(items), desc="Extracting content", unit="item") as pbar:
-                for i, item in enumerate(items):
+            if not items_to_process:
+                logging.warning(f"Ebooklib: No processable document items found in '{file_basename}'.")
+                if progress_callback: progress_callback(80, "ebooklib_no_items") # Considered a significant portion of this method
+                return ""
+            
+            logging.debug(f"Ebooklib: Found {len(items_to_process)} document items to process in '{file_basename}'.")
+            
+            with tqdm(total=len(items_to_process), desc=f"Ebooklib items ({file_basename})", unit="item", leave=False, position=2) as pbar_items:
+                for item_idx, item in enumerate(items_to_process):
+                    if shutdown_flag.is_set(): break
+                    pbar_items.set_description(f"Ebooklib item {item_idx+1}/{len(items_to_process)} ({item.get_name()[:20]})")
+                    item_text_content = ""
                     try:
-                        content = item.get_content().decode('utf-8')
+                        content_bytes = item.get_content()
+                        # Basic XML prolog check for encoding
+                        detected_encoding = 'utf-8'
+                        try:
+                            preamble = content_bytes[:150].decode('ascii', errors='ignore').lower()
+                            match = re.search(r'encoding="([^"]+)"', preamble)
+                            if match:
+                                detected_encoding = match.group(1)
+                                if self._debug: logging.debug(f"Ebooklib: Detected encoding '{detected_encoding}' for item '{item.get_name()}'")
+                        except Exception: pass # Ignore if preamble decoding fails
+
+                        content = content_bytes.decode(detected_encoding, errors='replace')
                         soup = BeautifulSoup(content, 'html.parser')
                         
-                        # Remove unwanted elements
-                        for tag in soup(['script', 'style', 'nav']):
-                            tag.decompose()
+                        for tag_type in soup(['script', 'style', 'nav', 'meta', 'link', 'head', 'title', 
+                                              'figure', 'figcaption', 'aside', 'footer', 'header', 
+                                              'annotation', 'ann', '[fallback]', 'svg', 'img']): # Remove svg, img
+                            tag_type.decompose()
                         
-                        # Extract text with layout preservation
-                        text = self._process_html_content(soup)
-                        if text.strip():
-                            text_parts.append(text.strip())
+                        body_tag = soup.find('body')
+                        target_node = body_tag if body_tag else soup
                         
-                        pbar.update(1)
-                        if progress_callback:
-                            progress_callback(1)
-                            
-                    except Exception as e:
-                        logging.debug(f"Item extraction failed: {e}")
-                        continue
-                    
-        finally:
-            book = None  # Release memory
-            
-        return '\n\n'.join(text_parts)
+                        item_text_segments = [s.strip() for s in target_node.get_text(separator='\n', strip=False).splitlines() if s.strip()]
+                        item_text_content = '\n'.join(item_text_segments)
 
-    def _process_html_content(self, soup) -> str:
-        """Process HTML content with layout preservation"""
-        text_parts = []
+                        if item_text_content:
+                            text_parts.append(item_text_content)
+                            if self._debug: logging.debug(f"Ebooklib: Extracted {len(item_text_content)} chars from item '{item.get_name()}'")
+                        elif self._debug:
+                            logging.debug(f"Ebooklib: No text extracted from item '{item.get_name()}'")
+                        processed_item_count +=1
+                    except Exception as e_item:
+                        logging.debug(f"Ebooklib: Item extraction failed for '{item.get_name()}' in '{file_basename}': {str(e_item)[:100]}")
+                        if self._debug: logging.debug(f"Traceback for item '{item.get_name()}' failure:", exc_info=True)
+                    finally:
+                        pbar_items.update(1)
+                        if progress_callback: progress_callback(1, "item") 
+                            
+        except Exception as e_main:
+            logging.warning(f"Ebooklib: Main processing failed for EPUB '{file_basename}': {str(e_main)[:100]}")
+            if self._debug: logging.debug(f"Traceback for Ebooklib failure on '{file_basename}':", exc_info=True)
+            if progress_callback: progress_callback(100, "ebooklib_error")
+            return ""
+        finally:
+            if book: del book
+
+        final_text = '\n\n'.join(filter(None, text_parts))
+        logging.info(f"Ebooklib: Finished for '{file_basename}', processed {processed_item_count}/{len(items_to_process) if 'items_to_process' in locals() and items_to_process else 0} items, extracted {len(final_text)} total chars.")
+        if progress_callback and not final_text and processed_item_count > 0: progress_callback(100, "ebooklib_empty_text")
+        elif progress_callback and final_text: progress_callback(100, "ebooklib_text_found")
+        return final_text
+
+    def extract_with_bs4(self, epub_path: str, progress_callback: Optional[Callable] = None) -> str:
+        file_basename = os.path.basename(epub_path)
+        logging.info(f"BS4/Zip: Starting extraction for '{file_basename}'.")
+
+        BeautifulSoup = self._get_module_or_log('bs4', 'BS4/Zip', file_basename)
+        zipfile_module = self._get_module_or_log('zipfile', 'BS4/Zip', file_basename)
+        # self.h (html2text instance) is checked by available_methods
+
+        if not all([BeautifulSoup, zipfile_module, self.h]):
+            if progress_callback: progress_callback(100, "bs4_deps_missing")
+            return ""
         
-        # Process headings with progress
-        headings = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
-        with tqdm(total=len(headings), desc="Processing headings", unit="heading", leave=False) as pbar:
-            for tag in headings:
-                text = tag.get_text(strip=True)
-                if text:
-                    text_parts.append(f"\n{text}\n")
-                pbar.update(1)
-        
-        # Process paragraphs and other block elements with progress
-        blocks = soup.find_all(['p', 'div', 'section'])
-        with tqdm(total=len(blocks), desc="Processing blocks", unit="block", leave=False) as pbar:
-            for tag in blocks:
-                text = tag.get_text(strip=True)
-                if text:
-                    text_parts.append(text)
-                pbar.update(1)
-        
-        return '\n\n'.join(text_parts)
-    
-    def extract_with_calibre(self, epub_path: str, progress_callback=None) -> str:
-        """Extract text using Calibre's ebook-converter"""
+        text_parts: List[str] = []
+        processed_item_count = 0
         try:
-            import subprocess
-            import tempfile
-            
-            # Check if ebook-converter or ebook-convert is available
-            calibre_bin = None
-            for bin_name in ['ebook-converter', 'ebook-convert']:
-                try:
-                    calibre_bin = shutil.which(bin_name)
-                    if calibre_bin:
-                        break
-                except:
-                    pass
-            
-            if not calibre_bin:
-                logging.debug("Calibre ebook-converter/ebook-convert not found")
-                return ""
+            with zipfile_module.ZipFile(epub_path) as zf:
+                html_files = [f for f in zf.namelist() if f.lower().endswith(('.html', '.xhtml', '.htm')) and 
+                                                      not f.lower().startswith('meta-inf/')]
+                if not html_files:
+                    logging.warning(f"BS4/Zip: No HTML/XHTML files found in EPUB '{file_basename}'.")
+                    if progress_callback: progress_callback(80, "bs4_no_html_files")
+                    return ""
                 
-            # Create temporary output file
-            with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temp:
-                output_path = temp.name
-                
-            # Run Calibre to convert to text
-            cmd = [calibre_bin, epub_path, output_path]
+                logging.debug(f"BS4/Zip: Found {len(html_files)} HTML/XHTML files in '{file_basename}'.")
+                with tqdm(total=len(html_files), desc=f"BS4/Zip items ({file_basename})", unit="file", leave=False, position=2) as pbar_html:
+                    for file_idx, html_file_name in enumerate(html_files):
+                        if shutdown_flag.is_set(): break
+                        pbar_html.set_description(f"BS4/Zip item {file_idx+1}/{len(html_files)}")
+                        item_text_content = ""
+                        try:
+                            content_bytes = zf.read(html_file_name)
+                            content = content_bytes.decode('utf-8', errors='replace')
+                            soup = BeautifulSoup(content, 'html.parser')
+                            for tag_type in soup(['script', 'style', 'nav', 'meta', 'link', 'head', 'title', 
+                                                  'figure', 'figcaption', 'aside', 'footer', 'header', 'annotation']):
+                                tag_type.decompose()
+                            
+                            item_text_content = self.h.handle(str(soup)).strip()
+                            if item_text_content:
+                                text_parts.append(item_text_content)
+                                if self._debug: logging.debug(f"BS4/Zip: Extracted {len(item_text_content)} chars from item '{html_file_name}'")
+                            elif self._debug:
+                                logging.debug(f"BS4/Zip: No text extracted from item '{html_file_name}'")
+                            processed_item_count += 1
+                        except Exception as e_item:
+                            logging.debug(f"BS4/Zip: Failed to process HTML file '{html_file_name}' in '{file_basename}': {str(e_item)[:100]}")
+                            if self._debug: logging.debug(f"Traceback for BS4/Zip item '{html_file_name}' failure:", exc_info=True)
+                        finally:
+                            pbar_html.update(1)
+                            if progress_callback: progress_callback(1, "item")
+        except zipfile_module.BadZipFile:
+            logging.warning(f"BS4/Zip: '{file_basename}' is not a valid zip file or is corrupted.")
+            if progress_callback: progress_callback(100, "bs4_bad_zip")
+            return ""
+        except Exception as e_main:
+            logging.warning(f"BS4/Zip: Main processing failed for EPUB '{file_basename}': {str(e_main)[:100]}")
+            if self._debug: logging.debug(f"Traceback for BS4/Zip failure on '{file_basename}':", exc_info=True)
+            if progress_callback: progress_callback(100, "bs4_error")
+            return ""
             
-            logging.debug(f"Running Calibre command: {' '.join(cmd)}")
-            
-            process = subprocess.run(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE, 
-                text=True,
-                check=False  # Don't raise exception on error
-            )
-            
-            if process.returncode != 0:
-                logging.warning(f"Calibre conversion returned error: {process.stderr}")
-                
-            # Read the output file if it exists
-            if os.path.exists(output_path):
-                with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
-                    text = f.read()
-                    
-                # Clean up temporary file
-                try:
-                    os.unlink(output_path)
-                except:
-                    pass
-                    
-                if progress_callback:
-                    progress_callback(1)
-                    
-                return text
-            else:
-                logging.warning(f"Calibre output file not created: {output_path}")
-                return ""
-                
-        except Exception as e:
-            logging.debug(f"Calibre extraction failed: {e}")
+        final_text = '\n\n'.join(filter(None, text_parts))
+        logging.info(f"BS4/Zip: Finished for '{file_basename}', processed {processed_item_count}/{len(html_files) if 'html_files' in locals() and html_files else 0} items, extracted {len(final_text)} total chars.")
+        if progress_callback and not final_text and processed_item_count > 0: progress_callback(100, "bs4_empty_text")
+        elif progress_callback and final_text: progress_callback(100, "bs4_text_found")
+        return final_text
+
+    def extract_with_epub2txt(self, epub_path: str, progress_callback: Optional[Callable] = None) -> str:
+        file_basename = os.path.basename(epub_path)
+        logging.info(f"Epub2txt: Starting extraction for '{file_basename}'.")
+        epub2txt_module = self._get_module_or_log('epub2txt', 'Epub2txt', file_basename)
+        if not epub2txt_module:
+            if progress_callback: progress_callback(100, "epub2txt_module_missing")
             return ""
 
-    def extract_with_bs4(self, epub_path: str, progress_callback=None) -> str:
-        """Extract using BeautifulSoup with zipfile and progress bars"""
-        BeautifulSoup = self._import_cache.import_module('bs4').BeautifulSoup
-        html2text = self._import_cache.import_module('html2text').HTML2Text()
-        zipfile = self._import_cache.import_module('zipfile')
-        
-        text_parts = []
-        
         try:
-            with zipfile.ZipFile(epub_path) as zf:
-                # Get HTML files
-                html_files = [f for f in zf.namelist() 
-                            if f.endswith(('.html', '.xhtml', '.htm'))]
-                
-                with tqdm(total=len(html_files), desc="Processing HTML files", unit="file") as pbar:
-                    for i, html_file in enumerate(html_files):
-                        try:
-                            content = zf.read(html_file).decode('utf-8')
-                            soup = BeautifulSoup(content, 'html.parser')
-                            
-                            # Remove unwanted elements
-                            for tag in soup(['script', 'style', 'nav']):
-                                tag.decompose()
-                            
-                            # Convert to markdown-style text
-                            html2text.ignore_links = True
-                            html2text.ignore_images = True
-                            text = html2text.handle(str(soup))
-                            
-                            if text.strip():
-                                text_parts.append(text.strip())
-                            
-                            pbar.update(1)
-                            if progress_callback:
-                                progress_callback(1)
-                                
-                        except Exception as e:
-                            logging.debug(f"File extraction failed: {e}")
-                            continue
-                            
-        except Exception as e:
-            logging.error(f"EPUB extraction failed: {e}")
+            # The epub2txt function from the library is usually the entry point
+            # It might be named epub2txt.epub2txt or just epub2txt.epub2txt
+            if hasattr(epub2txt_module, 'epub2txt') and callable(getattr(epub2txt_module, 'epub2txt')):
+                converter = getattr(epub2txt_module, 'epub2txt')
+            else: # Fallback if the structure is different (e.g. older version or direct import of function)
+                converter = epub2txt_module 
             
-        return '\n\n'.join(text_parts)
+            # The library can sometimes return a list of chapters or a single string
+            # We will request outputlist=False to get a single string if possible, or join if it's a list
+            result = converter(epub_path, outputlist=False) # Ask for a single string
+            
+            extracted_text = ""
+            if isinstance(result, str):
+                extracted_text = result.strip()
+            elif isinstance(result, list): # If it returns a list of chapters/strings
+                extracted_text = "\n\n".join(str(item).strip() for item in result if str(item).strip())
+            
+            if extracted_text:
+                logging.info(f"Epub2txt: Successfully extracted {len(extracted_text)} chars from '{file_basename}'.")
+            else:
+                logging.warning(f"Epub2txt: Extracted no text from '{file_basename}'.")
+            
+            if progress_callback: progress_callback(100, "epub2txt_done")
+            return extracted_text
 
-    def extract_with_zipfile(self, epub_path: str, progress_callback=None) -> str:
-        """Basic fallback extraction using zipfile with progress bars"""
-        zipfile = self._import_cache.import_module('zipfile')
-        import re
-        
-        text_parts = []
-        html_pattern = re.compile(r'<[^>]+>')
-        
-        try:
-            with zipfile.ZipFile(epub_path) as zf:
-                html_files = [f for f in zf.namelist() 
-                            if f.endswith(('.html', '.xhtml', '.htm'))]
-                
-                with tqdm(total=len(html_files), desc="Extracting text", unit="file") as pbar:
-                    for i, html_file in enumerate(html_files):
-                        try:
-                            content = zf.read(html_file).decode('utf-8')
-                            
-                            # Basic HTML cleaning
-                            content = re.sub(r'<script.*?</script>', '', content, 
-                                           flags=re.DOTALL)
-                            content = re.sub(r'<style.*?</style>', '', content, 
-                                           flags=re.DOTALL)
-                            content = html_pattern.sub(' ', content)
-                            
-                            # Clean up whitespace
-                            content = re.sub(r'\s+', ' ', content).strip()
-                            
-                            if content:
-                                text_parts.append(content)
-                            
-                            pbar.update(1)
-                            if progress_callback:
-                                progress_callback(1)
-                                
-                        except Exception as e:
-                            logging.debug(f"File extraction failed: {e}")
-                            continue
-                            
         except Exception as e:
-            logging.error(f"EPUB extraction failed: {e}")
+            logging.warning(f"Epub2txt: Extraction failed for '{file_basename}': {str(e)}")
+            if self._debug:
+                logging.debug(f"Traceback for Epub2txt failure on '{file_basename}':", exc_info=True)
+            if progress_callback: progress_callback(100, "epub2txt_error")
+            return ""
             
-        return '\n\n'.join(text_parts)
+    def extract_with_calibre(self, epub_path: str, progress_callback: Optional[Callable] = None) -> str:
+        file_basename = os.path.basename(epub_path)
+        if self._debug: logging.debug(f"EPUBExtractor: Attempting Calibre for '{file_basename}'")
+        
+        import tempfile # Keep imports local to method if not used elsewhere frequently
+        import subprocess # For run_process or direct call
+
+        calibre_bin = self._binary_paths.get('ebook-converter') # Prefer path from manager
+        if not calibre_bin or not os.path.exists(calibre_bin): # Check existence
+            for bin_name in ['ebook-converter', 'ebook-convert']:
+                path = shutil.which(bin_name)
+                if path:
+                    calibre_bin = path
+                    break
+        
+        if not calibre_bin:
+            logging.warning(f"Calibre ebook-converter not found for EPUB '{file_basename}'. Cannot use Calibre method.")
+            if progress_callback: progress_callback(100, "calibre_not_found")
+            return ""
+            
+        temp_output_file = None
+        try:
+            fd, temp_output_file = tempfile.mkstemp(suffix='.txt')
+            os.close(fd) # Close file descriptor, NamedTemporaryFile handles this better but mkstemp is fine
+            
+            cmd = [calibre_bin, epub_path, temp_output_file] # "--input-encoding=utf-8", "--output-encoding=utf-8"
+            if self._debug: logging.debug(f"Running Calibre command for EPUB '{file_basename}': {' '.join(cmd)}")
+            
+            # Assuming run_process is a global helper for subprocess calls
+            # If not, use subprocess.run directly:
+            process = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            # process = run_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) 
+            
+            if process.returncode != 0:
+                # This is where the ImportError from your local ebook-converter will be caught
+                logging.warning(f"Calibre conversion for EPUB '{file_basename}' failed (code {process.returncode}). Stderr: {process.stderr.strip()[:500]}")
+                if progress_callback: progress_callback(100, "calibre_error") # Signal method completion (with error)
+                return "" 
+            
+            extracted_text = ""
+            if os.path.exists(temp_output_file):
+                with open(temp_output_file, 'r', encoding='utf-8', errors='replace') as f:
+                    extracted_text = f.read().strip()
+                if extracted_text:
+                    logging.info(f"Calibre: Successfully extracted {len(extracted_text)} chars from '{file_basename}'")
+                else:
+                    logging.warning(f"Calibre: Extracted empty text from '{file_basename}'")
+            else:
+                logging.warning(f"Calibre output file was not created: {temp_output_file}")
+
+            if progress_callback: progress_callback(100, "calibre_done")
+            return extracted_text
+
+        except Exception as e:
+            logging.error(f"Exception during Calibre EPUB extraction for '{file_basename}': {str(e)}")
+            if self._debug: logging.debug(f"Traceback for Calibre EPUB failure:", exc_info=True)
+            if progress_callback: progress_callback(100, "calibre_exception")
+            return ""
+        finally:
+            if temp_output_file and os.path.exists(temp_output_file):
+                try: os.unlink(temp_output_file)
+                except Exception as e_unlink: logging.debug(f"Error unlinking temp Calibre output {temp_output_file}: {e_unlink}")
+
+    def extract_with_zipfile(self, epub_path: str, progress_callback: Optional[Callable] = None) -> str:
+        file_basename = os.path.basename(epub_path)
+        logging.info(f"Zipfile: Starting raw extraction for '{file_basename}'. This is a last resort.")
+        zipfile_module = self._get_module_or_log('zipfile', 'Zipfile', file_basename)
+        if not zipfile_module:
+            if progress_callback: progress_callback(100, "zipfile_module_missing")
+            return ""
+
+        import re
+        text_parts: List[str] = []
+        script_style_pattern = re.compile(r'<(script|style)\b[^>]*>.*?</\1>', re.DOTALL | re.IGNORECASE)
+        tag_pattern = re.compile(r'<[^>]+>')
+        
+        processed_item_count = 0
+        try:
+            with zipfile_module.ZipFile(epub_path) as zf:
+                # Try to be a bit smarter about file selection: OPF might list spine items
+                content_files = []
+                try:
+                    opf_file_name = next(f for f in zf.namelist() if f.lower().endswith('.opf'))
+                    opf_content = zf.read(opf_file_name).decode('utf-8', errors='replace')
+                    # Basic spine item extraction (can be much more complex with namespaces)
+                    spine_item_ids = re.findall(r'<itemref\s+idref="([^"]+)"', opf_content)
+                    manifest_items = {m.group(1): m.group(2) for m in re.finditer(r'<item\s+id="([^"]+)"[^>]+href="([^"]+)"', opf_content)}
+                    for item_id in spine_item_ids:
+                        href = manifest_items.get(item_id)
+                        if href:
+                            # Resolve relative path from OPF
+                            opf_dir = os.path.dirname(opf_file_name)
+                            full_href_path = os.path.normpath(os.path.join(opf_dir, href))
+                            if full_href_path in zf.namelist():
+                                content_files.append(full_href_path)
+                    if self._debug and content_files: logging.debug(f"Zipfile: Prioritizing {len(content_files)} files from OPF spine.")
+                except StopIteration:
+                    logging.debug(f"Zipfile: No OPF file found in '{file_basename}', falling back to all HTML/TXT.")
+                except Exception as e_opf:
+                    logging.debug(f"Zipfile: Error parsing OPF for '{file_basename}': {e_opf}")
+
+                if not content_files: # Fallback if OPF parsing fails or no spine
+                    content_files = [f for f in zf.namelist() if f.lower().endswith(('.html', '.xhtml', '.htm', '.txt')) and not f.lower().startswith('meta-inf/')]
+
+                if not content_files:
+                    logging.warning(f"Zipfile: No suitable content files (HTML/XHTML/TXT) found in EPUB '{file_basename}'.")
+                    if progress_callback: progress_callback(80, "zipfile_no_content_files")
+                    return ""
+                
+                logging.debug(f"Zipfile: Found {len(content_files)} potential content files in '{file_basename}'.")
+                with tqdm(total=len(content_files), desc=f"Zip items ({file_basename})", unit="item", leave=False, position=2) as pbar_zip:
+                    for item_idx, item_name in enumerate(content_files):
+                        if shutdown_flag.is_set(): break
+                        pbar_zip.set_description(f"Zip item {item_idx+1}/{len(content_files)}")
+                        try:
+                            content_bytes = zf.read(item_name)
+                            content = content_bytes.decode('utf-8', errors='replace')
+                            
+                            if item_name.lower().endswith(('.html', '.xhtml', '.htm')):
+                                cleaned_content = script_style_pattern.sub('', content)
+                                cleaned_content = tag_pattern.sub(' ', cleaned_content)
+                            else: # For .txt files
+                                cleaned_content = content
+                            
+                            # Basic HTML entity decoding (can be expanded)
+                            cleaned_content = cleaned_content.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+                            item_text = re.sub(r'\s+', ' ', cleaned_content).strip()
+                            
+                            if item_text:
+                                text_parts.append(item_text)
+                            processed_item_count += 1
+                        except Exception as e_item:
+                            logging.debug(f"Zipfile: Error processing item '{item_name}' in '{file_basename}': {str(e_item)[:100]}")
+                        finally:
+                            pbar_zip.update(1)
+                            if progress_callback: progress_callback(1, "item")
+        except zipfile_module.BadZipFile:
+            logging.warning(f"Zipfile: '{file_basename}' is not a valid zip file or is corrupted.")
+            if progress_callback: progress_callback(100, "zipfile_bad_zip")
+            return ""
+        except Exception as e_main:
+            logging.warning(f"Zipfile: Main error processing '{file_basename}': {str(e_main)[:100]}")
+            if self._debug: logging.debug(f"Traceback for Zipfile failure on '{file_basename}':", exc_info=True)
+            if progress_callback: progress_callback(100, "zipfile_error")
+            return ""
+
+        final_text = '\n\n'.join(filter(None, text_parts))
+        logging.info(f"Zipfile: Finished for '{file_basename}', processed {processed_item_count}/{len(content_files) if 'content_files' in locals() and content_files else 0} items, extracted {len(final_text)} total chars.")
+        if progress_callback and not final_text and processed_item_count > 0 : progress_callback(100, "zipfile_empty_text")
+        elif progress_callback and final_text: progress_callback(100, "zipfile_text_found")
+        return final_text
 
 class TableExtractor:
     """PDF table extraction using Camelot"""
@@ -3453,14 +3661,14 @@ class PDFExtractor:
             }
             
             # Handle potential user home directory paths
-            for binary in common_dirs:
+            for binary_key_in_loop in common_dirs: 
                 expanded_paths = []
-                for path in common_dirs[binary]:
-                    if '~' in path:
-                        expanded_paths.append(os.path.expanduser(path))
+                for path_in_loop in common_dirs[binary_key_in_loop]: 
+                    if '~' in path_in_loop:
+                        expanded_paths.append(os.path.expanduser(path_in_loop))
                     else:
-                        expanded_paths.append(path)
-                common_dirs[binary] = expanded_paths
+                        expanded_paths.append(path_in_loop)
+                common_dirs[binary_key_in_loop] = expanded_paths
         
         # First check PATH for each binary
         for binary, names in executable_names.items():
@@ -3473,12 +3681,12 @@ class PDFExtractor:
                     break
         
         # For binaries not found in PATH, check common directories
-        for binary, path in binary_paths.items():
-            if path is None and binary in common_dirs:
+        for binary, path_val in binary_paths.items(): 
+            if path_val is None and binary in common_dirs:
                 for directory in common_dirs[binary]:
                     if not os.path.exists(directory):
                         continue
-                        
+                    
                     for name in executable_names[binary]:
                         full_path = os.path.join(directory, name)
                         if os.path.exists(full_path) and os.access(full_path, os.X_OK):
@@ -3490,10 +3698,10 @@ class PDFExtractor:
                         break
         
         # Verify binary versions if found
-        for binary, path in binary_paths.items():
-            if path:
+        for binary, path_val_verify in binary_paths.items(): # Renamed variable
+            if path_val_verify:
                 # Skip verification for Calibre on Mac as it might not be executable directly
-                if binary == 'ebook-converter' and system == 'Darwin' and '/Applications/calibre.app' in path:
+                if binary == 'ebook-converter' and system == 'Darwin' and '/Applications/calibre.app' in path_val_verify:
                     if self._debug:
                         logging.debug(f"Skipping version check for {binary} in Mac app bundle")
                     continue
@@ -3504,7 +3712,7 @@ class PDFExtractor:
                     # For binaries that might error on version check but still work
                     try:
                         result = subprocess.run(
-                            [path, version_flag],
+                            [path_val_verify, version_flag],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
                             text=True,
@@ -3551,8 +3759,8 @@ class PDFExtractor:
         # Only show warnings for missing binaries once by tracking which warnings we've shown
         warned_about = getattr(self, '_warned_about_binaries', set())
         
-        for binary, path in binary_paths.items():
-            if not path and binary in download_info and binary not in warned_about:
+        for binary, path_val_warn in binary_paths.items(): # Renamed variable
+            if not path_val_warn and binary in download_info and binary not in warned_about:
                 logging.info(download_info[binary])
                 warned_about.add(binary)
         
@@ -3572,7 +3780,7 @@ class PDFExtractor:
             'calibre': bool(binary_paths['ebook-converter'])
         }
         
-        return binaries_bool
+        return binary_paths, binaries_bool
     
     def _check_core_dependencies(self):
         """Check core text extraction dependencies and add to initialized methods"""
@@ -8092,16 +8300,20 @@ def sort_author_names(author_names, provider, temperature: float = 0.3,
     
     # Check if name is already in "Lastname Firstname" format after basic processing
     parts = formatted_author_names.split()
-    if len(parts) >= 2:
+    # if len(parts) >= 2:
         # We have at least two parts, might be good enough
-        return formatted_author_names
+        # return formatted_author_names
     
     # Determine if we're using OpenAI client for Ollama or an LLM provider
-    is_openai_client = hasattr(provider, 'chat') and hasattr(provider.chat, 'completions')
+    is_raw_openai_client = hasattr(provider, 'chat') and hasattr(provider.chat, 'completions')
     
     # Use LLM to get the correct format with retries
     base_retry_wait = 2  # Base wait time in seconds
     for attempt in range(1, max_attempts + 1):
+        if shutdown_flag.is_set():
+            logging.info("Shutdown flag detected during author name sorting.")
+            return formatted_author_names # Return best effort
+
         if verbose:
             logging.debug(f"Attempt {attempt} to sort author name: {formatted_author_names}")
         
@@ -8133,79 +8345,88 @@ def sort_author_names(author_names, provider, temperature: float = 0.3,
         # Use the semaphore to limit concurrent requests
         with llm_semaphore:
             try:
-                if not hasattr(provider, 'chat_completion'):
-                    logging.warning(f"Provider {provider} missing chat_completion method")
-                    return author_names
-                
-                if is_openai_client:
-                    # Using OpenAI client for Ollama
+                reformatted_name_from_llm = None
+                if is_raw_openai_client:
+                    # Using raw OpenAI client (e.g., for Ollama)
                     response = provider.chat.completions.create(
-                        model=MODEL_NAME,
+                        model=MODEL_NAME, # Ensure MODEL_NAME is accessible or passed
                         temperature=temperature,
                         max_tokens=max_tokens,
                         messages=messages
                     )
-                    reformatted_name = response.choices[0].message.content.strip()
-                else:
-                    # Using an LLM provider instance
+                    reformatted_name_from_llm = response.choices[0].message.content.strip()
+                elif hasattr(provider, 'chat_completion'): # It's one of your custom LLMProvider wrappers
                     response = provider.chat_completion(
                         messages=messages,
                         temperature=temperature,
                         max_tokens=max_tokens
                     )
-                    reformatted_name = response["content"]
-                
-                # Check for tag issues and fix them
-                if "<AUTHOR>" not in reformatted_name:
-                    reformatted_name = f"<AUTHOR>{reformatted_name}</AUTHOR>"
-                if "</AUTHOR>" not in reformatted_name and not reformatted_name.endswith("</AUTHOR>"):
-                    reformatted_name = reformatted_name.replace("<AUTHOR>", "<AUTHOR>") + "</AUTHOR>"
-                
-                name_match = re.search(r'<AUTHOR>(.*?)</AUTHOR>', reformatted_name)
+                    reformatted_name_from_llm = response["content"]
+                else:
+                    # This case should ideally not be reached if provider validation is done earlier
+                    logging.warning(f"Provider {provider} is of an unexpected type in sort_author_names.")
+                    # Fallback to original name if provider is unusable
+                    if attempt == max_attempts: return formatted_author_names
+                    time.sleep(base_retry_wait * (1.5 ** (attempt - 1)))
+                    continue
+
+                if not reformatted_name_from_llm: # Handle empty response from LLM
+                    logging.warning(f"LLM returned empty response for author: {formatted_author_names}")
+                    if attempt < max_attempts:
+                         time.sleep(base_retry_wait * (1.5 ** (attempt - 1)))
+                         continue
+                    else: # Max attempts reached
+                        return formatted_author_names
+
+
+                # Tag checking and fixing
+                if "<AUTHOR>" not in reformatted_name_from_llm:
+                    reformatted_name_from_llm = f"<AUTHOR>{reformatted_name_from_llm}</AUTHOR>"
+                if "</AUTHOR>" not in reformatted_name_from_llm and not reformatted_name_from_llm.endswith("</AUTHOR>"):
+                     # Ensure it ends correctly without duplicating if already present at end
+                    if reformatted_name_from_llm.endswith("<AUTHOR>"): # case like <AUTHOR>Name<AUTHOR>
+                        reformatted_name_from_llm = reformatted_name_from_llm[:-len("<AUTHOR>")] + "</AUTHOR>"
+                    elif not reformatted_name_from_llm.endswith("</AUTHOR>"):
+                        reformatted_name_from_llm += "</AUTHOR>"
+
+
+                name_match = re.search(r'<AUTHOR>(.*?)</AUTHOR>', reformatted_name_from_llm)
                 if name_match:
                     ordered_name = name_match.group(1).strip()
-                    # Final cleanup - remove any placeholder text that might appear
                     ordered_name = re.sub(r'\b(Lastname|Firstname|Surname)\b', '', ordered_name, flags=re.IGNORECASE)
                     ordered_name = clean_author_name(ordered_name)
-                    logging.debug(f"Ordered name after cleaning: '{ordered_name}'")
-                    
-                    # Return it even if it's a single word - we won't add "Unknown"
-                    if ordered_name and len(ordered_name) >= 2:
+                    logging.debug(f"LLM ordered name after cleaning: '{ordered_name}'")
+                    if ordered_name and len(ordered_name) >= 2: # Check for minimal validity
                         return ordered_name
-                else:
-                    # Try to extract the name without tags if tags are malformed
-                    cleaned_response = reformatted_name.replace("</AUTHOR>", "").replace("<AUTHOR>", "").strip()
-                    if cleaned_response and cleaned_response not in ['Lastname Firstname', 'Unknown']:
+                else: # Try to extract without tags if LLM failed to provide them
+                    cleaned_response = reformatted_name_from_llm.replace("</AUTHOR>", "").replace("<AUTHOR>", "").strip()
+                    if cleaned_response and cleaned_response.lower() not in ['lastname firstname', 'unknown', 'n a', '']:
                         ordered_name = clean_author_name(cleaned_response)
                         if ordered_name and len(ordered_name) >= 2:
                             return ordered_name
-                            
-                    logging.warning(f"Failed to extract a valid name from: '{reformatted_name}', retrying...")
                 
+                logging.warning(f"Failed to extract a valid name from LLM response: '{reformatted_name_from_llm}', retrying...")
+
             except Exception as e:
                 if "rate_limit" in str(e).lower() or "timeout" in str(e).lower():
                     wait_time = base_retry_wait * (2 ** (attempt - 1))
-                    logging.info(f"Rate limit or timeout encountered. Retrying in {wait_time:.2f} seconds...")
+                    logging.info(f"Rate limit or timeout for author sort. Retrying in {wait_time:.2f}s...")
                 else:
-                    logging.error(f"Error querying LLM for author names: {e}")
+                    logging.error(f"Error querying LLM for author names (attempt {attempt}): {e}")
                     wait_time = base_retry_wait * (1.5 ** (attempt - 1))
-                    logging.info(f"Retrying in {wait_time:.2f} seconds...")
+                    logging.info(f"Retrying in {wait_time:.2f}s...")
                 
                 if attempt < max_attempts:
                     time.sleep(wait_time)
                     continue
-                
-                # Last resort - just return the original name, even if it's a single word
-                return formatted_author_names
-        
-        # Wait a little between attempts even if no error occurred
-        if attempt < max_attempts:
-            time.sleep(1)  # Small pause between attempts
-                
+                else: # Max attempts reached
+                    return formatted_author_names # Fallback to pre-LLM formatted name
+
+        if attempt < max_attempts: # Small pause if we are retrying due to format issues
+             time.sleep(1)
+
     logging.error(f"Maximum retry attempts reached for sorting author name: {formatted_author_names}")
-    
-    # Last resort - just return the original name
-    return formatted_author_names
+    return formatted_author_names # Fallback to pre-LLM formatted name
 
 def extract_metadata(text, filename, llm_provider):
     """
