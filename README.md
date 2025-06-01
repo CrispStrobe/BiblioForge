@@ -6,7 +6,7 @@ BiblioForge is a versatile, cross-platform command-line tool designed to extract
 
 ## Core Features
 
-* **Multi-Format Text Extraction:** Supports PDF, EPUB, DJVU, MOBI, various text formats (TXT, MD), HTML, and common office formats (DOCX, RTF, ODT via Calibre).
+* **Multi-Format Text Extraction:** Supports PDF, EPUB, DJVU, MOBI, various text formats (TXT, MD), HTML, and common office formats (DOCX, RTF, ODT via [ebook-converter](https://github.com/gryf/ebook-converter)).
 * **Smart Fallbacks:** Employs multiple extraction methods for each format, ensuring the best possible text recovery.
 * **OCR for Scanned Documents:** Integrated OCR engines (Tesseract, PaddleOCR, EasyOCR, DocTR, Kraken) to process image-based PDFs and other scanned documents.
 * **Table Extraction:** Capable of extracting tabular data from PDF files (using Camelot).
@@ -60,15 +60,13 @@ Certain functionalities, especially OCR and some format conversions, rely on ext
 
 **General Recommendation:**
 
-* **Calibre:** For robust conversion of many formats (DOCX, RTF, etc.) to text. Install the Calibre application. BiblioForge will try to use its `ebook-converter` command-line tool if it's in your system's PATH.
+* **[ebook-converter](https://github.com/gryf/ebook-converter):** For robust conversion of many formats (DOCX, RTF, etc.) to text. Install the ebook-converter application (based on Calibre codebase). BiblioForge will try to use the `ebook-converter` command-line tool if it's in your system's PATH.
 
 **Platform-Specific:**
 
 #### macOS:
 ```bash
 brew install tesseract poppler ghostscript djvulibre
-# For Calibre, download from the website or use:
-# brew install --cask calibre (if available and preferred)
 ```
 
 Ensure tesseract data files for your desired languages are installed (e.g., `brew install tesseract-lang`).
@@ -78,8 +76,6 @@ Ensure tesseract data files for your desired languages are installed (e.g., `bre
 sudo apt-get update
 sudo apt-get install -y tesseract-ocr tesseract-ocr-all poppler-utils ghostscript djvulibre-bin \
                         libgl1-mesa-glx libglib2.0-0 # Common deps for CV/OCR libs
-# For Calibre:
-# sudo -v && wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh | sudo sh /dev/stdin
 ```
 
 #### Windows:
@@ -90,7 +86,6 @@ Manual installation of the following is typically required. Ensure they are adde
 * **Poppler for Windows:** Download binaries (e.g., from [Poppler for Windows](https://github.com/oschwartz10612/poppler-windows/releases)). Add the `bin/` directory to PATH.
 * **Ghostscript:** Download installer from [Ghostscript releases](https://www.ghostscript.com/download/gsdnld.html). Add its `bin/` and `lib/` directories to PATH.
 * **DjVuLibre for Windows:** May be available from projects like DjView4 which might bundle the command-line tools.
-* **Calibre:** Download and install from the [Calibre website](https://calibre-ebook.com/). Ensure its installation directory (containing `ebook-converter.exe`) is in PATH.
 
 ### 4. LLM Setup (for --sort feature)
 
