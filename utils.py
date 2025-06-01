@@ -467,8 +467,126 @@ def initialize_rename_scripts(rename_script_path_base: str) -> Dict[str, Optiona
         'batch_script': actual_batch_path if is_windows else None
     }
 
-
 def add_rename_command(
+    rename_script_paths: Dict[str, Optional[str]], 
+    source_path_original_file: str, 
+    actual_text_content_file_path: Optional[str], # Path to the .txt file (original or extracted)
+    target_dir_name: str, 
+    new_filename_base: str, 
+    output_dir_for_sorted_files: str, 
+    debug: bool = False
+) -> Optional[Dict[str, Any]]:
+    if debug:
+        logging.debug(
+            f"add_rename_command: Inputs - source_path_original_file='{source_path_original_file}', "
+            f"actual_text_content_file_path='{actual_text_content_file_path}', "
+            f"target_dir_name='{target_dir_name}', new_filename_base='{new_filename_base}', "
+            f"output_dir_for_sorted_files='{output_dir_for_sorted_files}'"
+        )
+        logging.debug(f"add_rename_command: Script paths received: {rename_script_paths}")
+
+    target_dir_name_sanitized = sanitize_filename(target_dir_name.replace(',', ''))
+    new_filename_base_sanitized = sanitize_filename(new_filename_base)
+    
+    if not target_dir_name_sanitized: target_dir_name_sanitized = "UnknownAuthor"
+    if not new_filename_base_sanitized: new_filename_base_sanitized = "UnknownTitle"
+
+    full_target_dir_abs = Path(output_dir_for_sorted_files).resolve() / target_dir_name_sanitized
+    
+    # --- Handle the original file (PDF, EPUB, original .txt, etc.) ---
+    orig_ext = Path(source_path_original_file).suffix.lower()
+    final_new_filename_original = new_filename_base_sanitized + orig_ext
+    final_new_filename_original = re.sub(r'\.{2,}', '.', final_new_filename_original)
+
+    if debug:
+        logging.debug(f"add_rename_command: Original source='{source_path_original_file}'")
+        logging.debug(f"add_rename_command: Target directory for author='{str(full_target_dir_abs)}'")
+        logging.debug(f"add_rename_command: New filename for original file='{final_new_filename_original}'")
+
+    commands_written_to_any_script = False
+    abs_source_original_file = Path(source_path_original_file).resolve()
+
+    # Commands for the original file
+    bash_script_p_str = rename_script_paths.get('bash_script')
+    if bash_script_p_str:
+        if debug: logging.debug(f"add_rename_command: Appending main file move to BASH script: {bash_script_p_str}")
+        with file_lock:
+            with open(bash_script_p_str, "a", encoding='utf-8') as bash_f:
+                bash_f.write(f"\n# Renaming for: {os.path.basename(str(abs_source_original_file))}\n")
+                bash_f.write(f"mkdir -p {escape_special_chars(str(full_target_dir_abs))}\n")
+                bash_f.write(f"mv -v {escape_special_chars(str(abs_source_original_file))} {escape_special_chars(str(full_target_dir_abs / final_new_filename_original))}\n")
+        commands_written_to_any_script = True
+    
+    batch_script_p_str = rename_script_paths.get('batch_script')
+    if batch_script_p_str:
+        if debug: logging.debug(f"add_rename_command: Appending main file move to BATCH script: {batch_script_p_str}")
+        with file_lock:
+            with open(batch_script_p_str, "a", encoding='utf-8') as batch_f:
+                batch_f.write(f"\nREM Renaming for: {os.path.basename(str(abs_source_original_file))}\n")
+                batch_f.write(f"if not exist \"{str(full_target_dir_abs)}\" mkdir \"{str(full_target_dir_abs)}\"\n")
+                batch_f.write(f"move /Y \"{str(abs_source_original_file)}\" \"{str(full_target_dir_abs / final_new_filename_original)}\"\n")
+        commands_written_to_any_script = True
+
+    # --- Handle the associated text content file ---
+    # This is the .txt file that either *is* the original (if source was .txt) or was extracted.
+    # Its new name will be based on the original file's new name, but with .txt extension.
+    txt_target_filename_stem = Path(final_new_filename_original).stem
+    txt_target_path_abs = full_target_dir_abs / (txt_target_filename_stem + ".txt")
+
+    if actual_text_content_file_path and os.path.exists(actual_text_content_file_path):
+        abs_actual_text_content_file_path = Path(actual_text_content_file_path).resolve()
+        
+        # Check if the original file IS the text content file.
+        # This happens if source_path_original_file was already a .txt file and no separate extraction was made.
+        if abs_source_original_file == abs_actual_text_content_file_path:
+            if debug: logging.debug(f"add_rename_command: Original file '{str(abs_source_original_file)}' is also the text content file. Primary 'mv' command already handled it.")
+            # No additional 'mv' needed for the .txt file in this case.
+        else:
+            # This is a separate text file (e.g., extracted from PDF, or an _1.txt variant)
+            if debug: logging.debug(f"add_rename_command: Adding move for separate text content file '{str(abs_actual_text_content_file_path)}' to '{str(txt_target_path_abs)}'")
+            if bash_script_p_str:
+                with file_lock:
+                    with open(bash_script_p_str, "a", encoding='utf-8') as bash_f:
+                        bash_f.write(f"if [ -f {escape_special_chars(str(abs_actual_text_content_file_path))} ]; then\n")
+                        bash_f.write(f"  mv -v {escape_special_chars(str(abs_actual_text_content_file_path))} {escape_special_chars(str(txt_target_path_abs))}\n")
+                        bash_f.write(f"else\n")
+                        bash_f.write(f"  echo \"Info: Associated text file {escape_special_chars(str(abs_actual_text_content_file_path))} not found for move (original: {os.path.basename(str(abs_source_original_file))})\" >&2\n")
+                        bash_f.write(f"fi\n")
+            if batch_script_p_str:
+                with file_lock:
+                    with open(batch_script_p_str, "a", encoding='utf-8') as batch_f:
+                        batch_f.write(f"if exist \"{str(abs_actual_text_content_file_path)}\" (\n")
+                        batch_f.write(f"  move /Y \"{str(abs_actual_text_content_file_path)}\" \"{str(txt_target_path_abs)}\"\n")
+                        batch_f.write(f") else (\n")
+                        batch_f.write(f"  echo Info: Associated text file \"{str(abs_actual_text_content_file_path)}\" not found for move (original: {os.path.basename(str(abs_source_original_file))}) 1>&2\n")
+                        batch_f.write(f")\n")
+            commands_written_to_any_script = True # Ensure this is true if any command was written
+    elif debug:
+        logging.debug(f"add_rename_command: No 'actual_text_content_file_path' provided or it does not exist ('{actual_text_content_file_path}'). No separate .txt move generated.")
+
+    # Ensure newline after each file's block in the scripts if commands were written
+    if commands_written_to_any_script:
+        if bash_script_p_str:
+            with file_lock:
+                with open(bash_script_p_str, "a", encoding='utf-8') as bash_f: bash_f.write("\n")
+        if batch_script_p_str:
+            with file_lock:
+                with open(batch_script_p_str, "a", encoding='utf-8') as batch_f: batch_f.write("\n")
+
+        rename_details = {
+            "original_source_path": source_path_original_file,
+            "target_directory_path": str(full_target_dir_abs),
+            "new_filename_original_with_ext": final_new_filename_original,
+            "actual_text_content_source_path": str(abs_actual_text_content_file_path) if actual_text_content_file_path and os.path.exists(actual_text_content_file_path) else None,
+            "new_text_content_file_path": str(txt_target_path_abs) if actual_text_content_file_path and os.path.exists(actual_text_content_file_path) else None,
+        }
+        if debug: logging.debug(f"add_rename_command: Successfully formulated rename details: {rename_details}")
+        return rename_details
+    else:
+        if debug: logging.debug("add_rename_command: No script paths provided or no commands were applicable/written.")
+        return None
+    
+def add_rename_command_old(
     rename_script_paths: Dict[str, Optional[str]], 
     source_path: str, 
     target_dir_name: str, 

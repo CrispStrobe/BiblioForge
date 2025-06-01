@@ -130,51 +130,55 @@ class DocumentProcessor:
         input_basename = os.path.basename(input_file)
         input_stem = Path(input_basename).stem
         
-        # Use current directory if output_dir_base is not specified
-        eff_output_dir = Path(output_dir_base or '.').resolve()
+        eff_output_dir = Path(output_dir_base or '.').resolve() # output_dir_base is now always a string or '.'
         eff_output_dir.mkdir(parents=True, exist_ok=True)
         
         output_name = f"{input_stem}.txt"
         output_path = eff_output_dir / output_name
         
-        if noskip and output_path.exists(): # Only create unique if noskip AND file exists
+        if noskip and output_path.exists():
             counter = 1
             while True:
                 output_name = f"{input_stem}_{counter}.txt"
                 output_path = eff_output_dir / output_name
                 if not output_path.exists():
-                    if self._debug: logging.debug(f"Using unique output path for text file: {output_path}")
+                    if self._debug: logging.debug(f"_get_unique_output_path: Using unique output path for text file: {output_path}")
                     break
                 counter += 1
         elif not noskip and output_path.exists():
-            if self._debug: logging.debug(f"Output text file {output_path} exists and noskip is False.")
-            # No change to output_path, will be skipped or overwritten based on DocumentProcessor logic
-        
+            if self._debug: logging.debug(f"_get_unique_output_path: Output text file {output_path} exists and noskip is False.")
+        elif self._debug:
+            logging.debug(f"_get_unique_output_path: Standard output path for text file: {output_path} (noskip={noskip}, exists={output_path.exists()})")
+            
         return str(output_path)
 
 
     def _process_single_file(self, input_file: str,
-                             output_dir_base: Optional[str], # This is already a resolved string path
+                             output_dir_base: Optional[str], # This is a resolved string path
                              method: Optional[str],
                              ocr_method: Optional[str],
                              password: Optional[str],
                              extract_tables: bool,
                              force_ocr: bool,
                              noskip: bool,
-                             sort: bool,
-                             rename_script_base_path_for_unparseables: Optional[str], # String, base path for .sh/.bat
-                             initialized_rename_script_paths: Optional[Dict[str, Optional[str]]], # Dict of actual script paths
+                             sort: bool, # This reflects whether sorting should be attempted
+                             rename_script_base_path_for_unparseables: Optional[str],
+                             initialized_rename_script_paths: Optional[Dict[str, Optional[str]]],
                              llm_provider_instance: Optional[LLMProvider], 
                              temperature: float, 
                              max_tokens: int,     
                              **kwargs) -> Dict[str, Any]:
         
+        # Ensure output_dir_base is a string, as it's used with os.path.join and Path
+        # process_files now passes it as str(eff_output_dir)
+        current_output_dir_base = str(output_dir_base) if output_dir_base else '.'
+
         if self._debug: 
-            logging.debug(f"DS_Proc: Starting _process_single_file for: {input_file}")
-            logging.debug(f"DS_Proc: Params - sort={sort}, output_dir_base='{output_dir_base}'")
+            logging.debug(f"DS_Proc: Starting _process_single_file for: '{input_file}'")
+            logging.debug(f"DS_Proc: Effective output_dir_base='{current_output_dir_base}'")
+            logging.debug(f"DS_Proc: noskip={noskip}, sort={sort}")
             logging.debug(f"DS_Proc: rename_script_base_path_for_unparseables='{rename_script_base_path_for_unparseables}'")
             logging.debug(f"DS_Proc: initialized_rename_script_paths='{initialized_rename_script_paths}'")
-
 
         result: Dict[str, Any] = {
             'success': False, 'text': '', 'output_path': None, 'skipped': False, 
@@ -184,48 +188,102 @@ class DocumentProcessor:
         
         if shutdown_flag.is_set():
             result['error'] = "Processing aborted due to shutdown signal"
-            if self._debug: logging.debug(f"DS_Proc: Shutdown signal detected for {input_file}. Aborting.")
+            if self._debug: logging.debug(f"DS_Proc: Shutdown signal detected for '{input_file}'. Aborting.")
             return result
 
         try:
-            txt_output_path = self._get_unique_output_path(input_file, output_dir_base, noskip)
-            result['output_path'] = txt_output_path 
-            if self._debug: logging.debug(f"DS_Proc: Determined text output path: {txt_output_path} for {input_file}")
-
+            is_source_txt_file = input_file.lower().endswith(('.txt', '.md')) # Treat .md like .txt for direct reading
             text_loaded_from_file = False
-            if not noskip and os.path.exists(txt_output_path):
-                if not sort: 
-                    logging.info(f"Skipping {input_file} - text output {txt_output_path} exists and noskip=False, sort=False.")
-                    result['skipped'] = True
-                    result['success'] = True 
-                    result['text'] = "" 
-                    try: 
-                        result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
-                    except Exception as e_meta:
-                        if self._debug: logging.debug(f"Could not get inherent metadata for skipped file {input_file}: {e_meta}")
-                    return result
-                else: # noskip=False, file exists, but sort=True, so we need the text
-                    try:
-                        with open(txt_output_path, 'r', encoding='utf-8') as f:
-                            result['text'] = f.read()
-                        if result['text'].strip():
-                            result['success'] = True 
-                            text_loaded_from_file = True
-                            if self._debug: logging.debug(f"DS_Proc: Reusing existing text from {txt_output_path} for sorting {input_file}.")
-                        else:
-                            logging.warning(f"Existing text file {txt_output_path} is empty. Will attempt re-extraction for {input_file}.")
-                            result['success'] = False 
-                    except Exception as e_read:
-                        logging.warning(f"Could not read existing text file {txt_output_path} for sorting {input_file}: {e_read}. Will attempt re-extraction.")
-                        result['success'] = False
-            
-            if not text_loaded_from_file:
-                if self._debug: logging.debug(f"DS_Proc: Need to extract text for {input_file} (text_loaded_from_file={text_loaded_from_file}).")
-                path_for_manager_to_write = txt_output_path # Manager should always write to the determined (possibly unique) path
+            actual_text_content_path_for_rename: Optional[str] = None # Path of the text content used for LLM
 
+            if is_source_txt_file:
+                if self._debug: logging.debug(f"DS_Proc: Input '{input_file}' is a direct text type file.")
+                # For a source .txt/.md, its "output path" (conceptually, before sorting) is its place in the output_dir.
+                # No _1 suffix should be generated for the source file itself due to noskip for THIS initial step.
+                # _get_unique_output_path would be used if saving an *extraction of* this, but we're reading directly.
+                # However, for consistency, result['output_path'] should still point to where this text *content* is considered to be.
+                # If output_dir_base is '.', then Path(input_file).resolve() is appropriate.
+                # If output_dir_base is different, it's where it *would* be if copied/processed to that dir.
+                # Let's set result['output_path'] to the original file's path if it's directly read.
+                # This path will then be passed to add_rename_command as `actual_text_content_file_path`.
+                
+                result['output_path'] = str(Path(current_output_dir_base) / os.path.basename(input_file))
+                actual_text_content_path_for_rename = input_file # The source IS the content
+
+                if not noskip and os.path.exists(result['output_path']) and Path(input_file).resolve() != Path(result['output_path']).resolve() and not sort:
+                    # This case is tricky: if output_path (e.g. ./file.txt) exists, and input is elsewhere (../file.txt)
+                    # and we are not sorting, we might skip. For simplicity, if it's a source.txt, and --noskip is false,
+                    # and we are not sorting, we usually just use it.
+                    # The main `noskip` check below handles the general case.
+                    # If it's a source .txt, and `sort` is false, and `noskip` is false,
+                    # we shouldn't really "skip" it, we just don't do much with it.
+                    # The outer `process_files` loop's skip logic is more for "output text already exists".
+                    # For now, if it's a source.txt, we always "process" it (read content).
+                    pass
+
+
+                try:
+                    if self._debug: logging.debug(f"DS_Proc: Directly reading content from source text file: '{input_file}'")
+                    with open(input_file, 'r', encoding='utf-8', errors='replace') as f:
+                        result['text'] = f.read()
+                    if result['text'].strip():
+                        result['success'] = True
+                        text_loaded_from_file = True 
+                        if self._debug: logging.debug(f"DS_Proc: Successfully read content from source file '{input_file}'. Length: {len(result['text'])}")
+                    else:
+                        result['error'] = f"Source text file '{input_file}' is empty."
+                        result['success'] = False
+                        if self._debug: logging.warning(result['error'])
+                except Exception as e_read_txt:
+                    result['error'] = f"Failed to read source text file '{input_file}': {e_read_txt}"
+                    result['success'] = False
+                    logging.error(result['error'], exc_info=self._debug)
+            
+            # If not a source text file, or if reading source text file failed somehow:
+            if not text_loaded_from_file:
+                if self._debug and is_source_txt_file : logging.debug(f"DS_Proc: Direct read of source text file '{input_file}' failed or was empty, proceeding to manager.extract as fallback.")
+                
+                # This is the path where the extracted .txt will be saved by the manager.
+                # _get_unique_output_path handles --noskip correctly by potentially adding _1, _2, etc.
+                # if the base target (e.g. file.txt) already exists in current_output_dir_base
+                determined_extraction_output_path = self._get_unique_output_path(input_file, current_output_dir_base, noskip)
+                result['output_path'] = determined_extraction_output_path # Update result['output_path']
+                actual_text_content_path_for_rename = determined_extraction_output_path # This is where the text lives
+
+                if not noskip and os.path.exists(determined_extraction_output_path):
+                    if self._debug: logging.debug(f"DS_Proc: Extraction output '{determined_extraction_output_path}' exists and noskip=False for '{input_file}'.")
+                    if not sort:
+                        logging.info(f"Skipping '{input_file}' - text output '{determined_extraction_output_path}' exists, noskip=False, and sort=False.")
+                        result['skipped'] = True
+                        result['success'] = True 
+                        result['text'] = ""
+                        # Try to get inherent metadata even if skipped
+                        try: result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
+                        except Exception as e_meta:
+                            if self._debug: logging.debug(f"Could not get inherent metadata for skipped file '{input_file}': {e_meta}")
+                        return result # Early exit for skip
+                    else: # noskip=False, output exists, but sort=True, so load text
+                        if self._debug: logging.debug(f"DS_Proc: noskip=False, sort=True. Loading text from existing '{determined_extraction_output_path}' for '{input_file}'.")
+                        try:
+                            with open(determined_extraction_output_path, 'r', encoding='utf-8') as f:
+                                result['text'] = f.read()
+                            if result['text'].strip():
+                                result['success'] = True
+                                text_loaded_from_file = True
+                                if self._debug: logging.debug(f"DS_Proc: Reused text from '{determined_extraction_output_path}' for sorting '{input_file}'. Length: {len(result['text'])}")
+                            else:
+                                logging.warning(f"Existing text file '{determined_extraction_output_path}' for '{input_file}' is empty. Re-extracting.")
+                                result['success'] = False # Force re-extraction
+                        except Exception as e_read:
+                            logging.warning(f"Could not read '{determined_extraction_output_path}' for sorting '{input_file}': {e_read}. Re-extracting.")
+                            result['success'] = False # Force re-extraction
+
+            # Call manager.extract only if text wasn't loaded directly or from a pre-existing file
+            if not text_loaded_from_file:
+                if self._debug: logging.debug(f"DS_Proc: Calling manager.extract for '{input_file}' to output at '{actual_text_content_path_for_rename}'.")
                 extraction_result = self.manager.extract(
                     input_path=input_file,
-                    output_path=path_for_manager_to_write, 
+                    output_path=actual_text_content_path_for_rename, # Manager writes here
                     method=method, ocr_method=ocr_method, password=password,
                     extract_tables=extract_tables, force_ocr=force_ocr, 
                     temperature=temperature, max_tokens=max_tokens, 
@@ -233,125 +291,131 @@ class DocumentProcessor:
                 )
                 result['text'] = extraction_result.get('text', '')
                 result['success'] = extraction_result.get('success', False)
-                result['tables'] = extraction_result.get('tables', []) # Expects list of dicts
+                result['tables'] = extraction_result.get('tables', [])
                 if extraction_result.get('error'):
                     result['error'] = extraction_result.get('error')
                 
-                # Ensure output_path in result reflects where manager actually wrote, if it did.
-                if path_for_manager_to_write and result['success']:
-                    result['output_path'] = path_for_manager_to_write
-                # If manager didn't write (e.g. output_path=None) but we have text, this case is less likely now.
-                # The current logic has path_for_manager_to_write always set.
+                if result['success']:
+                    result['output_path'] = actual_text_content_path_for_rename # Confirm output path
+                    if self._debug: logging.debug(f"DS_Proc: manager.extract successful for '{input_file}'. Text length: {len(result['text'])}.")
+                elif self._debug:
+                     logging.debug(f"DS_Proc: manager.extract failed for '{input_file}'. Error: {result.get('error')}")
 
+
+            # --- Sorting Logic ---
             if result['success'] and result['text']:
-                if self._debug: logging.debug(f"DS_Proc: Text successfully extracted/loaded for {input_file}. Length: {len(result['text'])}. Sort: {sort}")
-                if sort and llm_provider_instance and initialized_rename_script_paths: # Check dict presence too
-                    if self._debug: logging.debug(f"DS_Proc: Processing LLM metadata for sorting: {input_file}")
-                    try:
-                        metadata_llm_str = llm_extract_metadata(
-                            text=result["text"], filename=input_file,
-                            llm_provider_arg=llm_provider_instance,
-                            verbose=self._debug # Pass debug status for more verbose LLM calls
-                        )
-                        if metadata_llm_str:
-                            parsed_llm_meta = parse_metadata(metadata_llm_str, filename=os.path.basename(input_file))
-                            if parsed_llm_meta:
-                                result['metadata_llm'] = parsed_llm_meta.copy()
-                                year_str_from_llm = parsed_llm_meta.get('year')
-                                parsed_llm_meta['year'] = validate_and_fix_year(year_str_from_llm)
-                                
-                                author_to_sort = parsed_llm_meta.get('author', "UnknownAuthor")
-                                corrected_author = "UnknownAuthor" # Default
-                                if author_to_sort.lower() not in ["lastname firstname", "unknownauthor", "unknown author", "main author: lastname firstname", "none", ""] and valid_author_name(author_to_sort):
-                                    corrected_author = sort_author_names(
-                                        author_names_input=author_to_sort,
-                                        provider_arg=llm_provider_instance,
-                                        temperature=0.2, max_tokens=250,
-                                        verbose=self._debug, filename_for_logging=input_file,
-                                        model_name_arg=llm_provider_instance.model_name if llm_provider_instance else None,
-                                        api_key_arg=llm_provider_instance.api_key if llm_provider_instance else None
-                                    )
-                                else:
-                                    if self._debug: logging.debug(f"DS_Proc: Author ('{author_to_sort}') is placeholder or invalid, skipping LLM sort for {input_file}.")
-                                
-                                parsed_llm_meta['author'] = corrected_author # Update with sorted/defaulted author
-
-                                if not valid_author_name(corrected_author) or \
-                                   not parsed_llm_meta.get('title') or \
-                                   parsed_llm_meta.get('title','').lower() in ['unknowntitle', 'unknown', '']:
+                if self._debug: logging.debug(f"DS_Proc: Text available for '{input_file}'. Sort flag: {sort}.")
+                if sort:
+                    if llm_provider_instance and initialized_rename_script_paths:
+                        if self._debug: logging.debug(f"DS_Proc: Processing LLM metadata for sorting: '{input_file}' using text from '{actual_text_content_path_for_rename}'")
+                        try:
+                            metadata_llm_str = llm_extract_metadata(
+                                text=result["text"], filename=input_file,
+                                llm_provider_arg=llm_provider_instance,
+                                verbose=self._debug 
+                            )
+                            if metadata_llm_str:
+                                # (The rest of the metadata parsing, author sorting, and add_rename_command call logic remains largely the same as previous corrected version)
+                                # Ensure `add_rename_command` is called with `actual_text_content_path_for_rename`
+                                # ... (LLM metadata parsing and author sorting) ...
+                                if self._debug: logging.debug(f"DS_Proc: LLM returned for metadata: '{metadata_llm_str[:150]}...' for '{input_file}'")
+                                parsed_llm_meta = parse_metadata(metadata_llm_str, filename=os.path.basename(input_file))
+                                if parsed_llm_meta:
+                                    if self._debug: logging.debug(f"DS_Proc: Parsed LLM metadata: {parsed_llm_meta} for '{input_file}'")
+                                    result['metadata_llm'] = parsed_llm_meta.copy()
                                     
-                                    logging.warning(f"LLM metadata invalid for sorting '{input_file}': Author='{corrected_author}', Title='{parsed_llm_meta.get('title')}'. Adding to unparseables.")
-                                    if rename_script_base_path_for_unparseables: # Use the base string path for parent dir
-                                        unparseables_path = Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst"
-                                        with file_lock:
-                                            with open(unparseables_path, "a", encoding='utf-8') as f_unp:
-                                                f_unp.write(f"{input_file} - Invalid LLM metadata (Author: {corrected_author}, Title: {parsed_llm_meta.get('title')})\n")
-                                else: # Valid LLM metadata for rename
-                                    if self._debug: logging.debug(f"DS_Proc: Valid metadata for rename. Author='{corrected_author}', Year='{parsed_llm_meta['year']}', Title='{parsed_llm_meta['title']}'")
-                                    # initialized_rename_script_paths is the DICT from process_files
-                                    rename_info_dict = add_rename_command(
-                                        rename_script_paths=initialized_rename_script_paths, # Pass the dict directly
-                                        source_path=input_file,
-                                        target_dir_name=parsed_llm_meta['author'], 
-                                        new_filename_base=f"{parsed_llm_meta['year']} {parsed_llm_meta['title']}",
-                                        output_dir_for_sorted_files=str(output_dir_base), 
-                                        debug=self._debug
-                                    )
-                                    result["renamed_info"] = rename_info_dict # Will be dict if successful, None otherwise
-                                    if self._debug and rename_info_dict:
-                                        logging.debug(f"DS_Proc: Rename command generated for {input_file}. Info: {rename_info_dict}")
-                                    elif self._debug and not rename_info_dict:
-                                        logging.warning(f"DS_Proc: add_rename_command returned None for {input_file}. No rename command added to script.")
+                                    year_str_from_llm = parsed_llm_meta.get('year')
+                                    parsed_llm_meta['year'] = validate_and_fix_year(year_str_from_llm)
+                                    if self._debug: logging.debug(f"DS_Proc: Validated year: '{parsed_llm_meta['year']}' for '{input_file}'")
+                                    
+                                    author_to_sort = parsed_llm_meta.get('author', "UnknownAuthor")
+                                    corrected_author = "UnknownAuthor" 
+                                    
+                                    if author_to_sort.lower() not in ["lastname firstname", "unknownauthor", "unknown author", "main author: lastname firstname", "none", ""] and valid_author_name(author_to_sort):
+                                        if self._debug: logging.debug(f"DS_Proc: Attempting to sort author name '{author_to_sort}' for '{input_file}'")
+                                        corrected_author = sort_author_names(
+                                            author_names_input=author_to_sort, provider_arg=llm_provider_instance,
+                                            temperature=0.2, max_tokens=100, verbose=self._debug, 
+                                            filename_for_logging=input_file,
+                                            model_name_arg=llm_provider_instance.model_name if llm_provider_instance else None,
+                                            api_key_arg=llm_provider_instance.api_key if llm_provider_instance else None )
+                                        if self._debug: logging.debug(f"DS_Proc: Sorted author name: '{corrected_author}' for '{input_file}'")
+                                    else:
+                                        if self._debug: logging.debug(f"DS_Proc: Author ('{author_to_sort}') is placeholder or invalid; using as-is or 'UnknownAuthor' for '{input_file}'.")
+                                        corrected_author = author_to_sort if valid_author_name(author_to_sort) else "UnknownAuthor"
+                                    parsed_llm_meta['author'] = corrected_author
 
-                            else: # parsed_llm_meta is None
-                                logging.warning(f"Failed to parse LLM metadata for {input_file} from: {metadata_llm_str[:100]}...")
+                                    if not valid_author_name(corrected_author) or \
+                                       not parsed_llm_meta.get('title') or \
+                                       parsed_llm_meta.get('title','').lower() in ['unknowntitle', 'unknown', 'the full title', '']:
+                                        logging.warning(f"LLM metadata invalid for sorting '{input_file}': Author='{corrected_author}', Title='{parsed_llm_meta.get('title')}'. Adding to unparseables.")
+                                        if rename_script_base_path_for_unparseables:
+                                            unparseables_path = Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst"
+                                            with file_lock:
+                                                with open(unparseables_path, "a", encoding='utf-8') as f_unp:
+                                                    f_unp.write(f"{input_file} - Invalid LLM metadata (Author: {corrected_author}, Title: {parsed_llm_meta.get('title')})\n")
+                                    else: 
+                                        if self._debug: logging.debug(f"DS_Proc: Valid metadata for rename. Author='{corrected_author}', Year='{parsed_llm_meta['year']}', Title='{parsed_llm_meta['title']}' for '{input_file}'")
+                                        rename_info_dict = add_rename_command(
+                                            rename_script_paths=initialized_rename_script_paths, 
+                                            source_path_original_file=input_file, # The original file being processed
+                                            actual_text_content_file_path=actual_text_content_path_for_rename, # Path to the .txt content
+                                            target_dir_name=parsed_llm_meta['author'], 
+                                            new_filename_base=f"{parsed_llm_meta['year']} {parsed_llm_meta['title']}",
+                                            output_dir_for_sorted_files=str(current_output_dir_base), 
+                                            debug=self._debug
+                                        )
+                                        result["renamed_info"] = rename_info_dict
+                                        if self._debug and rename_info_dict: logging.debug(f"DS_Proc: Rename command generated for {input_file}. Info: {rename_info_dict}")
+                                        elif self._debug and not rename_info_dict: logging.warning(f"DS_Proc: add_rename_command returned None for {input_file}.")
+                                else: 
+                                    logging.warning(f"Failed to parse LLM metadata for '{input_file}' from string: '{metadata_llm_str[:100]}...'")
+                                    if rename_script_base_path_for_unparseables:
+                                        with file_lock: (Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst").open("a", encoding='utf-8').write(f"{input_file} - Failed to parse LLM metadata from string\n")
+                            else: 
+                                logging.warning(f"LLM did not return metadata string for '{input_file}'")
                                 if rename_script_base_path_for_unparseables:
-                                    with file_lock:
-                                        with open(Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst", "a", encoding='utf-8') as f_unp:
-                                            f_unp.write(f"{input_file} - Failed to parse LLM metadata\n")
-                        else: # metadata_llm_str is empty
-                            logging.warning(f"LLM did not return metadata for {input_file}")
+                                    with file_lock: (Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst").open("a", encoding='utf-8').write(f"{input_file} - LLM returned no metadata string\n")
+                        except Exception as e_sort:
+                            logging.error(f"Error during LLM sorting process for '{input_file}': {e_sort}", exc_info=self._debug)
+                            result["error"] = f"Sorting error: {e_sort}"
                             if rename_script_base_path_for_unparseables:
-                                with file_lock:
-                                    with open(Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst", "a", encoding='utf-8') as f_unp:
-                                        f_unp.write(f"{input_file} - LLM returned no metadata\n")
-                    except Exception as e_sort:
-                        logging.error(f"Error during LLM sorting process for {input_file}: {e_sort}", exc_info=self._debug)
-                        result["error"] = f"Sorting error: {e_sort}"
-                        if rename_script_base_path_for_unparseables:
-                            with file_lock:
-                                with open(Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst", "a", encoding='utf-8') as f_unp:
-                                    f_unp.write(f"{input_file} - Error in sorting logic: {e_sort}\n")
-                elif sort and not llm_provider_instance:
-                    logging.warning(f"DS_Proc: Sort is True for {input_file}, but LLM provider instance is missing. Skipping sort.")
-                elif sort and not initialized_rename_script_paths:
-                     logging.warning(f"DS_Proc: Sort is True for {input_file}, but initialized_rename_script_paths is None. Skipping rename command generation.")
-
-
-            elif not result['success']: # If text extraction failed
+                                with file_lock: (Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst").open("a", encoding='utf-8').write(f"{input_file} - Error in sorting logic: {e_sort}\n")
+                    elif sort: # sort=True but LLM provider or script paths missing
+                        if not llm_provider_instance and self._debug: logging.warning(f"DS_Proc: Sort is True for '{input_file}', but LLM provider instance is missing. Skipping sort.")
+                        if not initialized_rename_script_paths and self._debug: logging.warning(f"DS_Proc: Sort is True for '{input_file}', but initialized_rename_script_paths is None. Skipping rename command generation.")
+            
+            # (Rest of the error handling and metadata extraction for result['inherent_metadata'])
+            elif not result['success']: 
                 if not result.get("error"): result['error'] = "Text extraction failed or produced no text."
-                if self._debug: logging.debug(f"DS_Proc: Text extraction failed for {input_file}. Error: {result['error']}")
-            elif not result['text']: # Success true, but text is empty (should be rare if success=True)
+                if self._debug: logging.debug(f"DS_Proc: Text extraction failed for '{input_file}'. Error: {result['error']}")
+            elif not result['text']: 
                  result['error'] = "Text extraction successful but produced empty text."
-                 result['success'] = False # Treat as failure if text is empty
-                 if self._debug: logging.debug(f"DS_Proc: Text extraction yielded empty text for {input_file}.")
+                 result['success'] = False 
+                 if self._debug: logging.debug(f"DS_Proc: Text extraction yielded empty text for '{input_file}'. Marked as failure.")
 
+            if not result.get('skipped'):
+                try:
+                    result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
+                    if self._debug: logging.debug(f"DS_Proc: Extracted inherent metadata for '{input_file}': {str(result['inherent_metadata'])[:200]}...")
+                except Exception as e_meta_final:
+                    if self._debug: logging.debug(f"DS_Proc: Could not get inherent metadata for '{input_file}' at the end: {e_meta_final}")
 
-            result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
-
-        except Exception as e:
-            result['error'] = f"Overall processing of {input_file} failed: {str(e)}"
+        except Exception as e: # Catch-all for _process_single_file
+            result['error'] = f"Overall processing of '{input_file}' failed in _process_single_file: {str(e)}"
             logging.error(result['error'], exc_info=self._debug)
             result['success'] = False
             if sort and rename_script_base_path_for_unparseables: 
                 try:
-                    with file_lock:
-                        with open(Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst", "a", encoding='utf-8') as f_unp:
-                            f_unp.write(f"{input_file} - Overall Error in _process_single_file: {str(e)}\n")
-                except Exception as e_unp:
-                    logging.error(f"Failed to write to unparseables.lst: {e_unp}")
+                    with file_lock: (Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst").open("a", encoding='utf-8').write(f"{input_file} - Overall Error in _process_single_file: {str(e)}\n")
+                except Exception as e_unp: logging.error(f"Failed to write to unparseables.lst: {e_unp}")
         
-        if self._debug: logging.debug(f"DS_Proc: Finished _process_single_file for: {input_file}, Success: {result['success']}, Error: {result.get('error')}, Renamed: {bool(result.get('renamed_info'))}")
+        if self._debug: 
+            logging.debug(f"DS_Proc: Finished _process_single_file for: '{input_file}', "
+                          f"Success: {result['success']}, Error: {result.get('error')}, "
+                          f"Renamed: {bool(result.get('renamed_info'))}, "
+                          f"Skipped: {result.get('skipped')}, "
+                          f"Final text content path in result: {result.get('output_path')}")
         return result
 
     def process_files(self, input_files: List[str], 
