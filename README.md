@@ -1,237 +1,273 @@
-# BiblioForge
+# BiblioForge: Document Text Extraction & Organization Tool
 
-BiblioForge is a multi-format document text extraction and automatic organization tool with smart metadata parsing. It extracts text from various document formats (PDF, EPUB, DJVU, MOBI, HTML, etc.) and intelligently organizes them by author and title using AI-powered content analysis.
+BiblioForge is a versatile, cross-platform command-line tool designed to extract text from a wide array of document formats and intelligently organize them. It leverages multiple extraction engines, OCR capabilities, and AI-powered metadata analysis to sort and rename your documents into a structured library.
 
-Note: This is unfinished, unstable WORK IN PROGRESS. Use or adapt at your own risk.
+**Status:** This project is under active development. While functional, expect ongoing improvements and potential changes.
 
-## Features
+## Core Features
 
-- Extract text from multiple document formats (PDF, EPUB, DJVU, MOBI, TXT, HTML, DOCX, etc)
-- Intelligently organize files based on content analysis
-- Multiple extraction methods for each format with smart fallbacks
-- OCR capabilities for scanned documents
-- Table extraction for PDF files
-- Language detection
-- Sort and rename files based on extracted metadata
-- Cross-platform support (Windows, macOS, Linux)
+* **Multi-Format Text Extraction:** Supports PDF, EPUB, DJVU, MOBI, various text formats (TXT, MD), HTML, and common office formats (DOCX, RTF, ODT via Calibre).
+* **Smart Fallbacks:** Employs multiple extraction methods for each format, ensuring the best possible text recovery.
+* **OCR for Scanned Documents:** Integrated OCR engines (Tesseract, PaddleOCR, EasyOCR, DocTR, Kraken) to process image-based PDFs and other scanned documents.
+* **Table Extraction:** Capable of extracting tabular data from PDF files (using Camelot).
+* **AI-Powered Sorting & Renaming:**
+    * Utilizes Large Language Models (LLMs) to analyze content and extract key metadata (author, title, year, language).
+    * Generates a shell script (`rename_commands.sh` or custom) to organize files into an `Author/Year Title.ext` structure.
+    * Option to automatically execute the rename script.
+* **Flexible LLM Integration:** Supports local LLMs via Ollama (recommended for privacy and cost) and various cloud-based LLM providers (OpenAI, Groq, Cohere, etc.).
+* **Customizable Processing:** Offers fine-grained control over extraction methods, OCR engines, file types, and more.
+* **Cross-Platform:** Designed to run on Windows, macOS, and Linux.
 
 ## Installation
 
-### 1. Python Requirements
+### 1. Python Environment
 
-Python 3.7+ is required. Install the required Python packages:
+Python 3.8+ is recommended.
 
+**Create a virtual environment (recommended):**
 ```bash
-# Core dependencies
-pip install pymupdf pdfplumber pypdf pdfminer.six pytesseract pdf2image tqdm openai
-
-# OCR-related packages
-pip install easyocr paddleocr python-doctr ocrmypdf kraken
-
-# Additional format support
-pip install ebooklib beautifulsoup4 html2text mobi
-
-# Optional dependencies for specific features
-pip install camelot-py opencv-python chardet ftfy lxml
+python -m venv biblioforge_env
+# On macOS/Linux:
+source biblioforge_env/bin/activate
+# On Windows (cmd):
+# biblioforge_env\Scripts\activate.bat
+# On Windows (PowerShell):
+# biblioforge_env\Scripts\Activate.ps1
 ```
 
-### 2. System Dependencies
+### 2. Python Dependencies
 
-For the very versatile Calibre ebook-converter:
+Install the required Python packages using pip:
 
 ```bash
-$ python -m venv venv
-$ . venv/bin/activate
-(venv) $ git clone https://github.com/gryf/ebook-converter
-(venv) $ cd ebook-converter
-(venv) $ pip install -e .
+pip install pymupdf pdfplumber pypdf pdfminer.six pytesseract pdf2image tqdm openai \
+            ebooklib beautifulsoup4 html2text mobi chardet ftfy lxml requests \
+            groq cohere huggingface_hub easyocr paddleocr python-doctr ocrmypdf \
+            python-Levenshtein # For potential string matching improvements (optional but good)
+            
+# For table extraction:
+pip install "camelot-py[cv]"
+
+# For Kraken OCR (can be complex, ensure system deps like Rust are met if building from source):
+pip install kraken
 ```
+
+**Note:** Some packages like `paddleocr` or `kraken` might have additional system-level build dependencies (e.g., C++ compilers, Rust).
+
+### 3. System Dependencies
+
+Certain functionalities, especially OCR and some format conversions, rely on external system tools.
+
+**General Recommendation:**
+
+* **Calibre:** For robust conversion of many formats (DOCX, RTF, etc.) to text. Install the Calibre application. BiblioForge will try to use its `ebook-converter` command-line tool if it's in your system's PATH.
+
+**Platform-Specific:**
 
 #### macOS:
-
 ```bash
-brew install tesseract poppler ghostscript djvulibre calibre
+brew install tesseract poppler ghostscript djvulibre
+# For Calibre, download from the website or use:
+# brew install --cask calibre (if available and preferred)
 ```
 
-#### Linux:
+Ensure tesseract data files for your desired languages are installed (e.g., `brew install tesseract-lang`).
 
+#### Linux (Debian/Ubuntu based):
 ```bash
-sudo apt-get install tesseract-ocr poppler-utils ghostscript djvulibre-bin calibre
+sudo apt-get update
+sudo apt-get install -y tesseract-ocr tesseract-ocr-all poppler-utils ghostscript djvulibre-bin \
+                        libgl1-mesa-glx libglib2.0-0 # Common deps for CV/OCR libs
+# For Calibre:
+# sudo -v && wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh | sudo sh /dev/stdin
 ```
 
 #### Windows:
 
-Install the following:
-- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)
-- [Ghostscript](https://ghostscript.com/releases/gsdnld.html)
-- [Poppler](https://github.com/oschwartz10612/poppler-windows/releases/)
-- [DjVuLibre](https://sourceforge.net/projects/djvu/files/DjVuLibre_Windows/)
-- [Calibre](https://calibre-ebook.com/download)
+Manual installation of the following is typically required. Ensure they are added to your system's PATH.
 
-### 3. LLM Support for Metadata Extraction
+* **Tesseract OCR:** Download installer from [UB-Mannheim Tesseract builds](https://github.com/tesseract-ocr/tesseract). Install language data during setup.
+* **Poppler for Windows:** Download binaries (e.g., from [Poppler for Windows](https://github.com/oschwartz10612/poppler-windows/releases)). Add the `bin/` directory to PATH.
+* **Ghostscript:** Download installer from [Ghostscript releases](https://www.ghostscript.com/download/gsdnld.html). Add its `bin/` and `lib/` directories to PATH.
+* **DjVuLibre for Windows:** May be available from projects like DjView4 which might bundle the command-line tools.
+* **Calibre:** Download and install from the [Calibre website](https://calibre-ebook.com/). Ensure its installation directory (containing `ebook-converter.exe`) is in PATH.
 
-For the sorting feature, you'll need one of these options:
+### 4. LLM Setup (for --sort feature)
 
-#### Option A: Local Ollama (Recommended)
+Choose one of the following:
 
-1. Install [Ollama](https://ollama.ai/)
-2. Pull a supported model:
+#### Option A: Local LLM with Ollama (Recommended)
+
+1. **Install Ollama:** Follow instructions at [ollama.ai](https://ollama.ai).
+2. **Pull a Model:** A smaller, faster model is often sufficient for metadata tasks.
    ```bash
-   ollama pull llama3
+   ollama pull llama3:8b # A good general-purpose model
+   # or for very fast responses:
+   ollama pull qwen2:1.5b 
+   ollama pull phi3
+   # The script defaults to 'cas/llama-3.2-3b-instruct:latest' or a similar small model if available
    ```
-3. Start the Ollama server:
-   ```bash
-   ollama serve
-   ```
+3. **Ensure Ollama Server is Running:** Usually, Ollama runs as a background service after installation. If not, you might need to start it manually (`ollama serve`).
 
 #### Option B: Cloud LLM Providers
 
-For cloud-based LLM providers, set the corresponding API key:
+Set the appropriate environment variable for your chosen provider:
 
 ```bash
-# For OpenAI (GPT-4, GPT-3.5)
-export OPENAI_API_KEY="your-key-here"
+# For OpenAI (e.g., GPT-4, GPT-3.5-turbo)
+export OPENAI_API_KEY="your-openai-api-key"
 
-# For Groq
-export GROQ_API_KEY="your-key-here"
+# For Groq (fast LLM inference)
+export GROQ_API_KEY="your-groq-api-key"
 
 # For Cohere
-export COHERE_API_KEY="your-key-here"  
+export COHERE_API_KEY="your-cohere-api-key"
 
-# For GLHF
-export GLHF_API_KEY="your-key-here"
+# For GLHF.chat (HuggingFace models via OpenAI-compatible API)
+export GLHF_API_KEY="your-glhf-api-key" # Often 'glhf-'. Visit glhf.chat for details.
+
+# For HuggingFace Inference Endpoints/API (direct)
+export HF_API_KEY="your-huggingface-api-key" 
+# (Note: Direct HF API usage might require specific model endpoint configuration not covered by default)
 ```
 
-## Usage
+On Windows, use `set` or `setx` in Command Prompt, or `$Env:VAR_NAME = "value"` in PowerShell to set environment variables.
 
-### Basic Text Extraction
+## Usage Examples
 
 ```bash
-python BiblioForge.py input.pdf
-python BiblioForge.py -o output_dir/ *.pdf
-python BiblioForge.py --method=pymupdf input.pdf
+python BiblioForge.py [options] file_or_pattern1 [file_or_pattern2 ...]
 ```
 
-### Process Multiple File Types
-
+### Basic Extraction:
 ```bash
-python BiblioForge.py "*.pdf *.epub *.djvu"
+# Extract text from a single PDF to the current directory
+python BiblioForge.py document.pdf
+
+# Extract from all PDFs in current directory to an 'output' subdirectory
+python BiblioForge.py -o output/ *.pdf
+
+# Specify a preferred PDF extraction method
+python BiblioForge.py --method=pymupdf document.pdf
 ```
 
-### Filter Specific File Types
-
+### Recursive Processing & File Types:
 ```bash
-python BiblioForge.py --file-types="pdf,epub" *.*
+# Process all supported files recursively in 'my_library'
+python BiblioForge.py -r my_library/
+
+# Process only PDF and EPUB files recursively
+python BiblioForge.py --file-types="pdf,epub" -r my_library/
 ```
 
-### Sorting and Organization
-
+### OCR Processing:
 ```bash
-# Sort and generate rename commands
-python BiblioForge.py --sort *.pdf
-
-# Sort and automatically execute the rename commands
-python BiblioForge.py --sort --execute-rename *.pdf
-
-# Use a specific LLM provider
-python BiblioForge.py --sort --llm-provider=groq --api-key=your-key *.pdf
+# Force OCR using Tesseract on a scanned PDF
+python BiblioForge.py --force-ocr --ocr-method=tesseract scanned_document.pdf
 ```
 
-### OCR Support
-
+### Sorting and Renaming (Requires LLM Setup):
 ```bash
-# Use OCR for scanned documents
-python BiblioForge.py --ocr-method=tesseract input.pdf
+# Analyze PDFs, generate 'rename_commands.sh' to sort them
+python BiblioForge.py --sort --noskip --output-dir ./organized_docs/ *.pdf
 
-# Try different OCR methods
-python BiblioForge.py --ocr-method=paddleocr input.pdf
+# Use a specific LLM provider (e.g., Groq) and execute renames
+python BiblioForge.py --sort --llm-provider=groq --execute-rename --output-dir ./groq_sorted/ documents/*.epub
+
+# Use a specific Ollama model
+python BiblioForge.py --sort --llm-provider=ollama --llm-model=qwen2:1.5b documents/
 ```
 
-### Extract Tables from PDFs
+**Notes:**
+- `--noskip` is recommended with `--sort` to ensure all files are processed for metadata, even if .txt files exist.
+- `--output-dir` with `--sort` specifies where the new `Author/Year Title.ext` structure will be created.
 
+### Table Extraction (PDFs):
 ```bash
-python BiblioForge.py -t input.pdf
+python BiblioForge.py --tables financial_report.pdf
+```
+
+### Debugging:
+```bash
+# See detailed logs for troubleshooting
+python BiblioForge.py --debug document.pdf
 ```
 
 ## Command-Line Arguments
 
-| Argument | Description |
-|----------|-------------|
-| `files` | Input files to process (supports wildcards and multiple file type patterns) |
-| `-o, --output-dir` | Output directory for extracted text files (default: current directory) |
-| `-m, --method` | Preferred extraction method (see below for options) |
-| `-r, --recursive` | Process files recursively through subdirectories |
-| `-p, --password` | Password for encrypted documents |
-| `--ocr-method` | Preferred OCR method: auto, tesseract, paddleocr, doctr, easyocr, kraken, kraken_cli |
-| `-t, --tables` | Extract tables (PDF only) |
-| `-j, --json` | Save results to JSON file |
-| `-w, --workers` | Maximum number of worker threads |
-| `-d, --debug` | Enable debug logging |
-| `--noskip` | Process files even if output text file already exists |
-| `--sort` | Sort and rename files based on content analysis |
-| `--execute-rename` | Automatically execute the generated rename commands |
-| `--rename-script` | Path to write the rename commands (default: rename_commands.sh) |
-| `--llm-provider` | LLM provider to use: ollama, groq, cohere, openai, glhf, huggingface |
-| `--llm-model` | Model name to use with the LLM provider |
-| `--api-key` | API key for cloud LLM providers |
-| `--temperature` | Temperature setting for LLM generation (0.0-1.0) |
-| `--max-tokens` | Maximum tokens in LLM response |
-| `--file-types` | Only process specified file types (comma-separated, e.g., 'pdf,epub,djvu') |
+| Argument | Short | Description | Default |
+|----------|-------|-------------|---------|
+| `files` | | Input files or patterns to process (e.g., `*.pdf`, `"docs/*.epub"`). | (None) |
+| `--output-dir` | `-o` | Base directory for extracted .txt files and the sorted/renamed file structure. | `.` (current directory) |
+| `--method` | `-m` | Preferred primary extraction method (e.g., `pymupdf` for PDF). Varies by file type. | (auto) |
+| `--ocr-method` | | Preferred OCR method: `auto`, `tesseract`, `paddleocr`, `doctr`, `easyocr`, `kraken`, `kraken_cli`. | `auto` |
+| `--force-ocr` | | Force OCR for all pages, even if a text layer is detected. | (False) |
+| `--recursive` | `-r` | Process files recursively in subdirectories. | (False) |
+| `--password` | `-p` | Password for encrypted documents. | (None) |
+| `--tables` | `-t` | Attempt to extract tables (primarily for PDF files using Camelot). | (False) |
+| `--json` | `-j` | Save detailed processing results (including extracted text and metadata) to a JSON file. Path to JSON file. | (None) |
+| `--workers` | `-w` | Maximum number of worker threads for parallel processing. | (auto-detected) |
+| `--noskip` | | Re-process files and overwrite/create unique .txt output, even if it already exists. Essential for `--sort`. | (False) |
+| `--file-types` | | Comma-separated list of file extensions to process (e.g., `pdf,epub`). Processes all supported if not set. | (All supported) |
+| `--sort` | | Enable LLM-based metadata extraction, sorting, and generation of rename commands. | (False) |
+| `--rename-script` | | Filename for the generated rename script when `--sort` is active. Path is relative to `--output-dir`. | `rename_commands.sh` |
+| `--execute-rename` | | Automatically execute the generated rename script after processing. Use with caution. | (False) |
+| `--llm-provider` | | LLM provider for `--sort`: `ollama`, `groq`, `cohere`, `openai`, `glhf`, `huggingface`, `poe`. | `ollama` |
+| `--llm-model` | | Specific model name for the chosen LLM provider (e.g., `llama3:8b`, `gpt-4-turbo`). | (Provider's default) |
+| `--api-key` | | API key for cloud-based LLM providers (if not set as an environment variable). | (None) |
+| `--temperature` | | LLM temperature for metadata/author name tasks (0.0-2.0). | `0.3` |
+| `--max-tokens` | | LLM max tokens for metadata/author name tasks. | `250` |
+| `--verbose / --debug` | `-v/-d` | Increase logging verbosity: `-v` for INFO, `-vv` or `-d` for DEBUG. | (WARNING level) |
 
-## Extraction Methods
+## Available Extraction Methods by Format
 
-### PDF
-- `pymupdf` - Fast native PDF parsing
-- `pdfplumber` - Good balance of speed and accuracy
-- `pypdf` - Simple but reliable
-- `pdfminer` - Good layout preservation
+BiblioForge tries methods in a preferred order, falling back if one fails.
 
-### EPUB
-- `ebooklib` - Native EPUB parsing
-- `bs4` - BeautifulSoup-based extraction
-- `zipfile` - Basic ZIP-based extraction
+* **PDF:** `pymupdf`, `calibre`, `pdfplumber`, `pypdf`, `pdfminer` (Text Layer); `tesseract`, `easyocr`, `paddleocr`, `doctr`, `kraken`, `kraken_cli` (OCR)
+* **EPUB:** `ebooklib` (with BeautifulSoup), `bs4` (manual unpack with BeautifulSoup & html2text), `epub2txt` (if installed), `calibre`, `zipfile` (raw text)
+* **DJVU:** `djvulibre` (Python bindings or djvutxt CLI), `pdf_conversion` (via ddjvu then PDF extraction), `ocr` (via ddjvu to images then Tesseract)
+* **MOBI/AZW:** `mobi` (Python library), `kindleunpack` (if available), `calibre`, `zipfile` (raw text)
+* **HTML/XHTML:** `bs4` (BeautifulSoup), `html2text`, `lxml`, `regex` (basic stripping)
+* **TXT/MD** (and other text-like formats via Calibre, e.g., DOCX, RTF, ODT): `direct read`, `charset_detection` (chardet), `encoding_detection` (ftfy), `calibre` (for non-plain-text formats)
 
-### DJVU
-- `djvulibre` - Native DJVU parsing
-- `pdf_conversion` - Convert to PDF then extract
-- `ocr` - Optical Character Recognition
+## Output Structure (with --sort)
 
-### MOBI
-- `mobi` - Native MOBI parsing
-- `kindleunpack` - KindleUnpack-based extraction
-- `calibre` - Calibre-based conversion
-- `zipfile` - Basic archive extraction
-
-### HTML
-- `bs4` - BeautifulSoup-based extraction
-- `html2text` - HTML to markdown conversion
-- `lxml` - LXML-based extraction
-- `regex` - Basic regex-based extraction
-
-### TXT
-- `direct` - Direct file reading
-- `charset_detection` - With encoding detection
-- `encoding_detection` - With encoding fixing
-
-## Output Structure
-
-When using the `--sort` option, BiblioForge creates an organized structure:
+When using `--sort`, files are organized into the `--output-dir` as follows:
 
 ```
-output_dir/
-  ├── Author Name/
-  │    ├── Year Title.pdf
-  │    └── Year Title.txt
-  ├── Another Author/
-  │    ├── Year Another Title.pdf
-  │    └── Year Another Title.txt
-  └── ...
+<output_dir>/
+├── <Author Name 1>/
+│   ├── <Year> <Title>.<original_ext>
+│   └── <Year> <Title>.txt (extracted text)
+├── <Author Name 2>/
+│   ├── <Year> <Another Title>.<original_ext>
+│   └── <Year> <Another Title>.txt
+└── ...
 ```
+
+An `unparseables.lst` file may also be created in the output directory, listing files for which metadata parsing failed.
+
+## Troubleshooting
+
+* **Permissions:** Ensure BiblioForge has read/write permissions for input/output directories.
+* **Dependencies:** Double-check that all Python and system dependencies are correctly installed and accessible in your system's PATH.
+* **LLM Issues:**
+  * For Ollama, ensure the server is running and the model is pulled.
+  * For cloud providers, verify your API key and account status.
+  * Try a different model or provider if one is consistently failing.
+* **Debug Logs:** Use `-vv` or `--debug` for detailed logs to pinpoint issues:
+  ```bash
+  python BiblioForge.py --debug --sort your_file.pdf > debug_output.log 2>&1
+  ```
+
+## Contributing
+
+Contributions, bug reports, and feature requests are welcome! Please open an issue or pull request on the GitHub repository.
 
 ## License
 
-MIT
+This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Acknowledgments
 
-BiblioForge uses several open-source libraries and tools. See the import section of the code for a full list.
+BiblioForge relies on numerous excellent open-source libraries and tools. Credit and thanks to all their developers. Specific libraries are listed in the Python import sections.
