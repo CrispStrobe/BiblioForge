@@ -6,20 +6,26 @@ import threading
 import time
 from typing import Optional, List, Dict, Any, Union
 import re # For sort_author_names
+from pathlib import Path # For LlamaCPPProvider model path
 
-# Attempt to import necessary HTTP client libraries
+# Attempt to import necessary HTTP client libraries and LLM clients
 try:
     import requests
 except ImportError:
     requests = None 
 try:
-    from openai import OpenAI
+    from openai import OpenAI, Timeout as OpenAITimeout, APIConnectionError as OpenAIAPIConnectionError
+    import httpx # Used by OpenAI client, good for custom timeouts
 except ImportError:
     OpenAI = None 
+    OpenAITimeout = None
+    OpenAIAPIConnectionError = None
+    httpx = None
 try:
-    from huggingface_hub import InferenceClient 
+    from huggingface_hub import InferenceClient, hf_hub_download
 except ImportError:
     InferenceClient = None
+    hf_hub_download = None # Needed for LlamaCPPProvider
 try:
     import cohere 
 except ImportError:
@@ -28,29 +34,38 @@ try:
     from groq import Groq
 except ImportError:
     Groq = None
+try:
+    import ollama # Official Ollama library
+except ImportError:
+    ollama = None
+try:
+    from llama_cpp import Llama, LlamaGrammar # For LlamaCPPProvider
+except ImportError:
+    Llama = None
+    LlamaGrammar = None
 
 # Import shutdown_flag from utils.
 try:
-    # This assumes utils.py is in a directory that's on the PYTHONPATH
-    # when llm_providers.py is imported by another root module like document_processor.py
     from utils import shutdown_flag
 except ImportError:
     logging.critical("llm_providers.py: CRITICAL - Could not import shutdown_flag from utils. Graceful shutdown might not work.")
-    # Create a dummy event so the script doesn't crash immediately if utils is missing
-    # This is not a solution for production but helps during refactoring.
     shutdown_flag = threading.Event()
 
 
-# Thread-local storage for LLM clients
+# Thread-local storage for LLM clients that benefit from it
 thread_local = threading.local()
-# Semaphore for LLM calls
-llm_semaphore = threading.Semaphore(4) # Adjusted, can be configured
+# Semaphore for LLM calls to limit concurrency
+llm_semaphore = threading.Semaphore(4) 
 
-# Default model name for Ollama
-DEFAULT_OLLAMA_MODEL_NAME = "cas/llama-3.2-3b-instruct:latest" 
-# Main model name used by functions in this module if not overridden
-# This is less relevant now as model is usually tied to the provider instance.
-MODEL_NAME_FALLBACK = DEFAULT_OLLAMA_MODEL_NAME
+# Default model names
+DEFAULT_OLLAMA_MODEL_NAME = "cas/llama-3.2-3b-instruct:latest" # A smaller, faster default for Ollama
+DEFAULT_LLAMACPP_REPO_ID = "TheBloke/phi-2-GGUF" # Example, user should verify/change
+DEFAULT_LLAMACPP_FILENAME = "phi-2.Q4_K_M.gguf" # Example, ~1.6GB
+DEFAULT_LOCAL_OPENAI_MODEL = "cas/llama-3.2-3b-instruct:latest" # Generic name for LM Studio etc.
+
+# Cache directory for LlamaCPP models
+LLAMACPP_MODELS_CACHE_DIR = Path.home() / ".cache" / "gguf"
+LLAMACPP_MODELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class LLMProvider:
@@ -58,10 +73,12 @@ class LLMProvider:
     def __init__(self, model_name: str, api_key: Optional[str] = None):
         self.model_name = model_name
         self.api_key = api_key
-    
+        if not hasattr(self, '_initialized_event'): # Ensure thread-safe init for subclasses
+            self._initialized_event = threading.Event()
+
     def chat_completion(self, messages: List[Dict[str, str]], 
                         temperature: float = 0.7, 
-                        max_tokens: int = 500,
+                        max_tokens: Optional[int] = 500, # Optional, as not all models/APIs use it identically
                         timeout_seconds: int = 120) -> Dict[str, Any]:
         raise NotImplementedError("Subclasses must implement this method.")
 
@@ -72,34 +89,39 @@ class OpenAIProvider(LLMProvider):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("OpenAI API key required. Either pass as api_key or set OPENAI_API_KEY.")
-        if OpenAI is None:
-            raise ImportError("OpenAI client library not installed. pip install openai.")
+        if OpenAI is None or httpx is None:
+            raise ImportError("OpenAI client library or httpx not installed. pip install openai httpx.")
         self._init_client()
     
     def _init_client(self):
-        if not hasattr(thread_local, "openai_provider_instance_client"): # More specific name
-            thread_local.openai_provider_instance_client = OpenAI(api_key=self.api_key)
+        if not hasattr(thread_local, "openai_provider_instance_client"):
+            custom_timeouts = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+            thread_local.openai_provider_instance_client = OpenAI(api_key=self.api_key, timeout=custom_timeouts)
         return thread_local.openai_provider_instance_client
     
     def chat_completion(self, messages: List[Dict[str, str]], 
                         temperature: float = 0.7, 
-                        max_tokens: int = 500,
+                        max_tokens: Optional[int] = 500,
                         timeout_seconds: int = 120) -> Dict[str, Any]:
         client = self._init_client()
         with llm_semaphore:
             try:
                 response = client.chat.completions.create(
                     model=self.model_name, messages=messages, temperature=temperature,
-                    max_tokens=max_tokens, timeout=timeout_seconds
+                    max_tokens=max_tokens, 
+                    timeout=float(timeout_seconds) # Overall request timeout
                 )
                 return {
                     "id": getattr(response, "id", "openai-unknown-id"),
                     "content": response.choices[0].message.content.strip() if response.choices and response.choices[0].message else "",
                     "finish_reason": response.choices[0].finish_reason if response.choices else "unknown",
-                    "model": getattr(response, 'model', self.model_name) # Use model from response if available
+                    "model": getattr(response, 'model', self.model_name)
                 }
+            except (OpenAIAPIConnectionError, OpenAITimeout) as e:
+                logging.error(f"OpenAIProvider ({self.model_name}) connection/timeout error: {e}")
+                raise
             except Exception as e:
-                logging.error(f"OpenAIProvider request for {self.model_name} failed: {e}")
+                logging.error(f"OpenAIProvider ({self.model_name}) request failed: {e}")
                 raise
 
 class HuggingFaceProvider(LLMProvider):
@@ -267,41 +289,6 @@ class GLHFProvider(LLMProvider):
                 logging.error(f"GLHFProvider request for {self.model_name} failed: {e}")
                 raise
 
-class OllamaProvider(LLMProvider):
-    """Ollama LLM provider."""
-    def __init__(self, model_name: str = DEFAULT_OLLAMA_MODEL_NAME, 
-                 base_url: Optional[str] = None): # base_url is optional, defaults in constructor
-        super().__init__(model_name) # api_key is not used by OllamaProvider constructor
-        self.base_url = base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1/")
-        if OpenAI is None: raise ImportError("OpenAI client not installed (for OllamaProvider).")
-        self._init_client()
-    
-    def _init_client(self):
-        if not hasattr(thread_local, "ollama_provider_instance_client"): # Specific name
-            thread_local.ollama_provider_instance_client = OpenAI(base_url=self.base_url, api_key="ollama")
-        return thread_local.ollama_provider_instance_client
-    
-    def chat_completion(self, messages: List[Dict[str, str]], 
-                        temperature: float = 0.7, 
-                        max_tokens: int = 500,
-                        timeout_seconds: int = 120) -> Dict[str, Any]:
-        client = self._init_client()
-        with llm_semaphore:
-            try:
-                response = client.chat.completions.create(
-                    model=self.model_name, temperature=temperature, max_tokens=max_tokens,
-                    messages=messages, timeout=timeout_seconds
-                )
-                return {
-                    "id": getattr(response, "id", "ollama-unknown-id"),
-                    "content": response.choices[0].message.content.strip() if response.choices and response.choices[0].message else "",
-                    "finish_reason": response.choices[0].finish_reason if response.choices else "unknown",
-                    "model": getattr(response, 'model', self.model_name)
-                }
-            except Exception as e:
-                logging.error(f"OllamaProvider request for {self.model_name} failed: {e}")
-                raise
-
 class GroqProvider(LLMProvider):
     """Groq LLM provider."""
     def __init__(self, model_name: str = "llama3-70b-8192", api_key: Optional[str] = None):
@@ -397,48 +384,352 @@ class PoeProvider(LLMProvider):
                 logging.error(f"PoeProvider processing error for {self.model_name}: {e}")
                 raise
 
+class LocalOpenAIProvider(LLMProvider):
+    """Provider for local LLM servers with an OpenAI-compatible API (e.g., LM Studio, older Ollama v1 endpoint)."""
+    def __init__(self, model_name: str = DEFAULT_LOCAL_OPENAI_MODEL, 
+                 base_url: str = "http://localhost:1234/v1/"): # Common LM Studio URL
+        super().__init__(model_name) # API key is not typically used or is a dummy
+        self.base_url = base_url
+        if OpenAI is None or httpx is None: 
+            raise ImportError("OpenAI client library and httpx not installed (required for LocalOpenAIProvider).")
+        self._init_client()
+    
+    def _init_client(self):
+        if not hasattr(thread_local, f"local_openai_client_{self.base_url}_{self.model_name}"):
+            custom_timeouts = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0) # Longer read for local
+            client_instance = OpenAI(
+                base_url=self.base_url, 
+                api_key="dummy-key", # API key is often not required or ignored
+                timeout=custom_timeouts
+            )
+            setattr(thread_local, f"local_openai_client_{self.base_url}_{self.model_name}", client_instance)
+        return getattr(thread_local, f"local_openai_client_{self.base_url}_{self.model_name}")
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                        temperature: float = 0.7, 
+                        max_tokens: Optional[int] = 500,
+                        timeout_seconds: int = 180) -> Dict[str, Any]: # Longer default timeout for local
+        client = self._init_client()
+        with llm_semaphore:
+            try:
+                response = client.chat.completions.create(
+                    model=self.model_name, # Model might be selected in the local server UI
+                    messages=messages, 
+                    temperature=temperature, 
+                    max_tokens=max_tokens,
+                    timeout=float(timeout_seconds)
+                )
+                return {
+                    "id": getattr(response, "id", f"local-openai-{time.time()}"),
+                    "content": response.choices[0].message.content.strip() if response.choices and response.choices[0].message else "",
+                    "finish_reason": response.choices[0].finish_reason if response.choices else "unknown",
+                    "model": getattr(response, 'model', self.model_name)
+                }
+            except (OpenAIAPIConnectionError, OpenAITimeout) as e:
+                logging.error(f"LocalOpenAIProvider ({self.model_name} at {self.base_url}) connection/timeout error: {e}")
+                raise
+            except Exception as e:
+                logging.error(f"LocalOpenAIProvider ({self.model_name} at {self.base_url}) request failed: {e}")
+                raise
 
+class OllamaProvider(LLMProvider):
+    """Ollama LLM provider using the official 'ollama' Python library."""
+    _checked_models: set = set() # Class-level set to track checked/pulled models
+
+    def __init__(self, model_name: str = DEFAULT_OLLAMA_MODEL_NAME, 
+                 host: Optional[str] = None): # e.g., http://localhost:11434
+        super().__init__(model_name)
+        if ollama is None:
+            raise ImportError("Official 'ollama' Python library not installed. 'pip install ollama'")
+        
+        self.host = host
+        self._client_kwargs = {}
+        if self.host:
+            self._client_kwargs['host'] = self.host
+        
+        # One-time check/pull for the model when the first instance for this model is created
+        if self.model_name not in OllamaProvider._checked_models:
+            self._ensure_model_available()
+            OllamaProvider._checked_models.add(self.model_name)
+
+    def _ensure_model_available(self):
+        try:
+            models_info = ollama.list(**self._client_kwargs)
+            local_model_names = [m.get('name') for m in models_info.get('models', [])]
+            if self.model_name not in local_model_names:
+                logging.info(f"OllamaProvider: Model '{self.model_name}' not found locally. Attempting to pull...")
+                ollama.pull(self.model_name, **self._client_kwargs) 
+                logging.info(f"OllamaProvider: Model '{self.model_name}' pulled successfully.")
+            else:
+                logging.debug(f"OllamaProvider: Model '{self.model_name}' already available locally.")
+        except Exception as e:
+            logging.warning(f"OllamaProvider: Error checking/pulling model '{self.model_name}': {e}. "
+                            f"Ensure the model name is correct and Ollama server is running and accessible at '{self.host or 'default host'}'.")
+
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                        temperature: float = 0.7, 
+                        max_tokens: Optional[int] = 500,
+                        timeout_seconds: int = 120) -> Dict[str, Any]: # timeout for ollama.Client
+        
+        options = {"temperature": temperature}
+        if max_tokens is not None and max_tokens > 0:
+            options["num_predict"] = max_tokens # Ollama uses num_predict
+
+        # The ollama.Client can take a timeout.
+        # We could instantiate it here if timeout_seconds is critical for each call,
+        # or rely on a globally configured client if the library supports it well.
+        # For now, passing host directly to ollama.chat
+        
+        # If a more persistent client with specific timeout is needed:
+        # client = ollama.Client(host=self.host, timeout=timeout_seconds)
+        # response = client.chat(...)
+        
+        with llm_semaphore:
+            try:
+                response = ollama.chat(
+                    model=self.model_name,
+                    messages=messages,
+                    stream=False,
+                    options=options,
+                    **self._client_kwargs 
+                )
+                
+                content = ""
+                if response and 'message' in response and 'content' in response['message']:
+                    content = response['message']['content'].strip()
+                
+                finish_reason = "stop" if response.get('done') else "unknown"
+
+                return {
+                    "id": "ollama-" + response.get('created_at', str(time.time())),
+                    "content": content,
+                    "finish_reason": finish_reason,
+                    "model": response.get('model', self.model_name)
+                }
+            except ollama.ResponseError as e:
+                logging.error(f"OllamaProvider: ResponseError for model {self.model_name} (host: {self.host or 'default'}): {e.status_code} - {e.error}")
+                raise
+            except Exception as e: # Other exceptions like connection errors
+                logging.error(f"OllamaProvider: Generic error during chat with model {self.model_name} (host: {self.host or 'default'}): {e}")
+                raise
+
+class LlamaCPPProvider(LLMProvider):
+    """Provider for llama-cpp-python."""
+    _loaded_models: Dict[str, Any] = {} # Class-level cache for Llama instances {model_key: Llama_instance}
+    _model_load_lock = threading.Lock() # Lock for loading models
+
+    def __init__(self, 
+                 model_name_or_path: str = DEFAULT_LLAMACPP_REPO_ID, # Can be HF repo or local GGUF path
+                 model_gguf_filename: Optional[str] = DEFAULT_LLAMACPP_FILENAME, # Required if model_name_or_path is HF repo
+                 n_ctx: int = 2048, 
+                 n_gpu_layers: int = 0, # -1 for all layers on GPU, 0 for CPU only
+                 verbose: bool = False, # llama-cpp-python verbosity
+                 chat_format: Optional[str] = "llama-2" # Or other formats like "chatml", "phi-2" etc.
+                 ):
+        
+        # model_name for LLMProvider base can be a composite or just the repo ID
+        display_model_name = f"{model_name_or_path}/{model_gguf_filename}" if model_gguf_filename else model_name_or_path
+        super().__init__(display_model_name)
+
+        if Llama is None or hf_hub_download is None:
+            raise ImportError("llama-cpp-python or huggingface_hub not installed. "
+                              "'pip install llama-cpp-python huggingface_hub'")
+
+        self.model_path_key = f"{model_name_or_path}_{model_gguf_filename or ''}" # Unique key for caching
+        self.model_name_or_path = model_name_or_path
+        self.model_gguf_filename = model_gguf_filename
+        self.n_ctx = n_ctx
+        self.n_gpu_layers = n_gpu_layers
+        self.llama_verbose = verbose
+        self.chat_format = chat_format
+
+        self._init_client() # This will ensure the model is loaded into thread_local
+
+    def _resolve_model_path(self) -> str:
+        """Downloads model from HF if needed, returns local path."""
+        if Path(self.model_name_or_path).is_file() and self.model_name_or_path.lower().endswith(".gguf"):
+            logging.debug(f"LlamaCPPProvider: Using local model path: {self.model_name_or_path}")
+            return self.model_name_or_path
+        elif self.model_gguf_filename: # Assume HF repo
+            logging.info(f"LlamaCPPProvider: Downloading/locating model '{self.model_gguf_filename}' from repo '{self.model_name_or_path}'...")
+            try:
+                model_path = hf_hub_download(
+                    repo_id=self.model_name_or_path,
+                    filename=self.model_gguf_filename,
+                    cache_dir=LLAMACPP_MODELS_CACHE_DIR,
+                    resume_download=True
+                )
+                logging.info(f"LlamaCPPProvider: Model path resolved to: {model_path}")
+                return model_path
+            except Exception as e:
+                logging.error(f"LlamaCPPProvider: Failed to download model {self.model_gguf_filename} from {self.model_name_or_path}: {e}")
+                raise
+        else:
+            raise ValueError("LlamaCPPProvider: model_name_or_path must be a local .gguf file path, or a HuggingFace repo_id with model_gguf_filename specified.")
+
+    def _init_client(self):
+        # Model loading can be slow, so we do it once per model_path_key and store in thread_local
+        # We use a class-level lock to ensure only one thread tries to load a given model at a time.
+        client_attr_name = f"llama_cpp_client_{self.model_path_key.replace('/', '_').replace('.', '_')}"
+
+        if not hasattr(thread_local, client_attr_name):
+            with LlamaCPPProvider._model_load_lock: # Ensure only one thread loads a specific model
+                # Double check after acquiring lock
+                if not hasattr(thread_local, client_attr_name):
+                    actual_model_path = self._resolve_model_path()
+                    logging.info(f"LlamaCPPProvider: Initializing Llama model from: {actual_model_path} "
+                                 f"(n_ctx={self.n_ctx}, n_gpu_layers={self.n_gpu_layers})")
+                    try:
+                        llama_instance = Llama(
+                            model_path=actual_model_path,
+                            n_ctx=self.n_ctx,
+                            n_gpu_layers=self.n_gpu_layers,
+                            verbose=self.llama_verbose,
+                            chat_format=self.chat_format
+                        )
+                        setattr(thread_local, client_attr_name, llama_instance)
+                        logging.info(f"LlamaCPPProvider: Model '{self.model_name}' loaded successfully.")
+                    except Exception as e:
+                        logging.error(f"LlamaCPPProvider: Error loading Llama model '{self.model_name}': {e}")
+                        # To prevent repeated load attempts for this thread for this broken model
+                        setattr(thread_local, client_attr_name, None) 
+                        raise
+        
+        client = getattr(thread_local, client_attr_name, None)
+        if client is None:
+            # This means loading failed previously for this thread after lock release or initial attempt
+            raise RuntimeError(f"LlamaCPPProvider: Client for model {self.model_name} could not be initialized.")
+        return client
+
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                        temperature: float = 0.7, 
+                        max_tokens: Optional[int] = 500, # llama_cpp uses max_tokens
+                        timeout_seconds: int = 180) -> Dict[str, Any]: # Timeout for llama.cpp is less direct, more about processing time
+        
+        client: Llama = self._init_client() # Ensures model is loaded for this thread
+
+        # llama-cpp-python's create_chat_completion handles timeout internally if supported by underlying calls,
+        # but it's mostly for long generations. A hard timeout for the call isn't standard here.
+        # We rely on the operation completing or an error.
+        
+        if max_tokens is None or max_tokens <= 0: # llama-cpp requires positive max_tokens or defaults.
+            max_tokens = self.n_ctx // 2 # A reasonable default if not specified.
+            
+        with llm_semaphore:
+            try:
+                response = client.create_chat_completion(
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    # stop=["\n"] # Example stop token, can be configured
+                )
+                
+                content = ""
+                finish_reason = "unknown"
+                response_id = f"llama_cpp-{time.time()}"
+
+                if response and response.get('choices'):
+                    choice = response['choices'][0]
+                    if choice.get('message') and choice['message'].get('content'):
+                        content = choice['message']['content'].strip()
+                    finish_reason = choice.get('finish_reason', 'stop') # Typically 'stop' or 'length'
+                    if response.get('id'): response_id = response['id']
+                
+                return {
+                    "id": response_id,
+                    "content": content,
+                    "finish_reason": finish_reason,
+                    "model": self.model_name # The display name we set
+                }
+            except Exception as e:
+                logging.error(f"LlamaCPPProvider ({self.model_name}) chat completion failed: {e}")
+                raise
+
+# --- Main Factory Function ---
 def get_llm_provider(provider_type: str = "ollama", 
-                     model_name: Optional[str] = None,
-                     api_key: Optional[str] = None) -> LLMProvider:
+                     model_name: Optional[str] = None, # For most providers, this is the model identifier
+                     api_key: Optional[str] = None,
+                     # Specific args for certain providers
+                     ollama_host: Optional[str] = None,
+                     local_openai_base_url: Optional[str] = None,
+                     llamacpp_repo_id: Optional[str] = None,
+                     llamacpp_gguf_filename: Optional[str] = None,
+                     llamacpp_n_ctx: int = 2048,
+                     llamacpp_n_gpu_layers: int = 0,
+                     llamacpp_chat_format: str = "llama-2"
+                     ) -> LLMProvider:
     provider_type_lower = provider_type.lower()
     
+    # Default model names for each provider type if not specified by user
     default_models = {
-        "ollama": DEFAULT_OLLAMA_MODEL_NAME, "groq": "llama3-8b-8192", # Changed to 8b for wider access
-        "openai": "gpt-3.5-turbo", "cohere": "command-r",
+        "ollama": DEFAULT_OLLAMA_MODEL_NAME, 
+        "groq": "llama3-8b-8192", 
+        "openai": "gpt-3.5-turbo", 
+        "cohere": "command-r",
         "huggingface": "mistralai/Mistral-7B-Instruct-v0.3", 
-        "glhf": "mistralai/Mistral-7B-Instruct-v0.3", "poe": "claude-3-haiku" 
+        "glhf": "mistralai/Mistral-7B-Instruct-v0.3", 
+        "poe": "claude-3-haiku",
+        "local_openai": DEFAULT_LOCAL_OPENAI_MODEL,
+        "llama_cpp": f"{llamacpp_repo_id or DEFAULT_LLAMACPP_REPO_ID}/{llamacpp_gguf_filename or DEFAULT_LLAMACPP_FILENAME}"
     }
     
-    effective_model_name = model_name or default_models.get(provider_type_lower, DEFAULT_OLLAMA_MODEL_NAME)
-    
+    effective_model_name = model_name or default_models.get(provider_type_lower, "default_model_not_in_map")
+    if provider_type_lower == "llama_cpp" and not model_name: # If llama_cpp and no specific model, use defaults
+        effective_model_name = default_models["llama_cpp"]
+
+
     provider_map: Dict[str, type[LLMProvider]] = {
-        "ollama": OllamaProvider, "groq": GroqProvider, "openai": OpenAIProvider,
-        "cohere": CohereProvider, "huggingface": HuggingFaceProvider,
-        "glhf": GLHFProvider, "poe": PoeProvider
+        "ollama": OllamaProvider, 
+        "groq": GroqProvider, 
+        "openai": OpenAIProvider,
+        "cohere": CohereProvider, 
+        "huggingface": HuggingFaceProvider,
+        "glhf": GLHFProvider, 
+        "poe": PoeProvider,
+        "local_openai": LocalOpenAIProvider,
+        "llama_cpp": LlamaCPPProvider
     }
 
     if provider_type_lower in provider_map:
         ProviderClass = provider_map[provider_type_lower]
         try:
-            # OllamaProvider's __init__ doesn't take api_key, others might.
             if provider_type_lower == "ollama":
-                 return ProviderClass(model_name=effective_model_name) # No api_key for OllamaProvider
-            else:
+                 return ProviderClass(model_name=effective_model_name, host=ollama_host) 
+            elif provider_type_lower == "local_openai":
+                 return ProviderClass(model_name=effective_model_name, base_url=local_openai_base_url or "http://localhost:1234/v1/")
+            elif provider_type_lower == "llama_cpp":
+                 # model_name is purely for display; actual model is from repo_id/filename
+                 # If user provides a model_name like "TheBloke/...", it's used for repo_id if llamacpp_repo_id is None
+                 repo_to_use = llamacpp_repo_id or (model_name if model_name and "/" in model_name else DEFAULT_LLAMACPP_REPO_ID)
+                 file_to_use = llamacpp_gguf_filename or (os.path.basename(model_name) if model_name and model_name.lower().endswith(".gguf") and "/" not in model_name else DEFAULT_LLAMACPP_FILENAME)
+
+                 return ProviderClass(
+                     model_name_or_path=repo_to_use, 
+                     model_gguf_filename=file_to_use,
+                     n_ctx=llamacpp_n_ctx,
+                     n_gpu_layers=llamacpp_n_gpu_layers,
+                     chat_format=llamacpp_chat_format,
+                     verbose=logging.getLogger().level == logging.DEBUG # Pass debug status for llama.cpp verbosity
+                    )
+            else: # For cloud providers primarily needing api_key
                  return ProviderClass(model_name=effective_model_name, api_key=api_key)
         except (ImportError, ValueError) as e: 
-            logging.error(f"Error initializing {provider_type_lower} provider with model {effective_model_name}: {e}")
+            logging.error(f"Error initializing '{provider_type_lower}' provider (model: '{effective_model_name}'): {e}")
             raise 
     else:
         raise ValueError(f"Unknown LLM provider type: {provider_type_lower}")
 
 
+# --- Core LLM Interaction Functions (send_to_llm, extract_metadata, sort_author_names) ---
+# These remain largely the same, operating on the LLMProvider interface.
+# (Ensure the refined send_to_llm from previous turn is used here)
+
 def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
                 max_attempts: int = 3, verbose: bool = False,
-                temperature_arg: float = 0.5, max_tokens_arg: int = 300, # Increased max_tokens slightly
+                temperature_arg: float = 0.5, max_tokens_arg: Optional[int] = 300,
                 prompt_choice: int = 0 
                 ) -> str:
-    base_retry_wait = 2.0
+    base_retry_wait = 5.0 
     prompt_templates = [
         ( 
             f"Extract metadata from the following file extraction snippet. We need (1) the main author name (format: Lastname Firstname), "
@@ -482,49 +773,81 @@ def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
         try:
             response_data = provider_instance.chat_completion(
                 messages=messages, temperature=temperature_arg,
-                max_tokens=max_tokens_arg, timeout_seconds=120 
+                max_tokens=max_tokens_arg, 
+                timeout_seconds=120 
             )
             output = response_data.get("content", "").strip()
             if verbose: logging.debug(f"LLM raw response for {filename} (attempt {attempt}): '{output}'")
             
-            # Check if essential tags are present. Parsing happens later.
-            if output and "<TITLE>" in output and "<AUTHOR>" in output and "<YEAR>" in output:
+            # Primary tag check
+            has_title = "<TITLE>" in output
+            has_author = "<AUTHOR>" in output
+            has_year = "<YEAR>" in output
+            # has_language = "<LANGUAGE>" in output # Language is desirable but sometimes omitted by LLM
+
+            if output and has_title and has_author and has_year:
                 return output 
+            # Check for alternative title tags if primary TITLE is missing
+            elif output and ("<PUBLICATION TITLE>" in output or "<PUBLICATIONTITLE>" in output) and \
+                 has_author and has_year:
+                if verbose: logging.debug(f"LLM for {filename} used alternative title tag. Accepting and standardizing.")
+                output = output.replace("<PUBLICATION TITLE>", "<TITLE>").replace("<PUBLICATIONTITLE>", "<TITLE>")
+                return output
             else:
-                logging.warning(f"LLM response for {filename} (attempt {attempt}) from {provider_instance.model_name} missing key tags or empty: '{output[:100]}...'")
+                logging.warning(f"LLM response for {filename} (attempt {attempt}) from {provider_instance.model_name} "
+                                f"missing key tags (TITLE, AUTHOR, YEAR) or empty: '{output[:100]}...'")
                 if attempt == max_attempts: 
                     logging.error(f"Max attempts reached for {filename}, returning last (possibly malformed) LLM output.")
-                    return output # Return last attempt even if malformed
+                    return output 
         
-        except Exception as e:
-            err_msg = str(e).lower()
-            is_timeout_or_ratelimit = any(keyword in err_msg for keyword in ["rate_limit", "timeout", "timed out", "limit", "too many requests"])
-            wait_time = base_retry_wait * (2 ** attempt if is_timeout_or_ratelimit else 1.5 ** attempt)
-            log_level = logging.INFO if is_timeout_or_ratelimit else logging.ERROR
-            logging.log(log_level, f"LLM error for {filename} with {provider_instance.__class__.__name__} (attempt {attempt}): {e}. Retrying in {wait_time:.1f}s.")
+        except (OpenAIAPIConnectionError, OpenAITimeout, ollama.ResponseError if ollama else Exception) as e_net: 
+            # Catch specific network/timeout errors from different libraries if possible
+            log_msg = f"LLM network/timeout error for {filename} with {provider_instance.__class__.__name__} (attempt {attempt}): {e_net}."
+            # For ollama.ResponseError, e_net.status_code might be informative
+            if ollama and isinstance(e_net, ollama.ResponseError):
+                log_msg += f" Status: {e_net.status_code}, Error: {e_net.error}"
+
+            logging.warning(f"{log_msg} Retrying in {base_retry_wait * attempt:.1f}s.")
+            if attempt < max_attempts:
+                time.sleep(base_retry_wait * attempt) 
+            else:
+                logging.error(f"Max LLM retries for {filename} due to network/timeout errors.")
+                return ""
+        except Exception as e: 
+            wait_time = base_retry_wait * (1.5 ** (attempt - 1)) 
+            logging.warning(f"LLM error for {filename} with {provider_instance.__class__.__name__} "
+                            f"(attempt {attempt}): {e}. Retrying in {wait_time:.1f}s.", exc_info=verbose)
             
-            if attempt < max_attempts: time.sleep(wait_time)
+            if attempt < max_attempts:
+                time.sleep(wait_time)
             else:
                 logging.error(f"Max LLM retries for {filename} with {provider_instance.__class__.__name__} due to errors.")
                 return "" 
         
-    return "" # Fallback if all attempts fail (e.g. consistent format issues not caught by tag check)
+    return ""
+
 
 def extract_metadata(text: str, filename: str, 
                      llm_provider_arg: Union[str, LLMProvider, None], 
                      model_name_arg: Optional[str] = None,
                      api_key_arg: Optional[str] = None,
-                     verbose: bool = False) -> str:
-    """
-    High-level wrapper to get raw metadata string from an LLM provider.
-    """
+                     verbose: bool = False,
+                     # Pass provider-specific args through kwargs to get_llm_provider
+                     **provider_specific_kwargs 
+                     ) -> str:
     provider_instance: Optional[LLMProvider] = None
     if isinstance(llm_provider_arg, LLMProvider):
         provider_instance = llm_provider_arg
     else: 
         provider_name_str = llm_provider_arg if isinstance(llm_provider_arg, str) else "ollama"
         try:
-            provider_instance = get_llm_provider(provider_name_str, model_name_arg, api_key_arg)
+            # Pass all provider_specific_kwargs to get_llm_provider
+            provider_instance = get_llm_provider(
+                provider_name_str, 
+                model_name_arg, 
+                api_key_arg,
+                **provider_specific_kwargs # Handles ollama_host, llamacpp_*, etc.
+            )
         except Exception as e:
             logging.error(f"Failed to get LLMProvider for '{provider_name_str}' in extract_metadata: {e}.")
             return ""
@@ -533,58 +856,57 @@ def extract_metadata(text: str, filename: str,
         logging.error("LLM provider instance could not be resolved in extract_metadata.")
         return ""
 
-    return send_to_llm(text=text, filename=filename, provider_instance=provider_instance, verbose=verbose)
+    return send_to_llm(text=text, filename=filename, provider_instance=provider_instance, verbose=verbose, 
+                       temperature_arg=provider_specific_kwargs.get('temperature', 0.5), # Get from kwargs or use default
+                       max_tokens_arg=provider_specific_kwargs.get('max_tokens', 300))
 
 
 def sort_author_names(author_names_input: str, 
                       provider_arg: Union[str, LLMProvider, None], 
-                      temperature: float = 0.2, # Lower temp for more deterministic formatting
-                      max_tokens: int = 60,   # Usually short response needed
+                      temperature: float = 0.2, 
+                      max_tokens: Optional[int] = 60,   
                       max_attempts: int = 2, 
                       verbose: bool = False,
-                      filename_for_logging: str = "UnknownFile", # For better context in logs
+                      filename_for_logging: str = "UnknownFile", 
                       model_name_arg: Optional[str] = None,
-                      api_key_arg: Optional[str] = None
+                      api_key_arg: Optional[str] = None,
+                      **provider_specific_kwargs # For get_llm_provider if needed
                       ) -> str:
-    """
-    Formats author names to 'Lastname Firstname' using an LLM.
-    Returns the best effort formatted name, or a cleaned version of input if LLM fails.
-    """
+    # ... (This function's internal logic remains largely the same as your provided version)
+    # Ensure it correctly calls get_llm_provider if provider_arg is a string,
+    # passing along model_name_arg, api_key_arg, and any relevant **provider_specific_kwargs.
     if not author_names_input or not isinstance(author_names_input, str):
         return "UnknownAuthor"
     
-    # Clean initial string from any surrounding XML tags or known prefixes
     cleaned_input_name = re.sub(r"^\s*<AUTHOR>\s*|\s*</AUTHOR>\s*$", "", author_names_input, flags=re.IGNORECASE).strip()
     cleaned_input_name = re.sub(r"^(Main Author: Lastname Firstname:|Main Author:)\s*", "", cleaned_input_name, flags=re.IGNORECASE).strip()
 
     if not cleaned_input_name or cleaned_input_name.lower() in ["unknown", "unknownauthor", "n a", ""]:
         return "UnknownAuthor"
 
-    # Heuristic: If it looks like "Lastname, Firstname" or "Lastname, F.", reformat directly
     if ',' in cleaned_input_name:
-        parts = [p.strip() for p in cleaned_input_name.split(',', 1)] # Split only on first comma
-        if len(parts) == 2 and parts[0] and parts[1]:
-            # Check if the part after comma looks like a first name/initials (not another last name)
-            # This is a simple check; more complex name structures might need LLM.
-            if len(parts[1].split()) <= 3: # Allow for multiple middle names/initials
-                reformatted = f"{parts[0]} {parts[1]}" # Assumes "Lastname" "Firstname Middle"
-                reformatted = re.sub(r'\s+', ' ', reformatted).strip()
-                if verbose: logging.debug(f"Pre-LLM comma sort for '{cleaned_input_name}' -> '{reformatted}' (file: {filename_for_logging})")
-                return reformatted
-            # Else, it might be "Org, Unit" or "Lastname1, Lastname2" - let LLM try
+        parts = [p.strip() for p in cleaned_input_name.split(',', 1)]
+        if len(parts) == 2 and parts[0] and parts[1] and len(parts[1].split()) <= 3:
+            reformatted = f"{parts[0]} {parts[1]}"
+            reformatted = re.sub(r'\s+', ' ', reformatted).strip()
+            if verbose: logging.debug(f"Pre-LLM comma sort for '{cleaned_input_name}' -> '{reformatted}' (file: {filename_for_logging})")
+            return reformatted
 
-    # Reduce multiple authors (if clearly delimited by ';') to the first one for the LLM prompt
     author_to_process = cleaned_input_name.split(';')[0].strip()
-    if not author_to_process: return "UnknownAuthor" # If splitting resulted in empty
+    if not author_to_process: return "UnknownAuthor"
 
-    # Resolve LLM provider instance
     llm_instance: Optional[LLMProvider] = None
     if isinstance(provider_arg, LLMProvider):
         llm_instance = provider_arg
     else: 
         provider_name_str = provider_arg if isinstance(provider_arg, str) else "ollama"
         try:
-            llm_instance = get_llm_provider(provider_name_str, model_name_arg, api_key_arg)
+            llm_instance = get_llm_provider(
+                provider_name_str, 
+                model_name_arg, 
+                api_key_arg, 
+                **provider_specific_kwargs # Pass along any relevant kwargs for this specific call context
+            )
         except Exception as e:
             logging.error(f"Failed to get LLM provider for author sorting ('{provider_name_str}'): {e}. Returning '{author_to_process}'.")
             return author_to_process 
@@ -626,7 +948,7 @@ def sort_author_names(author_names_input: str,
                         if ordered_name and ordered_name.lower() not in ["lastname firstname", "unknownauthor", "unknown author"]:
                             if verbose: logging.debug(f"LLM sorted '{author_to_process}' to '{ordered_name}' using {llm_instance.model_name} for {filename_for_logging}")
                             return ordered_name
-                    else: # LLM didn't use tags, try to use the whole response if it looks like a name
+                    else: 
                         plain_name = re.sub(r'<[^>]+>', '', llm_output).strip()
                         if plain_name and len(plain_name.split()) >= 1 and len(plain_name) < 70 and plain_name.lower() not in ["lastname firstname", "unknownauthor", "unknown author"]:
                              if verbose: logging.debug(f"LLM sorted (no tags) '{author_to_process}' to '{plain_name}' for {filename_for_logging}")
@@ -638,4 +960,4 @@ def sort_author_names(author_names_input: str,
         if attempt < max_attempts: time.sleep(base_retry_wait * (1.5 ** (attempt - 1)))
     
     logging.warning(f"Could not reliably sort author name '{author_names_input}' (processed as '{author_to_process}') for {filename_for_logging} via LLM. Returning best cleaned input.")
-    return author_to_process # Fallback to the pre-LLM cleaned/processed name
+    return author_to_process
