@@ -849,23 +849,26 @@ def get_llm_provider(provider_type: str = "ollama",
 # --- Core LLM Interaction Functions  ---
 
 def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
-                max_attempts: int = 3, verbose: bool = False, # verbose here is for send_to_llm's own logging
+                max_attempts: int = 3, # Max attempts for the *same* prompt template
+                verbose: bool = False,
                 temperature_arg: float = 0.5, max_tokens_arg: Optional[int] = 300,
-                prompt_choice: int = 0 
+                prompt_template_index: int = 0  # for retrires with diffrent templates
                 ) -> str:
-    base_retry_wait = 5.0 
-    prompt_templates = [
-        ( 
-            f"Extract metadata from the following file extraction snippet. We need"
-            f"(1) the publication title"
-            f"(2) the year of publication (4 digits)"
-            f"(3) the main author name (format: Lastname Firstname), and"
-            f"(4) the document language (2-letter ISO code)"
+    base_retry_wait = 5.0
+    # Ensure prompt_templates is defined in this scope or passed appropriately
+    # Using the structure provided by the user in the previous turn
+    prompt_templates_definition = [
+        ( # This is a TUPLE of strings
+            f"Extract metadata from the following file extraction snippet. We need "
+            f"(1) the publication title, "
+            f"(2) the year of publication (4 digits), "
+            f"(3) the main author name (format: Lastname Firstname), and "
+            f"(4) the document language (2-letter ISO code) "
             f"from the text below. Also consider the filename '{os.path.basename(filename)}' for clues. "
             f"Respond ONLY in the following exact format, with no extra text or explanations: \n"
             f"<TITLE>Extracted Publication Title</TITLE>\n<YEAR>YYYY</YEAR>\n<AUTHOR>Lastname Firstname</AUTHOR>\n<LANGUAGE>lg</LANGUAGE>\n\n"
         ),
-        ( 
+        ( # This is a SINGLE string (but can be kept as a tuple of one string for consistency if preferred)
             f"I need to extract metadata from a document with filename '{os.path.basename(filename)}'. "
             f"Provide ONLY these four tags with the information. Do not add any other text.\n"
             f"<TITLE>The Exact Title of the Publication</TITLE>\n"
@@ -873,7 +876,7 @@ def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
             f"<AUTHOR>Lastname Firstname of first/main Author</AUTHOR>\n"
             f"<LANGUAGE>lg (The 2-letter language code, e.g., en, de, fr)</LANGUAGE>\n\n"
         ),
-        ( 
+        (
             f"You are an expert metadata extraction tool. From the provided text (and filename '{os.path.basename(filename)}'), extract the following fields:\n"
             f"1. TITLE: The complete and exact title of the publication.\n"
             f"2. YEAR: The 4-digit year of publication. If not found, use 'UnknownYear'.\n"
@@ -883,127 +886,140 @@ def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
             f"<TITLE>...</TITLE>\n<YEAR>...</YEAR>\n<AUTHOR>...</AUTHOR>\n<LANGUAGE>...</LANGUAGE>\n\n"
         )
     ]
+
+    # Ensure the chosen prompt_template_index is valid
+    if not 0 <= prompt_template_index < len(prompt_templates_definition):
+        logging.error(f"send_to_llm: Invalid prompt_template_index {prompt_template_index}. Defaulting to 0.")
+        prompt_template_index = 0
     
+    chosen_template_config = prompt_templates_definition[prompt_template_index]
+    
+    # Handle if the template config is a tuple of strings or a single string
+    if isinstance(chosen_template_config, tuple):
+        prompt_template_str = "".join(chosen_template_config)
+    else:
+        prompt_template_str = chosen_template_config
+
+    provider_debug_flag = getattr(provider_instance, '_debug', False)
+
     for attempt in range(1, max_attempts + 1):
         if shutdown_flag.is_set():
             logging.info("Shutdown: Aborting LLM request in send_to_llm.")
             return ""
 
-        current_prompt_template_idx = min(prompt_choice + attempt - 1, len(prompt_templates) - 1)
-        prompt_template = prompt_templates[current_prompt_template_idx]
-        
-        # Use the provider's _debug flag for its internal verbose logging if needed
-        provider_debug_flag = getattr(provider_instance, '_debug', False)
-        
-        if provider_debug_flag or verbose: 
+        if provider_debug_flag or verbose:
             logging.debug(f"send_to_llm: Request for '{filename}' to {provider_instance.__class__.__name__} ('{provider_instance.model_name}'), "
-                          f"attempt {attempt}, prompt template {current_prompt_template_idx+1}")
+                          f"using prompt template index {prompt_template_index} (Attempt {attempt}/{max_attempts} for this template).")
 
-        prompt = prompt_template + f"Document text (first 3000 chars):\n{text[:3000]}"
+        prompt = prompt_template_str + f"Document text (first 3000 chars):\n{text[:3000]}"
         messages = [{"role": "user", "content": prompt}]
-        
+
+        # <<< VERBOSE LOGGING OF SENT DATA >>>
+        if provider_debug_flag or verbose:
+            try:
+                messages_str_for_log = json.dumps(messages, indent=2, ensure_ascii=False)
+                logging.debug(f"send_to_llm: Constructed messages payload for '{filename}' (template index {prompt_template_index}, attempt {attempt}):\n{messages_str_for_log}")
+            except Exception as e_log:
+                logging.debug(f"send_to_llm: Could not serialize messages payload for logging: {e_log}")
+
         try:
             response_data = provider_instance.chat_completion(
                 messages=messages, temperature=temperature_arg,
-                max_tokens=max_tokens_arg, 
+                max_tokens=max_tokens_arg,
                 timeout_seconds=120 # Default overall timeout for the call
             )
             output = response_data.get("content", "").strip()
-            if provider_debug_flag or verbose: logging.debug(f"send_to_llm: Raw LLM response for '{filename}' (attempt {attempt}): '{output}'")
-            
+            if provider_debug_flag or verbose: logging.debug(f"send_to_llm: Raw LLM response for '{filename}' (template index {prompt_template_index}, attempt {attempt}): '{output}'")
+
             has_title = "<TITLE>" in output
             has_author = "<AUTHOR>" in output
             has_year = "<YEAR>" in output
 
             if output and has_title and has_author and has_year:
-                return output 
+                return output
             elif output and ("<PUBLICATION TITLE>" in output or "<PUBLICATIONTITLE>" in output) and \
                  has_author and has_year:
                 if provider_debug_flag or verbose: logging.debug(f"send_to_llm: LLM for '{filename}' used alternative title tag. Standardizing.")
                 output = output.replace("<PUBLICATION TITLE>", "<TITLE>").replace("<PUBLICATIONTITLE>", "<TITLE>")
                 return output
             else:
-                logging.warning(f"send_to_llm: LLM response for '{filename}' (attempt {attempt}, model '{provider_instance.model_name}') "
+                # This log means the response was received but was structurally bad for THIS attempt with THIS template
+                logging.warning(f"send_to_llm: LLM response for '{filename}' (template index {prompt_template_index}, attempt {attempt}, model '{provider_instance.model_name}') "
                                 f"missing key tags (TITLE, AUTHOR, YEAR) or empty: '{output[:100]}...'")
-                if attempt == max_attempts: 
-                    logging.error(f"send_to_llm: Max attempts reached for '{filename}', returning last (malformed) output.")
-                    return output 
-        
-        except (OpenAIAPIConnectionError, OpenAITimeout, ollama.ResponseError if ollama else RuntimeError) as e_net: 
-            log_msg = f"send_to_llm: LLM network/timeout error for '{filename}' with {provider_instance.__class__.__name__} (attempt {attempt}): {e_net}."
+                # If max_attempts for this specific prompt template is reached, return the malformed output.
+                # The outer loop in _process_single_file will then decide to try the next template.
+                if attempt == max_attempts:
+                    logging.error(f"send_to_llm: Max attempts ({max_attempts}) reached for '{filename}' with prompt template index {prompt_template_index}. Returning last (malformed) output.")
+                    return output # Return whatever was received
+
+        except (OpenAIAPIConnectionError, OpenAITimeout, ollama.ResponseError if ollama else RuntimeError) as e_net:
+            log_msg = f"send_to_llm: LLM network/timeout error for '{filename}' with {provider_instance.__class__.__name__} (template index {prompt_template_index}, attempt {attempt}): {e_net}."
             if ollama and isinstance(e_net, ollama.ResponseError):
                 log_msg += f" Status: {e_net.status_code}, Error: {e_net.error}"
             logging.warning(log_msg)
             if attempt < max_attempts:
                 sleep_time = base_retry_wait * attempt
-                logging.info(f"send_to_llm: Retrying in {sleep_time:.1f}s.")
-                time.sleep(sleep_time) 
+                logging.info(f"send_to_llm: Retrying prompt template index {prompt_template_index} in {sleep_time:.1f}s.")
+                time.sleep(sleep_time)
             else:
-                logging.error(f"send_to_llm: Max LLM retries for '{filename}' due to network/timeout errors.")
-                return ""
-        except Exception as e: 
-            wait_time = base_retry_wait * (1.5 ** (attempt - 1)) 
+                logging.error(f"send_to_llm: Max LLM retries ({max_attempts}) for '{filename}' with prompt template index {prompt_template_index} due to network/timeout errors.")
+                return "" # Return empty if all retries for this template fail due to network issues
+        except Exception as e:
+            wait_time = base_retry_wait * (1.5 ** (attempt - 1))
             logging.warning(f"send_to_llm: LLM call error for '{filename}' with {provider_instance.__class__.__name__} "
-                            f"(attempt {attempt}): {e}. Retrying in {wait_time:.1f}s.", exc_info=provider_debug_flag or verbose) # Show exc_info if debug
-            
+                            f"(template index {prompt_template_index}, attempt {attempt}): {e}. Retrying in {wait_time:.1f}s.", exc_info=provider_debug_flag or verbose)
+
             if attempt < max_attempts:
                 time.sleep(wait_time)
             else:
-                logging.error(f"send_to_llm: Max LLM retries for '{filename}' due to errors.")
-                return "" 
-        
-    return ""
+                logging.error(f"send_to_llm: Max LLM retries ({max_attempts}) for '{filename}' with prompt template index {prompt_template_index} due to errors.")
+                return "" # Return empty if all retries for this template fail due to other errors
+
+    return "" # Should be reached if all attempts for the given prompt_template_index fail
 
 
-def extract_metadata(text: str, filename: str, 
-                     llm_provider_arg: Union[str, LLMProvider, None], 
-                     model_name_arg: Optional[str] = None, # Passed as model_name to get_llm_provider
-                     api_key_arg: Optional[str] = None,   # Passed as api_key to get_llm_provider
-                     verbose: bool = False, # For send_to_llm's own logging
-                     **provider_constructor_kwargs # Catches ollama_host, llamacpp_*, local_openai_base_url, debug flag
-                     ) -> str:
+def extract_metadata(text: str, filename: str,
+                         llm_provider_arg: Union[str, LLMProvider, None],
+                         model_name_arg: Optional[str] = None,
+                         api_key_arg: Optional[str] = None,
+                         verbose: bool = False, # For send_to_llm's own logging
+                         prompt_template_index_to_try: int = 0, # fo retries
+                         **provider_constructor_kwargs # Catches ollama_host, llamacpp_*, local_openai_base_url, debug flag
+                         ) -> str:
     provider_instance: Optional[LLMProvider] = None
-    
-    # Extract general llm config that might be in provider_constructor_kwargs from CLI args
-    # and ensure they are passed to send_to_llm if not already explicit.
-    # The 'debug' flag for providers is passed via provider_constructor_kwargs to get_llm_provider
+
     debug_for_provider = provider_constructor_kwargs.get('debug', False)
-    
+
     if isinstance(llm_provider_arg, LLMProvider):
         provider_instance = llm_provider_arg
-        # Ensure the instance's debug flag matches verbose if verbose is more detailed
-        if verbose and hasattr(provider_instance, '_debug') and not provider_instance._debug:
-            # This scenario is tricky; the instance is pre-made. Forcing its debug might be intrusive.
-            # Best if instance is created with correct debug flag initially.
-            pass 
-    else: 
+    else:
         provider_name_str = llm_provider_arg if isinstance(llm_provider_arg, str) else "ollama"
         try:
             provider_instance = get_llm_provider(
-                provider_type=provider_name_str, 
-                model_name=model_name_arg, 
+                provider_type=provider_name_str,
+                model_name=model_name_arg,
                 api_key=api_key_arg,
-                debug=debug_for_provider, # Pass the debug status for provider construction
-                **provider_constructor_kwargs 
+                debug=debug_for_provider,
+                **provider_constructor_kwargs
             )
         except Exception as e:
-            logging.error(f"extract_metadata: Failed to get LLMProvider '{provider_name_str}': {e}", exc_info=debug_for_provider)
+            logging.error(f"llm_extract_metadata: Failed to get LLMProvider '{provider_name_str}': {e}", exc_info=debug_for_provider)
             return ""
 
     if not provider_instance:
-        logging.error("extract_metadata: LLM provider instance could not be resolved.")
+        logging.error("llm_extract_metadata: LLM provider instance could not be resolved.")
         return ""
 
-    # Temperature and max_tokens for this specific metadata extraction task
-    temp_for_metadata = provider_constructor_kwargs.get('temperature', 0.5) # from BiblioForge.py args
-    max_tokens_for_metadata = provider_constructor_kwargs.get('max_tokens', 300) # from BiblioForge.py args
+    temp_for_metadata = provider_constructor_kwargs.get('temperature', 0.5)
+    max_tokens_for_metadata = provider_constructor_kwargs.get('max_tokens', 300)
 
     return send_to_llm(
-        text=text, filename=filename, 
-        provider_instance=provider_instance, 
-        verbose=verbose, # Controls send_to_llm's direct logging
+        text=text, filename=filename,
+        provider_instance=provider_instance,
+        verbose=verbose, 
         temperature_arg=temp_for_metadata,
-        max_tokens_arg=max_tokens_for_metadata
+        max_tokens_arg=max_tokens_for_metadata,
+        prompt_template_index=prompt_template_index_to_try # for retries with different prompt templates
     )
 
 def sort_author_names(author_names_input: str, 
