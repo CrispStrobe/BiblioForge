@@ -279,7 +279,7 @@ def _restore_logging_if_corrupted():
             if root_logger.level != logging._biblioforge_target_level:
                 logging.warning(f"Logging level was changed from {logging._biblioforge_target_level} to {root_logger.level}. Restoring...")
                 root_logger.setLevel(logging._biblioforge_target_level)
-                
+
 # --- Filename and Text Utilities ---
 def sanitize_filename(name: str) -> str:
     
@@ -376,27 +376,6 @@ def validate_and_fix_year_old(year: Optional[str], filename: Optional[str] = Non
             valid_years_from_pattern = [y for y in matches if y and 1500 <= int(y) <= current_year_dt + 2]
             if valid_years_from_pattern: return max(valid_years_from_pattern)
     return "UnknownYear"
-
-def escape_special_chars(filename: str) -> str:
-    """
-    Enhanced shell escaping that handles complex filenames with special characters.
-    Uses a combination of strategies for maximum compatibility.
-    """
-    filename_str = str(filename)
-    
-    # For very complex filenames, use double quotes with internal escaping
-    # This handles most problematic characters while remaining readable
-    if any(char in filename_str for char in ["'", '"', '[', ']', '(', ')', '&', ';', '|', '<', '>', '`', '$', '!', '*', '?']):
-        # Escape characters that are problematic even within double quotes
-        escaped = filename_str.replace('\\', '\\\\')  # Escape backslashes first
-        escaped = escaped.replace('"', '\\"')        # Escape double quotes
-        escaped = escaped.replace('`', '\\`')        # Escape backticks (command substitution)
-        escaped = escaped.replace('$', '\\$')        # Escape dollar signs (variable expansion)
-        escaped = escaped.replace('!', '\\!')        # Escape exclamation marks (history expansion in bash)
-        return f'"{escaped}"'
-    else:
-        # For simpler filenames, use shlex.quote which is very robust
-        return shlex.quote(filename_str)
 
 def extract_year_from_filename(filename: str) -> Optional[str]:
     # (Implementation from before)
@@ -673,7 +652,7 @@ def add_rename_command(
                         bash_f.write(f"if [ -f {escape_special_chars(str(abs_actual_text_content_file_path))} ]; then\n")
                         bash_f.write(f"  mv -v {escape_special_chars(str(abs_actual_text_content_file_path))} {escape_special_chars(str(txt_target_path_abs))}\n")
                         bash_f.write(f"else\n")
-                        bash_f.write(f"  echo \"Info: Associated text file {escape_special_chars(str(abs_actual_text_content_file_path))} not found for move (original: {os.path.basename(str(abs_source_original_file))})\" >&2\n")
+                        bash_f.write(f"  echo \"Info: Associated text file {escape_special_chars(str(abs_actual_text_content_file_path))} not found for move (original: {escape_special_chars(os.path.basename(str(abs_source_original_file)))})\" >&2\n")
                         bash_f.write(f"fi\n")
             if batch_script_p_str:
                 with file_lock:
@@ -681,7 +660,7 @@ def add_rename_command(
                         batch_f.write(f"if exist {_escape_for_batch(str(abs_actual_text_content_file_path))} (\n")
                         batch_f.write(f"  move /Y {_escape_for_batch(str(abs_actual_text_content_file_path))} {_escape_for_batch(str(txt_target_path_abs))}\n")
                         batch_f.write(f") else (\n")
-                        batch_f.write(f"  echo Info: Associated text file {_escape_for_batch(str(abs_actual_text_content_file_path))} not found for move ^(original: {os.path.basename(str(abs_source_original_file))}^) 1>&2\n")
+                        batch_f.write(f"  echo Info: Associated text file {_escape_for_batch(str(abs_actual_text_content_file_path))} not found for move ^(original: {_escape_for_batch(os.path.basename(str(abs_source_original_file)))}^) 1>&2\n")
                         batch_f.write(f")\n")
             commands_written_to_any_script = True # Ensure this is true if any command was written
     elif debug:
@@ -708,6 +687,27 @@ def add_rename_command(
     else:
         if debug: logging.debug("add_rename_command: No script paths provided or no commands were applicable/written.")
         return None
+
+def escape_special_chars(filename: str) -> str:
+    """
+    Enhanced shell escaping that handles complex filenames with special characters.
+    Uses a combination of strategies for maximum compatibility.
+    """
+    filename_str = str(filename)
+    
+    # For very complex filenames, use double quotes with internal escaping
+    # This handles most problematic characters while remaining readable
+    if any(char in filename_str for char in ["'", '"', '[', ']', '(', ')', '&', ';', '|', '<', '>', '`', '$', '!', '*', '?']):
+        # Escape characters that are problematic even within double quotes
+        escaped = filename_str.replace('\\', '\\\\')  # Escape backslashes first
+        escaped = escaped.replace('"', '\\"')        # Escape double quotes
+        escaped = escaped.replace('`', '\\`')        # Escape backticks (command substitution)
+        escaped = escaped.replace('$', '\\$')        # Escape dollar signs (variable expansion)
+        escaped = escaped.replace('!', '\\!')        # Escape exclamation marks (history expansion in bash)
+        return f'"{escaped}"'
+    else:
+        # For simpler filenames, use shlex.quote which is very robust
+        return shlex.quote(filename_str)
 
 def _escape_for_batch(path: str) -> str:
     """

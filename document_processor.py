@@ -156,29 +156,27 @@ class DocumentProcessor:
 
 
     def _process_single_file(self, input_file: str,
-                             current_output_dir_base_str: str,
-                             method: Optional[str],
-                             ocr_method: Optional[str],
-                             password: Optional[str],
-                             extract_tables: bool,
-                             force_ocr: bool,
-                             noskip: bool,
-                             effective_sort_flag: bool,
-                             rename_script_base_path_for_unparseables: Optional[str],
-                             initialized_rename_script_paths: Optional[Dict[str, Optional[str]]],
-                             llm_provider_instance: Optional[LLMProvider],
-                             temperature_for_metadata: float,
-                             max_tokens_for_metadata: int,
-                             **kwargs_from_main) -> Dict[str, Any]:
+                         current_output_dir_base_str: str,
+                         method: Optional[str],
+                         ocr_method: Optional[str],
+                         password: Optional[str],
+                         extract_tables: bool,
+                         force_ocr: bool,
+                         noskip: bool,
+                         effective_sort_flag: bool,
+                         rename_script_base_path_for_unparseables: Optional[str],
+                         initialized_rename_script_paths: Optional[Dict[str, Optional[str]]],
+                         llm_provider_instance: Optional[LLMProvider],
+                         temperature_for_metadata: float,
+                         max_tokens_for_metadata: int,
+                         **kwargs_from_main) -> Dict[str, Any]:
 
-        logging.critical(f"DEBUG: >>>>>>> Attempting to process: {input_file} <<<<<<<")
-        
-        # Restore logging before text extraction
-        self._ensure_logging_intact()
+        # logging.critical(f"DEBUG: >>>>>>> Attempting to process: {input_file} <<<<<<<")
         
         if self._debug:
             logging.debug(f"DS_Proc: Starting _process_single_file for: '{input_file}'")
 
+        # INITIALIZE result FIRST - this is the critical fix!
         result: Dict[str, Any] = {
             'success': False, 'text': '', 'output_path': None, 'skipped': False,
             'error': None, 'tables': [], 'metadata_llm': None, 'renamed_info': None,
@@ -187,29 +185,44 @@ class DocumentProcessor:
         
         actual_text_content_path_for_llm_and_rename: Optional[str] = None # Initialize here
 
-        # --- 0-BYTE FILE CHECK --- 
-        if False:
-            try:
-                file_size = os.path.getsize(input_file)
-                if file_size == 0:
-                    error_message = f"File '{input_file}' is 0 bytes and cannot be processed."
-                    logging.warning(f"DS_Proc: {error_message}")
-                    result['error'] = error_message
-                    result['success'] = False
-                    # Optionally, still attempt to get inherent metadata if useful
-                    try: result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
-                    except: pass
-                    return result
-            except OSError as e_size:
-                # File might not exist or be accessible, which would be caught later anyway,
-                # but good to handle if getsize fails for other reasons.
-                logging.warning(f"DS_Proc: Could not get size for '{input_file}': {e_size}. Proceeding with caution.")
-            
-        # --- END OF 0-BYTE FILE CHECK --- 
+        # --- EARLY FILE VALIDATION (now that result is initialized) ---
+        try:
+            file_path = Path(input_file)
+            if not file_path.exists():
+                error_message = f"File '{input_file}' does not exist."
+                logging.warning(f"DS_Proc: {error_message}")
+                result['error'] = error_message
+                result['success'] = False
+                return result
+                
+            file_size = file_path.stat().st_size
+            if file_size == 0:
+                error_message = f"File '{input_file}' is 0 bytes and cannot be processed."
+                logging.warning(f"DS_Proc: {error_message}")
+                result['error'] = error_message
+                result['success'] = False
+                # Optionally, still attempt to get inherent metadata if useful
+                try: 
+                    result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
+                except: 
+                    pass
+                return result
+                
+            # Check for very small files that might be corrupted
+            if file_size < 100 and not input_file.lower().endswith(('.txt', '.md')):
+                error_message = f"File '{input_file}' is suspiciously small ({file_size} bytes) and might be corrupted."
+                logging.warning(f"DS_Proc: {error_message}")
+                result['error'] = error_message
+                result['success'] = False
+                return result
+                
+        except OSError as e_size:
+            error_message = f"Could not access file '{input_file}': {e_size}"
+            logging.warning(f"DS_Proc: {error_message}")
+            result['error'] = error_message
+            result['success'] = False
+            return result
         
-        # Add logging restoration checkpoint
-        _restore_logging_if_corrupted()
-
         # --- Start of Text Extraction Logic (simplified from your provided code) ---
         if shutdown_flag.is_set():
             result['error'] = "Processing aborted due to shutdown signal"
@@ -225,7 +238,8 @@ class DocumentProcessor:
                     with open(input_file, 'r', encoding='utf-8', errors='replace') as f:
                         result['text'] = f.read()
                     if result['text'].strip():
-                        result['success'] = True; text_loaded_from_file = True
+                        result['success'] = True
+                        text_loaded_from_file = True
                     else:
                         result['error'] = f"Source text file '{input_file}' is empty."
                 except Exception as e_read_txt:
@@ -239,18 +253,24 @@ class DocumentProcessor:
                 if not noskip and os.path.exists(determined_extraction_output_path):
                     if not effective_sort_flag:
                         logging.info(f"Skipping '{input_file}' - output '{determined_extraction_output_path}' exists, noskip=False, and sort=False.")
-                        result['skipped'] = True; result['success'] = True
-                        try: result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
-                        except: pass
+                        result['skipped'] = True
+                        result['success'] = True
+                        try: 
+                            result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
+                        except: 
+                            pass
                         return result
                     else:
                         try:
                             with open(determined_extraction_output_path, 'r', encoding='utf-8') as f:
                                 result['text'] = f.read()
                             if result['text'].strip():
-                                result['success'] = True; text_loaded_from_file = True
-                            else: result['success'] = False # Will trigger re-extraction
-                        except Exception: result['success'] = False # Will trigger re-extraction
+                                result['success'] = True
+                                text_loaded_from_file = True
+                            else: 
+                                result['success'] = False # Will trigger re-extraction
+                        except Exception: 
+                            result['success'] = False # Will trigger re-extraction
                 
                 if not text_loaded_from_file:
                     extraction_result = self.manager.extract(
@@ -263,8 +283,10 @@ class DocumentProcessor:
                     result['text'] = extraction_result.get('text', '')
                     result['success'] = extraction_result.get('success', False)
                     result['tables'] = extraction_result.get('tables', [])
-                    if extraction_result.get('error'): result['error'] = extraction_result.get('error')
-                    if result['success']: result['output_path'] = actual_text_content_path_for_llm_and_rename
+                    if extraction_result.get('error'): 
+                        result['error'] = extraction_result.get('error')
+                    if result['success']: 
+                        result['output_path'] = actual_text_content_path_for_llm_and_rename
         # --- End of Text Extraction Logic (simplified) ---
             
             # --- Modified Sorting Logic with Retries for different prompt templates ---
@@ -374,13 +396,14 @@ class DocumentProcessor:
                                 with open(unparseables_path, "a", encoding='utf-8') as f_unp:
                                     f_unp.write(f"{input_file} - All LLM template attempts failed to yield sortable metadata.\n")
                 elif effective_sort_flag and not llm_provider_instance and self._debug:
-                     logging.warning(f"DS_Proc: Sort is True for '{input_file}', but LLM provider instance is missing. Skipping sort.")
+                    logging.warning(f"DS_Proc: Sort is True for '{input_file}', but LLM provider instance is missing. Skipping sort.")
             
             elif not result['success'] and not result.get('skipped'):
-                if not result.get("error"): result['error'] = "Text extraction or direct read failed/produced no text."
+                if not result.get("error"): 
+                    result['error'] = "Text extraction or direct read failed/produced no text."
             elif not result['text'] and not result.get('skipped'):
-                 result['error'] = "Text acquisition successful but produced empty text."
-                 result['success'] = False
+                result['error'] = "Text acquisition successful but produced empty text."
+                result['success'] = False
             
             if not result.get('skipped'):
                 try:
@@ -407,11 +430,11 @@ class DocumentProcessor:
         
         if self._debug:
             logging.debug(f"DS_Proc: Finished _process_single_file for: '{input_file}', "
-                          f"Success: {result['success']}, Error: {result.get('error')}, "
-                          f"Renamed: {bool(result.get('renamed_info'))}, "
-                          f"Skipped: {result.get('skipped')}, "
-                          f"Final text content path in result (result['output_path']): {result.get('output_path')}, "
-                          f"Actual text content path used for LLM/Rename: {actual_text_content_path_for_llm_and_rename}")
+                        f"Success: {result['success']}, Error: {result.get('error')}, "
+                        f"Renamed: {bool(result.get('renamed_info'))}, "
+                        f"Skipped: {result.get('skipped')}, "
+                        f"Final text content path in result (result['output_path']): {result.get('output_path')}, "
+                        f"Actual text content path used for LLM/Rename: {actual_text_content_path_for_llm_and_rename}")
         return result
 
     def process_files(self, input_files: List[str], 

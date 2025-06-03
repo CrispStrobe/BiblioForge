@@ -112,6 +112,52 @@ def signal_handler(signum, frame):
     else:
         logging.info("Shutdown already in progress.")
 
+def filter_out_extracted_txt_files(file_list: List[str]) -> List[str]:
+    """
+    Filter out .txt files that are likely extracted versions of other files in the list.
+    
+    Args:
+        file_list: List of file paths to process
+        
+    Returns:
+        Filtered list with extracted .txt files removed
+    """
+    txt_files = []
+    non_txt_files = []
+    
+    # Separate .txt files from other files
+    for file_path in file_list:
+        if file_path.lower().endswith('.txt'):
+            txt_files.append(file_path)
+        else:
+            non_txt_files.append(file_path)
+    
+    # Find .txt files that have corresponding non-.txt files with the same base name
+    extracted_txt_files = set()
+    
+    for txt_file in txt_files:
+        txt_base = os.path.splitext(txt_file)[0]  # Remove .txt extension
+        
+        # Check if there's a corresponding non-.txt file
+        for non_txt_file in non_txt_files:
+            non_txt_base = os.path.splitext(non_txt_file)[0]  # Remove original extension
+            
+            if txt_base == non_txt_base:
+                # Found a matching pair - the .txt is likely extracted from the other file
+                extracted_txt_files.add(txt_file)
+                logging.debug(f"Excluding extracted .txt file: {txt_file} (corresponds to {non_txt_file})")
+                break
+    
+    # Keep only .txt files that don't have corresponding non-.txt files (standalone .txt files)
+    standalone_txt_files = [txt for txt in txt_files if txt not in extracted_txt_files]
+    
+    # Combine non-.txt files with standalone .txt files
+    filtered_files = non_txt_files + standalone_txt_files
+    
+    if extracted_txt_files:
+        logging.info(f"Filtered out {len(extracted_txt_files)} extracted .txt files to avoid duplicates")
+        
+    return sorted(filtered_files)
 
 def main():
     # --- Argument Parser Setup (ensure all new LLM args are defined here as in previous full file) ---
@@ -243,6 +289,12 @@ def main():
                                 input_files_discovered.append(str(sub_item))
 
     final_input_files = sorted(list(set(str(Path(p).resolve()) for p in input_files_discovered)))
+
+    # After collecting files but before processing
+    if final_input_files:
+        logging.debug(f"Found {len(final_input_files)} files before filtering")
+        final_input_files = filter_out_extracted_txt_files(final_input_files)
+        logging.info(f"Processing {len(final_input_files)} files after filtering out extracted .txt duplicates")
 
     if not final_input_files:
         logging.error("No input files found to process with the given criteria.")
