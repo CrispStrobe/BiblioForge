@@ -856,11 +856,14 @@ def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
     base_retry_wait = 5.0 
     prompt_templates = [
         ( 
-            f"Extract metadata from the following file extraction snippet. We need (1) the main author name (format: Lastname Firstname), "
-            f"(2) the year of publication (4 digits), (3) publication title, and (4) language (2-letter ISO code) "
-            f"from the text below. Consider the filename '{os.path.basename(filename)}' for clues. "
+            f"Extract metadata from the following file extraction snippet. We need"
+            f"(1) the publication title"
+            f"(2) the year of publication (4 digits)"
+            f"(3) the main author name (format: Lastname Firstname), and"
+            f"(4) the document language (2-letter ISO code)"
+            f"from the text below. Also consider the filename '{os.path.basename(filename)}' for clues. "
             f"Respond ONLY in the following exact format, with no extra text or explanations: \n"
-            f"<TITLE>The Full Title</TITLE>\n<YEAR>YYYY</YEAR>\n<AUTHOR>Lastname Firstname</AUTHOR>\n<LANGUAGE>lg</LANGUAGE>\n\n"
+            f"<TITLE>Extracted Publication Title</TITLE>\n<YEAR>YYYY</YEAR>\n<AUTHOR>Lastname Firstname</AUTHOR>\n<LANGUAGE>lg</LANGUAGE>\n\n"
         ),
         ( 
             f"I need to extract metadata from a document with filename '{os.path.basename(filename)}'. "

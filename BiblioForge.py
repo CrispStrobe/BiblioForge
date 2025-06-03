@@ -313,11 +313,14 @@ def main():
                 logging.error(f"Failed to save JSON results to '{json_output_path}': {e_json}")
 
         final_rename_script_path_for_user: Optional[str] = None
-        if args.sort and args.rename_script:
+        if args.sort and args.rename_script: # Only determine if sorting was on and script name provided
             if os.path.isabs(args.rename_script) or os.path.dirname(args.rename_script):
+                # If args.rename_script is already a path (absolute or relative with directory components)
                 final_rename_script_path_for_user = str(Path(args.rename_script).resolve())
             else:
-                final_rename_script_path_for_user = str(Path(args.output_dir).resolve() / args.rename_script).resolve()
+                # If args.rename_script is just a filename, combine with output_dir and then resolve
+                path_obj = Path(args.output_dir).resolve() / args.rename_script
+                final_rename_script_path_for_user = str(path_obj.resolve())
         
         if args.sort and args.execute_rename and final_rename_script_path_for_user:
             if os.path.exists(final_rename_script_path_for_user):
