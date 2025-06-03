@@ -312,36 +312,77 @@ def clean_author_name(author_name: str) -> str:
     author_name = re.sub(r'\s+', ' ', author_name).strip()
     return author_name
 
-def valid_author_name_old(author_name: str) -> bool:
-    # (Implementation from before)
-    if not author_name or len(author_name.strip()) < 2: return False
-    parts = author_name.strip().split()
-    if not parts: return False 
-    lower_name = author_name.lower()
-    if lower_name == "unknown" and len(parts) == 1: return True
-    if "unknown" in lower_name and len(parts) == 2 and parts[1].lower() == "unknown": return True
-    if any(p in lower_name for p in ["unknownauthor", "lastname", "surname", "firstname", "author", "n a"]): return False
-    if not re.match(r'^[\w\s.\'-áéíóúàèìòùäëïöüÄËÏÖÜâêîôûÂÊÎÔÛñÑçÇ]+$', author_name, re.UNICODE): return False
-    if any(len(part) < 1 or len(part) > 30 for part in parts): return False
-    return True
-
 def valid_author_name(author_name: Optional[str]) -> bool:
+    """
+    Comprehensive validation for author names, consolidating all previous logic.
+    """
     if not author_name:
         return False
-    name_lower = author_name.lower().strip()
-    # Remove potential prefixes for the check itself
-    name_to_check = re.sub(r"^(>?(Main Author|Author):?\s*)", "", name_lower, flags=re.IGNORECASE).strip()
     
-    if name_to_check in ["unknownauthor", "unknown author", "n/a", "", "lastname firstname"]: # Added "lastname firstname"
+    # Basic cleaning and normalization
+    name_lower = author_name.lower().strip()
+    
+    # Remove potential prefixes that LLMs sometimes add
+    name_to_check = re.sub(r"^(>?(Main Author|Author|Editor|By):?\s*)", "", name_lower, flags=re.IGNORECASE).strip()
+    
+    # Check minimum length
+    if len(name_to_check) < 2:
         return False
-    if len(name_to_check) < 2: # Minimum length for a meaningful name
+    
+    # Extensive list of invalid patterns/keywords
+    invalid_patterns = [
+        # Direct invalid values
+        "unknownauthor", "unknown author", "n/a", "na", "lastname firstname", 
+        "firstname lastname", "surname name", "author name", "name author",
+        
+        # Placeholder text that LLMs sometimes return
+        "first", "author", "lastname", "firstname", "surname", "name",
+        "unknown", "main author", "primary author", "contributor", "writer", 
+        "creator", "by", "from", "extracted", "publication", "document", 
+        "title", "various", "multiple", "et al", "and others", "anonymous",
+        
+        # Multi-language variants
+        "nicht verfügbar", "unbekannt", "autor", "verfasser", "auteur",
+        "escritor", "scrittore", "författare",
+        
+        # Just the prefix symbols
+        ">", ">>", ":",
+        
+        # Common editor/role indicators
+        "editor", "editors", "ed.", "eds.", "herausgeber", "hrsg.",
+    ]
+    
+    # Check for exact matches with invalid patterns
+    if name_to_check in invalid_patterns:
         return False
-    # Avoid if it's just placeholder words like "author" or "editor"
-    if name_to_check in ["author", "editor", "various authors", "et al"]:
+    
+    # Check if any invalid keywords are contained in the name
+    for pattern in ["unknownauthor", "lastname", "firstname", "surname", "main author", "primary author"]:
+        if pattern in name_to_check:
+            return False
+    
+    # Check for valid character patterns (allow international characters)
+    if not re.match(r'^[\w\s.\'-áéíóúàèìòùäëïöüÄËÏÖÜâêîôûÂÊÎÔÛñÑçÇşŞıİğĞüÜöÖçÇ]+$', name_to_check, re.UNICODE):
         return False
-    # Avoid if it's just the prefix '>'
-    if name_to_check == ">":
+    
+    # Check word length constraints
+    parts = name_to_check.split()
+    if not parts:
         return False
+    
+    # Ensure reasonable word lengths
+    if any(len(part) < 1 or len(part) > 35 for part in parts):
+        return False
+    
+    # Check for too short total meaningful content
+    meaningful_chars = ''.join(c for c in name_to_check if c.isalnum())
+    if len(meaningful_chars) < 3:
+        return False
+    
+    # Special case: allow "Unknown" as a valid fallback
+    if name_to_check == "unknown" and len(parts) == 1:
+        return True
+    
     return True
 
 def validate_and_fix_year(year_str: str) -> str:

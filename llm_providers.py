@@ -1022,7 +1022,135 @@ def extract_metadata(text: str, filename: str,
         prompt_template_index=prompt_template_index_to_try # for retries with different prompt templates
     )
 
-def sort_author_names(author_names_input: str, 
+def sort_author_names(
+    author_names_input: str, 
+    provider_arg, 
+    verbose: bool = False, 
+    filename_for_logging: str = "Unknown", 
+    prompt_template_index: int = 0,
+    **kwargs
+) -> str:
+    """
+    Sort author names using LLM with multiple prompt templates for better reliability.
+    """
+    
+    # Multiple prompt templates for author sorting
+    author_sorting_prompts = [
+        # Template 0: Direct and simple
+        f"""Convert this author name to "Lastname Firstname" format. If there are multiple authors, use only the first/main author.
+
+Author name: "{author_names_input}"
+
+Respond with ONLY the sorted name in this exact format:
+<AUTHOR>Lastname Firstname</AUTHOR>
+
+Examples:
+- "Smith John" → <AUTHOR>Smith John</AUTHOR>
+- "John Smith" → <AUTHOR>Smith John</AUTHOR>
+- "Smith, John" → <AUTHOR>Smith John</AUTHOR>
+- "Dr. John Smith" → <AUTHOR>Smith John</AUTHOR>""",
+
+        # Template 1: More detailed with examples
+        f"""Please reformat the author name into "Lastname Firstname" order. Extract only the main author if multiple authors are present.
+
+Input: "{author_names_input}"
+
+Rules:
+1. Put family name (surname) first
+2. Put given name (first name) second
+3. Remove titles like Dr., Prof., etc.
+4. Use only the primary author if multiple authors
+5. Keep original spelling and accents
+
+Format your response as: <AUTHOR>Lastname Firstname</AUTHOR>
+
+Examples:
+- "Maria Garcia" → <AUTHOR>Garcia Maria</AUTHOR>
+- "Prof. Hans Müller" → <AUTHOR>Müller Hans</AUTHOR>
+- "Dr. Meier, Klaus" → <AUTHOR>Meier Klaus</AUTHOR>""",
+
+        # Template 2: Academic focus with international considerations
+        f"""Reorder this academic author name to surname-first format. Handle international names appropriately.
+
+Author: "{author_names_input}"
+
+Instructions:
+- Convert to: Surname GivenName
+- For Western names: "John Smith" becomes "Smith John"
+- For names with particles: "van der Berg, Jan" becomes "van der Berg Jan"
+- Remove academic titles (Dr., Prof., etc.)
+- If uncertain about name order, judge according to your knowledge about what is likelier as a Firstname.
+- For compound surnames, keep them together
+
+Response format: <AUTHOR>Surname GivenName</AUTHOR>
+
+Sample conversions:
+- "Thomas Anderson" → <AUTHOR>Anderson Thomas</AUTHOR>
+- "Marie-Claire Dubois" → <AUTHOR>Dubois Marie-Claire</AUTHOR>
+- "José García López" → <AUTHOR>García López José</AUTHOR>"""
+    ]
+    
+    if prompt_template_index >= len(author_sorting_prompts):
+        prompt_template_index = 0  # Fallback to first template
+    
+    selected_prompt = author_sorting_prompts[prompt_template_index]
+    
+    if verbose:
+        logging.debug(f"sort_author_names: Using prompt template {prompt_template_index} for '{author_names_input}' (file: {filename_for_logging})")
+    
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            if verbose:
+                logging.debug(f"sort_author_names: LLM request for '{author_names_input}' (file: {filename_for_logging}) to {type(provider_arg).__name__} ('{provider_arg.model_name}'), template {prompt_template_index}, attempt {attempt + 1}")
+            
+            response = provider_arg.send_request(
+                messages=[{"role": "user", "content": selected_prompt}],
+                temperature=0.1,  # Low temperature for consistent sorting
+                max_tokens=100,
+                **kwargs
+            )
+            
+            if verbose:
+                logging.debug(f"sort_author_names: Raw LLM response for '{author_names_input}': '{response}'")
+            
+            if not response:
+                if verbose:
+                    logging.warning(f"sort_author_names: Empty response for '{author_names_input}' (template {prompt_template_index}, attempt {attempt + 1})")
+                continue
+            
+            # Extract author name from response
+            author_match = re.search(r'<AUTHOR[^>]*>(.*?)</AUTHOR>', response, re.DOTALL | re.IGNORECASE)
+            if author_match:
+                sorted_author = author_match.group(1).strip()
+                
+                # Clean up the result
+                sorted_author = re.sub(r'\s+', ' ', sorted_author)  # Normalize whitespace
+                sorted_author = re.sub(r'^(Dr\.?|Prof\.?|Mr\.?|Mrs\.?|Ms\.?)\s+', '', sorted_author, flags=re.IGNORECASE)  # Remove titles
+                
+                if sorted_author and len(sorted_author.strip()) > 1:
+                    if verbose:
+                        logging.debug(f"sort_author_names: LLM sorted '{author_names_input}' to '{sorted_author}' using {provider_arg.model_name} (template {prompt_template_index}) for {filename_for_logging}")
+                    return sorted_author
+                else:
+                    if verbose:
+                        logging.warning(f"sort_author_names: Extracted author name too short: '{sorted_author}' (template {prompt_template_index}, attempt {attempt + 1})")
+            else:
+                if verbose:
+                    logging.warning(f"sort_author_names: Could not extract <AUTHOR> tags from response: '{response[:100]}...' (template {prompt_template_index}, attempt {attempt + 1})")
+        
+        except Exception as e:
+            if verbose:
+                logging.warning(f"sort_author_names: LLM request failed for '{author_names_input}' (template {prompt_template_index}, attempt {attempt + 1}): {e}")
+            continue
+    
+    # All attempts failed
+    if verbose:
+        logging.warning(f"sort_author_names: All attempts failed for '{author_names_input}' with template {prompt_template_index}, returning original")
+    
+    return author_names_input  # Return original if all attempts fail
+
+def sort_author_names_old(author_names_input: str, 
                       provider_arg: Union[str, LLMProvider, None], 
                       temperature: float = 0.2, # Specific temperature for this task
                       max_tokens: Optional[int] = 100, # Specific max_tokens for this task 
@@ -1081,7 +1209,7 @@ def sort_author_names(author_names_input: str,
             f"If it's a single name (e.g., 'Plato'), return it as is. "
             f"If it's an organization, return it as is. "
             f"Handle particles like 'van', 'de la', 'von' correctly (e.g., 'Vincent van Gogh' should become 'van Gogh Vincent'). "
-            f"Prioritize 'Lastname Firstname'. "
+            f"Prioritize 'Lastname Firstname'. Judge according to your knowledge about what names are likelier Firstnames."
             f"Respond ONLY with the formatted name inside <AUTHOR></AUTHOR> tags. Examples:\n"
             f"Input: John Doe -> Output: <AUTHOR>Doe John</AUTHOR>\n"
             f"Input: Plato -> Output: <AUTHOR>Plato</AUTHOR>\n"

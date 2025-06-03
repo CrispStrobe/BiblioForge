@@ -55,6 +55,99 @@ class DocumentProcessor:
             setup_logging(2)  # Debug level
             logging.warning("Logging configuration was corrupted and has been restored.")
 
+    def sort_author_with_retries(
+        self, 
+        author_name: str, 
+        llm_provider_instance, 
+        input_file: str, 
+        max_template_retries: int = 3,
+        **kwargs_from_main
+    ) -> str:
+        """
+        Sort author name with multiple prompt templates and retry logic for consistency.
+        """
+        if not valid_author_name(author_name):
+            return "UnknownAuthor"
+        
+        # If name is already in "Lastname Firstname" format, might not need sorting
+        if ',' in author_name:
+            # Pre-sort comma-separated names
+            parts = [p.strip() for p in author_name.split(',')]
+            if len(parts) == 2 and all(valid_author_name(p) for p in parts):
+                return f"{parts[0]} {parts[1]}"
+        
+        all_results = []
+        
+        # Try different prompt templates
+        for template_idx in range(max_template_retries):
+            if shutdown_flag.is_set():
+                break
+                
+            if self._debug:
+                logging.debug(f"sort_author_with_retries: Trying template {template_idx} for '{author_name}' (file: {input_file})")
+            
+            try:
+                sorted_name = sort_author_names(
+                    author_names_input=author_name,
+                    provider_arg=llm_provider_instance,
+                    verbose=self._debug,
+                    filename_for_logging=input_file,
+                    prompt_template_index=template_idx,
+                    **kwargs_from_main
+                )
+                
+                if sorted_name and valid_author_name(sorted_name) and sorted_name != author_name:
+                    all_results.append(sorted_name)
+                    if self._debug:
+                        logging.debug(f"sort_author_with_retries: Template {template_idx} result: '{sorted_name}'")
+                else:
+                    if self._debug:
+                        logging.warning(f"sort_author_with_retries: Template {template_idx} returned unusable result: '{sorted_name}'")
+                        
+            except Exception as e:
+                if self._debug:
+                    logging.warning(f"sort_author_with_retries: Template {template_idx} failed: {e}")
+                continue
+        
+        if not all_results:
+            if self._debug:
+                logging.warning(f"sort_author_with_retries: All template attempts failed for '{author_name}', using original")
+            return author_name if valid_author_name(author_name) else "UnknownAuthor"
+        
+        # Analyze results for consistency
+        if len(set(all_results)) == 1:
+            # All templates agree - high confidence
+            final_result = all_results[0]
+            if self._debug:
+                logging.debug(f"sort_author_with_retries: All templates agreed on: '{final_result}'")
+            return final_result
+        else:
+            # Results differ - use majority voting or most reasonable result
+            from collections import Counter
+            result_counts = Counter(all_results)
+            most_common = result_counts.most_common(1)[0]
+            
+            if most_common[1] > 1:  # More than one occurrence
+                final_result = most_common[0]
+                if self._debug:
+                    logging.debug(f"sort_author_with_retries: Using majority result: '{final_result}' (appeared {most_common[1]} times out of {len(all_results)})")
+            else:
+                # All results are unique - use heuristic to pick best one
+                # Prefer results that look more like "Lastname Firstname" format
+                best_result = all_results[0]
+                for result in all_results:
+                    parts = result.split()
+                    if len(parts) == 2 and parts[0][0].isupper() and parts[1][0].isupper():
+                        # Looks like proper "Lastname Firstname" format
+                        best_result = result
+                        break
+                
+                final_result = best_result
+                if self._debug:
+                    logging.warning(f"sort_author_with_retries: All templates differ {all_results}, using heuristic choice: '{final_result}'")
+            
+            return final_result
+
     def _extract_pdf_metadata(self, file_path: str) -> Dict[str, Any]:
         metadata = {}
         if PdfReader is None:
@@ -153,6 +246,163 @@ class DocumentProcessor:
             logging.debug(f"_get_unique_output_path: Standard output path: {str(output_path)} (noskip={noskip}, exists={output_path.exists()})")
             
         return str(output_path)
+    
+    def has_invalid_author_keywords(self, author_name: str) -> bool:
+        """
+        Check if author name contains invalid placeholder keywords that indicate LLM failure.
+        """
+        if not author_name:
+            return True
+        
+        author_lower = author_name.lower().strip()
+        
+        # Keywords that indicate the LLM failed to extract a real author name
+        invalid_keywords = [
+            'first', 'author', 'lastname', 'firstname', 'surname', 'name',
+            'unknown', 'unknownauthor', 'main author', 'primary author',
+            'editor', 'contributor', 'writer', 'creator', 'by', 'from',
+            'extracted', 'publication', 'document', 'title', 'various',
+            'multiple', 'et al', 'and others', 'anonymous', 'n/a', 'na',
+            'nicht verfügbar', 'unbekannt', 'autor', 'verfasser'
+        ]
+        
+        # Check if the author name contains any invalid keywords
+        for keyword in invalid_keywords:
+            if keyword in author_lower:
+                return True
+        
+        # Check for patterns like "Lastname Firstname" (literal placeholder)
+        if author_lower in ['lastname firstname', 'firstname lastname', 'surname name']:
+            return True
+        
+        # Check if it's too short or just punctuation
+        if len(author_lower.replace(' ', '').replace('.', '').replace(',', '')) < 3:
+            return True
+        
+        return False
+
+    def process_llm_metadata_with_retries(
+        self,
+        text: str, 
+        input_file: str, 
+        llm_provider_instance, 
+        temperature_for_metadata: float,
+        max_tokens_for_metadata: int,
+        **kwargs_from_main
+    ) -> Optional[Dict[str, str]]:
+        """
+        Process LLM metadata with enhanced retry logic for invalid author names.
+        """
+        max_llm_metadata_attempts = 3
+        max_author_retry_attempts = 3  # Additional retries specifically for bad author names
+        
+        for template_attempt in range(max_llm_metadata_attempts):
+            if shutdown_flag.is_set():
+                break
+                
+            if self._debug:
+                logging.debug(f"DS_Proc: Processing LLM metadata for '{input_file}', template attempt {template_attempt + 1}/{max_llm_metadata_attempts}")
+            
+            # Try up to max_author_retry_attempts for each template
+            for author_retry in range(max_author_retry_attempts):
+                current_llm_response_str = llm_extract_metadata(
+                    text=text, 
+                    filename=input_file,
+                    llm_provider_arg=llm_provider_instance,
+                    verbose=self._debug,
+                    temperature_arg=temperature_for_metadata,
+                    max_tokens_arg=max_tokens_for_metadata,
+                    prompt_template_index_to_try=template_attempt,
+                    **kwargs_from_main
+                )
+
+                if not current_llm_response_str:
+                    if self._debug:
+                        logging.warning(f"DS_Proc: LLM returned no metadata string for '{input_file}' on template {template_attempt + 1}, author retry {author_retry + 1}")
+                    break  # Try next template if no response
+                
+                if self._debug:
+                    logging.debug(f"DS_Proc: LLM returned for metadata (template {template_attempt + 1}, author retry {author_retry + 1}): '{current_llm_response_str[:150]}...' for '{input_file}'")
+                
+                parsed_meta = parse_metadata(current_llm_response_str, filename=os.path.basename(input_file))
+                
+                if not parsed_meta:
+                    if self._debug:
+                        logging.warning(f"DS_Proc: Failed to parse LLM metadata for '{input_file}' (template {template_attempt + 1}, author retry {author_retry + 1})")
+                    break  # Try next template if parsing failed
+                
+                # Validate year
+                year_str_from_llm = parsed_meta.get('year')
+                validated_year = validate_and_fix_year(year_str_from_llm)
+                parsed_meta['year'] = validated_year
+                
+                # Get and validate author
+                author_to_sort = parsed_meta.get('author', "UnknownAuthor")
+                
+                # Check if author contains invalid keywords
+                if self.has_invalid_author_keywords(author_to_sort):
+                    if self._debug:
+                        logging.warning(f"DS_Proc: Author '{author_to_sort}' contains invalid keywords for '{input_file}' (template {template_attempt + 1}, author retry {author_retry + 1}). Retrying...")
+                    
+                    # If this is not the last author retry, continue to next author retry
+                    if author_retry < max_author_retry_attempts - 1:
+                        continue
+                    else:
+                        # If this was the last author retry for this template, break to try next template
+                        if self._debug:
+                            logging.warning(f"DS_Proc: Exhausted author retries for template {template_attempt + 1} on '{input_file}'")
+                        break
+                
+                # Author seems valid, proceed with author sorting
+                corrected_author = "UnknownAuthor"
+                if valid_author_name(author_to_sort):
+                    if self._debug:
+                        logging.debug(f"DS_Proc: Attempting enhanced author sorting for '{author_to_sort}' for '{input_file}' (template {template_attempt + 1}, author retry {author_retry + 1})")
+                    
+                    corrected_author = self.sort_author_with_retries(
+                        author_name=author_to_sort,
+                        llm_provider_instance=llm_provider_instance,
+                        input_file=input_file,
+                        max_retries=2,  # 2 retries for sorting consistency
+                        **kwargs_from_main
+                    )
+                    
+                    if self._debug:
+                        logging.debug(f"DS_Proc: Enhanced sorted author name: '{corrected_author}' for '{input_file}'")
+                else:
+                    corrected_author = author_to_sort if valid_author_name(author_to_sort) else "UnknownAuthor"
+                
+                parsed_meta['author'] = corrected_author
+                
+                # Final validation for sorting
+                title_from_llm = parsed_meta.get('title', "")
+                
+                is_valid_for_sorting = (
+                    valid_author_name(corrected_author) and
+                    title_from_llm and
+                    title_from_llm.lower() not in ['unknowntitle', 'unknown', 'the full title', ''] and
+                    validated_year != "UnknownYear"
+                )
+                
+                if is_valid_for_sorting:
+                    if self._debug:
+                        logging.info(f"DS_Proc: LLM metadata is VALID for sorting '{input_file}' (template {template_attempt + 1}, author retry {author_retry + 1})")
+                    return parsed_meta
+                else:
+                    if self._debug:
+                        logging.warning(f"DS_Proc: LLM metadata is INVALID for sorting '{input_file}' (template {template_attempt + 1}, author retry {author_retry + 1}). Author='{corrected_author}', Title='{title_from_llm}', Year='{validated_year}'")
+                    
+                    # If author is the main problem and we have retries left, continue
+                    if not valid_author_name(corrected_author) and author_retry < max_author_retry_attempts - 1:
+                        continue
+                    else:
+                        break  # Try next template
+        
+        # All attempts failed
+        if self._debug:
+            logging.warning(f"DS_Proc: All LLM attempts failed to produce valid metadata for '{input_file}'")
+        
+        return None
 
 
     def _process_single_file(self, input_file: str,
@@ -172,6 +422,7 @@ class DocumentProcessor:
                          **kwargs_from_main) -> Dict[str, Any]:
 
         # logging.critical(f"DEBUG: >>>>>>> Attempting to process: {input_file} <<<<<<<")
+        debug = self._debug
         
         if self._debug:
             logging.debug(f"DS_Proc: Starting _process_single_file for: '{input_file}'")
@@ -289,94 +540,27 @@ class DocumentProcessor:
                         result['output_path'] = actual_text_content_path_for_llm_and_rename
         # --- End of Text Extraction Logic (simplified) ---
             
-            # --- Modified Sorting Logic with Retries for different prompt templates ---
+            # --- Enhanced Sorting Logic with Author-specific Retries ---
             if result['success'] and result['text'] and actual_text_content_path_for_llm_and_rename and effective_sort_flag:
                 if llm_provider_instance:
                     if not initialized_rename_script_paths and self._debug:
                         logging.warning(f"DS_Proc: Sort is True for '{input_file}', but rename scripts not initialized. Cannot generate rename commands.")
 
-                    max_llm_metadata_attempts = 3 # Number of prompt templates to try
-                    final_parsed_llm_meta: Optional[Dict[str, str]] = None
-                    last_llm_response_str_for_debug = ""
+                    final_parsed_llm_meta = self.process_llm_metadata_with_retries(
+                        text=result["text"],
+                        input_file=input_file,
+                        llm_provider_instance=llm_provider_instance,
+                        temperature_for_metadata=temperature_for_metadata,
+                        max_tokens_for_metadata=max_tokens_for_metadata,
+                        **kwargs_from_main
+                    )
 
-                    for llm_template_attempt_idx in range(max_llm_metadata_attempts):
-                        if shutdown_flag.is_set(): break
-                        if self._debug:
-                            logging.debug(f"DS_Proc: Processing LLM metadata for '{input_file}', template attempt {llm_template_attempt_idx + 1}/{max_llm_metadata_attempts}")
-                        
-                        current_llm_response_str = llm_extract_metadata(
-                            text=result["text"], filename=input_file,
-                            llm_provider_arg=llm_provider_instance,
-                            verbose=self._debug, # For send_to_llm's own detailed logging
-                            temperature_arg=temperature_for_metadata,
-                            max_tokens_arg=max_tokens_for_metadata,
-                            prompt_template_index_to_try=llm_template_attempt_idx, # <<< USE NEW ARG
-                            **kwargs_from_main
-                        )
-                        last_llm_response_str_for_debug = current_llm_response_str # Store for potential final debug
-
-                        if not current_llm_response_str:
-                            logging.warning(f"DS_Proc: LLM returned no metadata string for '{input_file}' on template attempt {llm_template_attempt_idx + 1}.")
-                            continue # Try next template
-
-                        if self._debug:
-                            logging.debug(f"DS_Proc: LLM returned for metadata (template attempt {llm_template_attempt_idx + 1}): '{current_llm_response_str[:150]}...' for '{input_file}'")
-                        
-                        parsed_meta_this_attempt = parse_metadata(current_llm_response_str, filename=os.path.basename(input_file))
-
-                        if not parsed_meta_this_attempt:
-                            logging.warning(f"DS_Proc: Failed to parse LLM metadata for '{input_file}' (template attempt {llm_template_attempt_idx + 1}). Response: '{current_llm_response_str[:100]}...'")
-                            continue # Try next template
-                        
-                        # --- Perform validation (author, year, title) ---
-                        year_str_from_llm = parsed_meta_this_attempt.get('year')
-                        validated_year = validate_and_fix_year(year_str_from_llm)
-                        parsed_meta_this_attempt['year'] = validated_year # Update with validated year
-                        if self._debug: logging.debug(f"DS_Proc: Validated year: '{validated_year}' for '{input_file}' (template attempt {llm_template_attempt_idx + 1})")
-
-                        author_to_sort = parsed_meta_this_attempt.get('author', "UnknownAuthor")
-                        corrected_author = "UnknownAuthor"
-                        if author_to_sort.lower() not in ["lastname firstname", "unknownauthor", "unknown author", "main author: lastname firstname", "none", ""] and valid_author_name(author_to_sort):
-                            if self._debug: logging.debug(f"DS_Proc: Attempting to sort author name '{author_to_sort}' for '{input_file}' (template attempt {llm_template_attempt_idx + 1})")
-                            corrected_author = sort_author_names(
-                                author_names_input=author_to_sort,
-                                provider_arg=llm_provider_instance,
-                                verbose=self._debug,
-                                filename_for_logging=input_file,
-                                **kwargs_from_main
-                            )
-                            if self._debug: logging.debug(f"DS_Proc: Sorted author name: '{corrected_author}' for '{input_file}' (template attempt {llm_template_attempt_idx + 1})")
-                        else:
-                            corrected_author = author_to_sort if valid_author_name(author_to_sort) else "UnknownAuthor"
-                        parsed_meta_this_attempt['author'] = corrected_author
-                        # --- End Author Sort ---
-
-                        title_from_llm = parsed_meta_this_attempt.get('title', "")
-
-                        # Check if metadata is valid for sorting
-                        is_valid_for_sorting = (
-                            valid_author_name(corrected_author) and
-                            title_from_llm and
-                            title_from_llm.lower() not in ['unknowntitle', 'unknown', 'the full title', ''] and
-                            validated_year != "UnknownYear" # Also check if year is known
-                        )
-
-                        if is_valid_for_sorting:
-                            if self._debug: logging.info(f"DS_Proc: LLM metadata from template attempt {llm_template_attempt_idx + 1} is VALID for sorting '{input_file}'.")
-                            final_parsed_llm_meta = parsed_meta_this_attempt.copy()
-                            break # Successfully got valid metadata, exit loop
-                        else:
-                            logging.warning(
-                                f"DS_Proc: LLM metadata from template attempt {llm_template_attempt_idx + 1} for '{input_file}' "
-                                f"is INVALID for sorting. Author='{corrected_author}', Title='{title_from_llm}', Year='{validated_year}'. "
-                                f"Retrying if attempts left ({max_llm_metadata_attempts - (llm_template_attempt_idx + 1)})."
-                            ) # Loop will continue to the next template
-                    # --- End of loop for trying different prompt templates ---
-
-                    if final_parsed_llm_meta: # If a valid metadata was found
+                    if final_parsed_llm_meta:
                         result['metadata_llm'] = final_parsed_llm_meta
                         if initialized_rename_script_paths:
-                            if self._debug: logging.debug(f"DS_Proc: Generating rename command for '{input_file}' with Author='{final_parsed_llm_meta['author']}', Year='{final_parsed_llm_meta['year']}', Title='{final_parsed_llm_meta['title']}'")
+                            if self._debug:
+                                logging.debug(f"DS_Proc: Generating rename command for '{input_file}' with Author='{final_parsed_llm_meta['author']}', Year='{final_parsed_llm_meta['year']}', Title='{final_parsed_llm_meta['title']}'")
+                            
                             rename_info_dict = add_rename_command(
                                 rename_script_paths=initialized_rename_script_paths,
                                 source_path_original_file=input_file,
@@ -387,16 +571,15 @@ class DocumentProcessor:
                                 debug=self._debug
                             )
                             result["renamed_info"] = rename_info_dict
-                            if self._debug and rename_info_dict: logging.debug(f"DS_Proc: Rename command generated for {input_file}. Info: {rename_info_dict}")
-                    else: # All template attempts failed to produce sortable metadata
-                        logging.warning(f"DS_Proc: All {max_llm_metadata_attempts} LLM prompt template attempts failed to produce sortable metadata for '{input_file}'. Last LLM response: '{last_llm_response_str_for_debug[:100]}...'")
+                            if self._debug and rename_info_dict:
+                                logging.debug(f"DS_Proc: Rename command generated for {input_file}. Info: {rename_info_dict}")
+                    else:
+                        logging.warning(f"DS_Proc: All enhanced LLM attempts (including author-specific retries) failed for '{input_file}'")
                         if rename_script_base_path_for_unparseables:
                             unparseables_path = Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst"
                             with file_lock:
                                 with open(unparseables_path, "a", encoding='utf-8') as f_unp:
-                                    f_unp.write(f"{input_file} - All LLM template attempts failed to yield sortable metadata.\n")
-                elif effective_sort_flag and not llm_provider_instance and self._debug:
-                    logging.warning(f"DS_Proc: Sort is True for '{input_file}', but LLM provider instance is missing. Skipping sort.")
+                                    f_unp.write(f"{input_file} - All LLM attempts (including author retries) failed to yield sortable metadata.\n")
             
             elif not result['success'] and not result.get('skipped'):
                 if not result.get("error"): 
