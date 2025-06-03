@@ -38,12 +38,12 @@ except ImportError as e:
 
 try:
     from utils import (
-        setup_logging,
+        setup_logging, _restore_logging_if_corrupted,
         initialize_rename_scripts,
         execute_rename_commands,
         shutdown_flag, # For signal_handler
         active_processes, # For signal_handler
-        extraction_in_progress # For signal_handler
+        extraction_in_progress, # For signal_handler
     )
 except ImportError as e:
     print(f"Critical Error: Could not import 'utils' module. {e}", file=sys.stderr)
@@ -168,8 +168,21 @@ def main():
     parser.add_argument('-d', '--debug', action='store_const', const=2, dest='verbose', help="Enable debug logging (shortcut for -vv).")
     
     args = parser.parse_args()
-    setup_logging(args.verbose) 
+    # Store verbosity for restoration
+    logging._biblioforge_verbosity = args.verbose
+    logging._biblioforge_target_level = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}.get(args.verbose, logging.DEBUG)
+    
+    setup_logging(args.verbose)
+
     logging.debug(f"Arguments received: {args}")
+
+    # Add periodic logging checks during processing
+    def check_and_restore_logging():
+        """Periodic logging health check"""
+        root_logger = logging.getLogger()
+        if not root_logger.handlers or root_logger.level != logging._biblioforge_target_level:
+            print(f"WARNING: Logging was corrupted, restoring...", file=sys.stderr)
+            setup_logging(args.verbose)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -270,6 +283,9 @@ def main():
         logging.debug(f"main: Filtered LLM config kwargs to pass to process_files: {llm_config_kwargs_to_pass}")
 
     try:
+        # Add logging check before processing
+        check_and_restore_logging()
+
         processing_results_summary = processor.process_files(
             input_files=final_input_files,
             output_dir=args.output_dir,
@@ -287,6 +303,9 @@ def main():
             max_tokens=args.max_tokens,     # Explicitly passed
             **llm_config_kwargs_to_pass     # Pass all other relevant configs
         )
+
+        # Add logging check after processing
+        check_and_restore_logging()
 
         if args.json:
             json_output_path = args.json
@@ -356,6 +375,8 @@ def main():
                  logging.info(f"Partial rename script may exist at {script_path_to_check}")
         return 130 
     except Exception as e:
+        # Ensure we can still log errors even if logging was corrupted
+        check_and_restore_logging()
         logging.error(f"An unexpected error occurred in main execution: {e}", exc_info=args.verbose > 1)
         return 1
     finally:

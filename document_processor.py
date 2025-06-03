@@ -15,7 +15,8 @@ from extraction_manager import ExtractionManager
 from utils import (
     file_lock, parse_metadata, sanitize_filename, 
     validate_and_fix_year, add_rename_command, 
-    shutdown_flag, valid_author_name, initialize_rename_scripts
+    shutdown_flag, valid_author_name, initialize_rename_scripts,
+    setup_logging, _restore_logging_if_corrupted
 )
 from llm_providers import (
     extract_metadata as llm_extract_metadata, 
@@ -44,6 +45,15 @@ class DocumentProcessor:
     def __init__(self, debug: bool = False):
         self.manager = ExtractionManager(debug=debug)
         self._debug = debug
+
+    def _ensure_logging_intact(self):
+        """Ensure logging configuration is still intact"""
+        root_logger = logging.getLogger()
+        if self._debug and (not root_logger.handlers or root_logger.level > logging.DEBUG):
+            # Re-setup logging if it was corrupted
+            from utils import setup_logging
+            setup_logging(2)  # Debug level
+            logging.warning("Logging configuration was corrupted and has been restored.")
 
     def _extract_pdf_metadata(self, file_path: str) -> Dict[str, Any]:
         metadata = {}
@@ -161,9 +171,13 @@ class DocumentProcessor:
                              max_tokens_for_metadata: int,
                              **kwargs_from_main) -> Dict[str, Any]:
 
+        logging.critical(f"DEBUG: >>>>>>> Attempting to process: {input_file} <<<<<<<")
+        
+        # Restore logging before text extraction
+        self._ensure_logging_intact()
+        
         if self._debug:
             logging.debug(f"DS_Proc: Starting _process_single_file for: '{input_file}'")
-            # ... (other initial debug logs from your existing code) ...
 
         result: Dict[str, Any] = {
             'success': False, 'text': '', 'output_path': None, 'skipped': False,
@@ -172,6 +186,29 @@ class DocumentProcessor:
         }
         
         actual_text_content_path_for_llm_and_rename: Optional[str] = None # Initialize here
+
+        # --- 0-BYTE FILE CHECK --- 
+        if False:
+            try:
+                file_size = os.path.getsize(input_file)
+                if file_size == 0:
+                    error_message = f"File '{input_file}' is 0 bytes and cannot be processed."
+                    logging.warning(f"DS_Proc: {error_message}")
+                    result['error'] = error_message
+                    result['success'] = False
+                    # Optionally, still attempt to get inherent metadata if useful
+                    try: result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
+                    except: pass
+                    return result
+            except OSError as e_size:
+                # File might not exist or be accessible, which would be caught later anyway,
+                # but good to handle if getsize fails for other reasons.
+                logging.warning(f"DS_Proc: Could not get size for '{input_file}': {e_size}. Proceeding with caution.")
+            
+        # --- END OF 0-BYTE FILE CHECK --- 
+        
+        # Add logging restoration checkpoint
+        _restore_logging_if_corrupted()
 
         # --- Start of Text Extraction Logic (simplified from your provided code) ---
         if shutdown_flag.is_set():
@@ -307,8 +344,11 @@ class DocumentProcessor:
                             final_parsed_llm_meta = parsed_meta_this_attempt.copy()
                             break # Successfully got valid metadata, exit loop
                         else:
-                            logging.warning(f"DS_Proc: LLM metadata from template attempt {llm_template_attempt_idx + 1} for '{input_file}' is INVALID for sorting. Author='{corrected_author}', Title='{title_from_llm}', Year='{validated_year}'. Retrying if attempts left.")
-                            # Loop will continue to the next template
+                            logging.warning(
+                                f"DS_Proc: LLM metadata from template attempt {llm_template_attempt_idx + 1} for '{input_file}' "
+                                f"is INVALID for sorting. Author='{corrected_author}', Title='{title_from_llm}', Year='{validated_year}'. "
+                                f"Retrying if attempts left ({max_llm_metadata_attempts - (llm_template_attempt_idx + 1)})."
+                            ) # Loop will continue to the next template
                     # --- End of loop for trying different prompt templates ---
 
                     if final_parsed_llm_meta: # If a valid metadata was found
@@ -335,7 +375,7 @@ class DocumentProcessor:
                                     f_unp.write(f"{input_file} - All LLM template attempts failed to yield sortable metadata.\n")
                 elif effective_sort_flag and not llm_provider_instance and self._debug:
                      logging.warning(f"DS_Proc: Sort is True for '{input_file}', but LLM provider instance is missing. Skipping sort.")
-            # ... (rest of your error handling and inherent metadata extraction) ...
+            
             elif not result['success'] and not result.get('skipped'):
                 if not result.get("error"): result['error'] = "Text extraction or direct read failed/produced no text."
             elif not result['text'] and not result.get('skipped'):
@@ -354,8 +394,16 @@ class DocumentProcessor:
             result['success'] = False
             if effective_sort_flag and rename_script_base_path_for_unparseables:
                 try:
-                    with file_lock: (Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst").open("a", encoding='utf-8').write(f"{input_file} - Overall Error in _process_single_file: {str(e)}\n")
-                except Exception as e_unp: logging.error(f"Failed to write to unparseables.lst: {e_unp}")
+                    logging.debug(f"DS_Proc: Attempting to acquire file_lock for unparseables.lst for {input_file}")
+                    with file_lock:
+                        logging.debug(f"DS_Proc: Acquired file_lock for unparseables.lst for {input_file}")
+                        unparseables_path = Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst"
+                        with open(unparseables_path, "a", encoding='utf-8') as f_unp:
+                            f_unp.write(f"{input_file} - Overall Error in _process_single_file: {str(e)}\n")
+                        logging.debug(f"DS_Proc: Wrote to unparseables.lst for {input_file}")
+                    logging.debug(f"DS_Proc: Released file_lock for unparseables.lst for {input_file}")
+                except Exception as e_unp:
+                    logging.error(f"Failed to write to unparseables.lst for {input_file}: {e_unp}")
         
         if self._debug:
             logging.debug(f"DS_Proc: Finished _process_single_file for: '{input_file}', "

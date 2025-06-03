@@ -12,7 +12,7 @@ import re # For any regex operations if needed
 # Direct import for utilities, assuming 'utils.py' is in PYTHONPATH
 # (which it will be if running from the root directory)
 try:
-    from utils import ImportCache, run_process, shutdown_flag # Added shutdown_flag
+    from utils import ImportCache, run_process, shutdown_flag, escape_special_chars # Added shutdown_flag
 except ImportError as e:
     logging.error(f"CRITICAL: Failed to import from utils.py in pdf_extractor.py: {e}")
     # Depending on how critical these are, you might re-raise or provide dummy objects

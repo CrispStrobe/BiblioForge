@@ -13,6 +13,7 @@ from pathlib import Path
 from tqdm import tqdm 
 import subprocess # For run_process and Popen type hint
 import sys # <<< ADDED IMPORT FOR SYS
+import warnings
 
 # --- Global Variables / Flags ---
 shutdown_flag = threading.Event()
@@ -21,6 +22,9 @@ file_lock = threading.Lock()
 active_processes: List['subprocess.Popen'] = [] 
 extraction_in_progress = threading.Event()
 
+# logging globals
+_target_log_level = logging.WARNING
+_logging_check_counter = 0
 
 DEBUG_PARSE_METADATA = True # Or manage via environment variable/config
 
@@ -136,54 +140,146 @@ class ImportCache:
         return self._modules[cache_key]
 
 # --- Logging Setup ---
-class TqdmLoggingHandler(logging.Handler):
-    def emit(self, record: logging.LogRecord): # Added type hint for record
+class TqdmLoggingHandler(logging.Handler): # Make sure this class is defined before setup_logging
+    def emit(self, record: logging.LogRecord):
         try:
             msg = self.format(record)
-            tqdm.write(msg, file=sys.stderr) # sys is now imported
+            tqdm.write(msg, file=sys.stderr)
             self.flush()
         except Exception:
             self.handleError(record)
 
 def setup_logging(verbosity: int = 0):
-    # (Implementation from before, unchanged)
+    """Enhanced logging setup with protection against library interference"""
+    USE_STANDARD_HANDLER_FOR_DEBUGGING = True
+    
     levels = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
     level = levels.get(verbosity, logging.DEBUG)
-    
+
+    # Store the target level globally for restoration
+    global _target_log_level
+    _target_log_level = level
+
     root_logger = logging.getLogger()
-    if root_logger.hasHandlers(): root_logger.handlers.clear()
+    
+    # Clear existing handlers
+    if root_logger.hasHandlers():
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+            handler.close()
+    
+    # Force set the level
     root_logger.setLevel(level)
     
     format_str = '%(asctime)s - %(levelname)s - %(name)s - %(funcName)s - %(message)s' if verbosity > 1 \
                  else '%(asctime)s - %(levelname)s - %(message)s' if verbosity > 0 \
                  else '%(message)s'
     
-    console_handler = TqdmLoggingHandler()
-    console_handler.setFormatter(logging.Formatter(format_str))
-    root_logger.addHandler(console_handler)
-    
+    formatter = logging.Formatter(format_str)
+
+    if USE_STANDARD_HANDLER_FOR_DEBUGGING:
+        if verbosity > 0:
+            console_handler = logging.StreamHandler(sys.stderr)
+            console_handler.setFormatter(formatter)
+            console_handler.setLevel(level)  # Explicitly set handler level
+            root_logger.addHandler(console_handler)
+            logging.info("Using standard StreamHandler for console logging (for debugging).")
+
+    # File logging
     try:
         log_file_path = Path('biblioforge.log').resolve()
-        # Use 'a' for append mode to keep logs across runs if desired, or 'w' to overwrite
-        file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8') 
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(module)s.%(funcName)s:%(lineno)d - %(message)s'))
+        log_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(module)s.%(funcName)s:%(lineno)d - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        file_handler.setLevel(logging.DEBUG)  # Always debug level for file
         root_logger.addHandler(file_handler)
-        if level <= logging.INFO: logging.info(f"Logging to console and file: {log_file_path}")
+        
+        if level <= logging.INFO:
+            root_logger.info(f"Logging to console and file: {log_file_path}")
     except Exception as e:
-        # Use root logger to log this critical error, as it might happen before console handler is fully up
-        root_logger.error(f"Failed to set up file logging to biblioforge.log: {e}")
+        error_msg = f"Failed to set up file logging: {e}"
+        if root_logger.hasHandlers():
+            root_logger.error(error_msg)
+        else:
+            print(f"ERROR: {error_msg}", file=sys.stderr)
 
-    import warnings # Local import for this function's scope is fine
-    warnings.filterwarnings('ignore', category=DeprecationWarning)
-    warnings.filterwarnings('ignore', category=UserWarning)
+    # Silence problematic libraries more aggressively
+    _silence_problematic_libraries(verbosity)
     
-    libraries_to_quiet = ['PIL', 'pdf2image', 'pytesseract', 'pdfminer', 'pypdf', 
-                          'camelot', 'pymupdf', 'matplotlib', 'h5py', 'tensorflow']
+    # Set up logging restoration hook
+    _setup_logging_restoration_hook(verbosity)
+
+def _silence_problematic_libraries(verbosity: int):
+    """Aggressively silence libraries that interfere with logging"""
+    libraries_to_quiet = [
+        'PIL', 'pdf2image', 'pytesseract', 'pdfminer', 'pypdf', 'camelot', 'pymupdf', 
+        'matplotlib', 'h5py', 'tensorflow', 'easyocr', 'paddleocr', 'doctr', 'jax',
+        'numexpr', 'torch', 'paddle', 'kraken', 'cv2', 'numpy'
+    ]
+    
     for lib_name in libraries_to_quiet:
-        logging.getLogger(lib_name).setLevel(logging.WARNING if verbosity < 2 else logging.INFO)
-    if verbosity < 2: logging.getLogger('pypdf').setLevel(logging.ERROR)
+        lib_logger = logging.getLogger(lib_name)
+        lib_logger.setLevel(logging.ERROR)  # Always ERROR for these
+        # Prevent propagation to avoid interference
+        lib_logger.propagate = False
+    
+    # Special handling for very problematic ones
+    if verbosity < 2:
+        for problematic in ['easyocr', 'paddleocr', 'doctr']:
+            prob_logger = logging.getLogger(problematic)
+            prob_logger.disabled = True  # Completely disable if not in debug mode
 
+def _setup_logging_restoration_hook(verbosity: int):
+    """Set up a hook to restore logging if it gets corrupted"""
+    global _logging_check_counter, _target_log_level
+    _logging_check_counter = 0
+    
+    def restore_logging_if_needed():
+        global _logging_check_counter
+        _logging_check_counter += 1
+        
+        # Check every 5 log calls
+        if _logging_check_counter % 5 == 0:
+            root_logger = logging.getLogger()
+            if root_logger.level != _target_log_level:
+                logging.warning(f"Logging level was changed from {_target_log_level} to {root_logger.level}. Restoring...")
+                root_logger.setLevel(_target_log_level)
+                # Re-apply handler levels
+                for handler in root_logger.handlers:
+                    if isinstance(handler, logging.StreamHandler) and handler.stream == sys.stderr:
+                        handler.setLevel(_target_log_level)
+    
+    # Add filter to root logger to check periodically
+    root_logger = logging.getLogger()
+    
+    class LoggingProtectionFilter(logging.Filter):
+        def filter(self, record):
+            restore_logging_if_needed()
+            return True
+    
+    root_logger.addFilter(LoggingProtectionFilter())
 
+def _restore_logging_if_corrupted():
+        """Force restore logging configuration if it was corrupted by external libraries"""
+        root_logger = logging.getLogger()
+        
+        # Check if we still have handlers
+        if not root_logger.handlers:
+            logging.error("Logging handlers were removed! Attempting to restore...")
+            # Re-run setup_logging with stored verbosity
+            if hasattr(logging, '_biblioforge_verbosity'):
+                setup_logging(logging._biblioforge_verbosity)
+            else:
+                setup_logging(2)  # Default to debug
+        
+        # Check if level was changed
+        if hasattr(logging, '_biblioforge_target_level'):
+            if root_logger.level != logging._biblioforge_target_level:
+                logging.warning(f"Logging level was changed from {logging._biblioforge_target_level} to {root_logger.level}. Restoring...")
+                root_logger.setLevel(logging._biblioforge_target_level)
+                
 # --- Filename and Text Utilities ---
 def sanitize_filename(name: str) -> str:
     
@@ -282,8 +378,25 @@ def validate_and_fix_year_old(year: Optional[str], filename: Optional[str] = Non
     return "UnknownYear"
 
 def escape_special_chars(filename: str) -> str:
-    # shlex.quote is generally preferred for shell escaping
-    return shlex.quote(str(filename))
+    """
+    Enhanced shell escaping that handles complex filenames with special characters.
+    Uses a combination of strategies for maximum compatibility.
+    """
+    filename_str = str(filename)
+    
+    # For very complex filenames, use double quotes with internal escaping
+    # This handles most problematic characters while remaining readable
+    if any(char in filename_str for char in ["'", '"', '[', ']', '(', ')', '&', ';', '|', '<', '>', '`', '$', '!', '*', '?']):
+        # Escape characters that are problematic even within double quotes
+        escaped = filename_str.replace('\\', '\\\\')  # Escape backslashes first
+        escaped = escaped.replace('"', '\\"')        # Escape double quotes
+        escaped = escaped.replace('`', '\\`')        # Escape backticks (command substitution)
+        escaped = escaped.replace('$', '\\$')        # Escape dollar signs (variable expansion)
+        escaped = escaped.replace('!', '\\!')        # Escape exclamation marks (history expansion in bash)
+        return f'"{escaped}"'
+    else:
+        # For simpler filenames, use shlex.quote which is very robust
+        return shlex.quote(filename_str)
 
 def extract_year_from_filename(filename: str) -> Optional[str]:
     # (Implementation from before)
@@ -368,7 +481,7 @@ def _fallback_detect_language(text: str) -> Optional[str]:
 # --- Process Management ---
 def run_process(cmd: List[str], timeout_sec: Optional[int] = None, **kwargs) -> subprocess.CompletedProcess:
     # (Implementation from before, ensuring globals are from this module)
-    global active_processes, extraction_in_progress 
+    global active_processes, extraction_in_progress
     extraction_in_progress.set()
     cmd_str = [str(c) for c in cmd]
     process = subprocess.Popen(
@@ -383,24 +496,33 @@ def run_process(cmd: List[str], timeout_sec: Optional[int] = None, **kwargs) -> 
         returncode = process.returncode
     except subprocess.TimeoutExpired:
         logging.warning(f"Process {' '.join(cmd_str)} timed out after {timeout_sec}s. Terminating.")
-        process.kill()
-        try: stdout, stderr = process.communicate(timeout=1)
-        except subprocess.TimeoutExpired: logging.warning(f"Process {process.pid} did not respond to kill quickly.")
-        except Exception as e_comm_kill: logging.debug(f"Error during communicate after kill for {process.pid}: {e_comm_kill}")
-        returncode = -9 
-    except KeyboardInterrupt: 
+        process.kill() # Send SIGKILL
+        try:
+            # Attempt to get output after kill, with a very short timeout
+            stdout, stderr = process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            logging.warning(f"Process {process.pid} did not respond to communicate after kill quickly.")
+        except Exception as e_comm_kill:
+            logging.debug(f"Error during communicate after kill for {process.pid}: {e_comm_kill}")
+        returncode = -9 # Indicate timeout
+    except KeyboardInterrupt:
         logging.warning(f"Process {' '.join(cmd_str)} interrupted by user.")
         process.terminate()
-        try: process.wait(timeout=2)
-        except subprocess.TimeoutExpired: process.kill()
-        raise 
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        raise
     except Exception as e_comm:
         logging.error(f"Error during process communication for {' '.join(cmd_str)}: {e_comm}")
-        returncode = process.returncode if process.poll() is not None else -1 
-        if process.poll() is None: process.kill()
+        returncode = process.returncode if process.poll() is not None else -1
+        if process.poll() is None:
+            process.kill()
     finally:
-        if process in active_processes: active_processes.remove(process)
-        if not active_processes: extraction_in_progress.clear()
+        if process in active_processes:
+            active_processes.remove(process)
+        if not active_processes:
+            extraction_in_progress.clear()
     return subprocess.CompletedProcess(args=cmd_str, returncode=returncode, stdout=stdout or "", stderr=stderr or "")
 
 # --- File Operations & Renaming Script Logic ---
@@ -451,7 +573,7 @@ def initialize_rename_scripts(rename_script_path_base: str) -> Dict[str, Optiona
     if not is_windows or actual_bash_path == rename_script_path_base or main_ext.lower() != '.bat':
         with file_lock:
             with open(actual_bash_path, "w", encoding='utf-8') as bash_file:
-                bash_file.write("#!/bin/bash\n# Encoding: UTF-8\nset -e\n\n")
+                bash_file.write("#!/bin/bash\n# Encoding: UTF-8\n\n") # set -e\n
         try: os.chmod(actual_bash_path, 0o755)
         except Exception as e: logging.warning(f"Could not chmod {actual_bash_path}: {e}")
         logging.debug(f"Initialized bash script: {actual_bash_path}")
@@ -523,8 +645,9 @@ def add_rename_command(
         with file_lock:
             with open(batch_script_p_str, "a", encoding='utf-8') as batch_f:
                 batch_f.write(f"\nREM Renaming for: {os.path.basename(str(abs_source_original_file))}\n")
-                batch_f.write(f"if not exist \"{str(full_target_dir_abs)}\" mkdir \"{str(full_target_dir_abs)}\"\n")
-                batch_f.write(f"move /Y \"{str(abs_source_original_file)}\" \"{str(full_target_dir_abs / final_new_filename_original)}\"\n")
+                # For Windows batch files, use a more robust escaping approach
+                batch_f.write(f"if not exist {_escape_for_batch(str(full_target_dir_abs))} mkdir {_escape_for_batch(str(full_target_dir_abs))}\n")
+                batch_f.write(f"move /Y {_escape_for_batch(str(abs_source_original_file))} {_escape_for_batch(str(full_target_dir_abs / final_new_filename_original))}\n")
         commands_written_to_any_script = True
 
     # --- Handle the associated text content file ---
@@ -555,10 +678,10 @@ def add_rename_command(
             if batch_script_p_str:
                 with file_lock:
                     with open(batch_script_p_str, "a", encoding='utf-8') as batch_f:
-                        batch_f.write(f"if exist \"{str(abs_actual_text_content_file_path)}\" (\n")
-                        batch_f.write(f"  move /Y \"{str(abs_actual_text_content_file_path)}\" \"{str(txt_target_path_abs)}\"\n")
+                        batch_f.write(f"if exist {_escape_for_batch(str(abs_actual_text_content_file_path))} (\n")
+                        batch_f.write(f"  move /Y {_escape_for_batch(str(abs_actual_text_content_file_path))} {_escape_for_batch(str(txt_target_path_abs))}\n")
                         batch_f.write(f") else (\n")
-                        batch_f.write(f"  echo Info: Associated text file \"{str(abs_actual_text_content_file_path)}\" not found for move (original: {os.path.basename(str(abs_source_original_file))}) 1>&2\n")
+                        batch_f.write(f"  echo Info: Associated text file {_escape_for_batch(str(abs_actual_text_content_file_path))} not found for move ^(original: {os.path.basename(str(abs_source_original_file))}^) 1>&2\n")
                         batch_f.write(f")\n")
             commands_written_to_any_script = True # Ensure this is true if any command was written
     elif debug:
@@ -585,6 +708,37 @@ def add_rename_command(
     else:
         if debug: logging.debug("add_rename_command: No script paths provided or no commands were applicable/written.")
         return None
+
+def _escape_for_batch(path: str) -> str:
+    """
+    Special escaping function for Windows batch files.
+    Batch files have different escaping rules than bash.
+    """
+    path_str = str(path)
+    
+    # Check if the path contains problematic characters
+    problematic_chars = ["'", "(", ")", "[", "]", "&", "|", "<", ">", "^", "%", "!", "="]
+    
+    if any(char in path_str for char in problematic_chars):
+        # For batch files, we need to escape special characters differently
+        escaped = path_str.replace("^", "^^")  # Escape caret first
+        escaped = escaped.replace("&", "^&")   # Escape ampersand
+        escaped = escaped.replace("|", "^|")   # Escape pipe
+        escaped = escaped.replace("<", "^<")   # Escape less than
+        escaped = escaped.replace(">", "^>")   # Escape greater than
+        escaped = escaped.replace("(", "^(")   # Escape opening parenthesis
+        escaped = escaped.replace(")", "^)")   # Escape closing parenthesis
+        escaped = escaped.replace("[", "^[")   # Escape opening bracket
+        escaped = escaped.replace("]", "^]")   # Escape closing bracket
+        escaped = escaped.replace("!", "^!")   # Escape exclamation mark
+        escaped = escaped.replace("=", "^=")   # Escape equals sign
+        escaped = escaped.replace("%", "%%")   # Escape percent sign (different rule)
+        
+        # Wrap in quotes for extra safety
+        return f'"{escaped}"'
+    else:
+        # For simpler paths, just use quotes
+        return f'"{path_str}"'
     
 def add_rename_command_old(
     rename_script_paths: Dict[str, Optional[str]], 
@@ -669,11 +823,11 @@ def add_rename_command_old(
         with file_lock:
             with open(batch_script_p, "a", encoding='utf-8') as batch_f:
                 batch_f.write(f"\nREM Renaming for: {os.path.basename(source_path)}\n")
-                batch_f.write(f"if not exist \"{str(full_target_dir_abs)}\" mkdir \"{str(full_target_dir_abs)}\"\n")
-                batch_f.write(f"move /Y \"{os.path.abspath(source_path)}\" \"{str(full_target_dir_abs / final_new_filename)}\"\n")
+                batch_f.write(f"if not exist {_escape_for_batch(str(full_target_dir_abs))} mkdir {_escape_for_batch(str(full_target_dir_abs))}\n")
+                batch_f.write(f"move /Y {_escape_for_batch(os.path.abspath(source_path))} {_escape_for_batch(str(full_target_dir_abs / final_new_filename))}\n")
                 if os.path.exists(str(txt_source_path_abs)):
-                    batch_f.write(f"if exist \"{str(txt_source_path_abs)}\" (\n")
-                    batch_f.write(f"  move /Y \"{str(txt_source_path_abs)}\" \"{str(txt_target_path_abs)}\"\n")
+                    batch_f.write(f"if exist {_escape_for_batch(str(txt_source_path_abs))} (\n")
+                    batch_f.write(f"  move /Y {_escape_for_batch(str(txt_source_path_abs))} {_escape_for_batch(str(txt_target_path_abs))}\n")
                     batch_f.write(f")\n")
                 batch_f.write("\n")
         commands_written_to_any_script = True

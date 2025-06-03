@@ -12,7 +12,7 @@ from tqdm import tqdm
 import threading
 import time
 import shlex
-import traceback # <<< ADDED IMPORT FOR TRACEBACK
+import traceback 
 
 # Direct import for utilities, assuming 'utils.py' is in PYTHONPATH
 # (which it will be if running from the root directory)
@@ -362,140 +362,209 @@ class PDFExtractor:
     def set_password(self, password: str):
         self._password = password
 
-    # ... (All extract_with_... methods from PDFExtractor need to be moved here)
-    # Make sure they use self._import_cache.import_module() or self._safe_import()
-    # and self.get_binary_path()
+    def _safe_library_call(self, func, *args, **kwargs):
+        """Wrapper to protect logging around library calls"""
+        # Store current logging state
+        root_logger = logging.getLogger()
+        original_level = root_logger.level
+        original_handlers = root_logger.handlers.copy()
+        
+        try:
+            result = func(*args, **kwargs)
+            return result
+        finally:
+            # Restore logging state if it was changed
+            current_level = root_logger.level
+            current_handlers = root_logger.handlers
+            
+            if (current_level != original_level or 
+                len(current_handlers) != len(original_handlers)):
+                
+                if self._debug:
+                    logging.warning(f"Library call to {func.__name__} changed logging configuration. Restoring...")
+                
+                # Restore level
+                root_logger.setLevel(original_level)
+                
+                # Restore handlers if they were removed
+                if len(current_handlers) < len(original_handlers):
+                    for handler in original_handlers:
+                        if handler not in current_handlers:
+                            root_logger.addHandler(handler)
 
     def extract_text(self, pdf_path: str, preferred_method: Optional[str] = None,
                      ocr_method: Optional[str] = None, force_ocr: bool = False,
-                     progress_callback: Optional[Callable] = None, 
+                     progress_callback: Optional[Callable] = None,
                      extract_tables: bool = False, **kwargs) -> str:
         if not os.path.exists(pdf_path):
+            # This check should ideally be even earlier, e.g., in DocumentProcessor,
+            # but it's good to have it here too as a safeguard.
+            logging.error(f"PDFExtractor: File not found: {pdf_path}")
             raise FileNotFoundError(f"File not found: {pdf_path}")
 
         if self._debug: logging.debug(f"PDFExtractor: Starting extraction for {pdf_path}")
-        
-        text_parts = []
+
         final_text = ""
         used_method = "None"
-
-        # Determine effective methods to try
-        methods_to_try = []
-        if force_ocr:
-            methods_to_try = [m for m in self.OCR_METHODS if self.available_methods.get(m)]
-            if preferred_method and preferred_method in methods_to_try:
-                methods_to_try.remove(preferred_method)
-                methods_to_try.insert(0, preferred_method)
-            elif ocr_method and ocr_method != 'auto' and ocr_method in methods_to_try:
-                methods_to_try.remove(ocr_method)
-                methods_to_try.insert(0, ocr_method)
-            if self._debug: logging.debug(f"Force OCR. Trying methods: {methods_to_try}")
-        else:
-            # Prioritize preferred method if available
-            if preferred_method and self.available_methods.get(preferred_method):
-                methods_to_try.append(preferred_method)
-            
-            # Add other core methods
-            methods_to_try.extend([m for m in self.CORE_METHODS if m != preferred_method and self.available_methods.get(m)])
-            
-            # Determine if OCR should be attempted as fallback
-            # For now, we'll add OCR methods if core methods fail or text quality is low.
-            # A full check might be done after core methods.
-            if self._debug: logging.debug(f"Core methods to try: {methods_to_try}")
-
-
-        # Attempt text layer extraction
-        for method_name in methods_to_try:
-            if shutdown_flag.is_set(): break
-            if not hasattr(self, f'extract_with_{method_name}'):
-                if self._debug: logging.debug(f"Method {method_name} not implemented in PDFExtractor.")
-                continue
-
-            if self._debug: logging.debug(f"PDFExtractor: Trying method {method_name}")
-            if progress_callback: progress_callback(1, f"pdf_{method_name}")
-            try:
-                extraction_func = getattr(self, f'extract_with_{method_name}')
-                current_text = extraction_func(pdf_path, progress_callback=progress_callback)
-                if current_text and current_text.strip():
-                    quality = self._assess_text_quality(current_text)
-                    if self._debug: logging.debug(f"Method {method_name} extracted {len(current_text)} chars, quality: {quality:.2f}")
-                    if quality > 0.5: # Threshold for "good enough" text
-                        final_text = current_text.strip()
-                        used_method = method_name
-                        break # Successful extraction
-                    else: # Low quality, store but continue if better method exists
-                        if not final_text: # Keep first non-empty result if all are low quality
-                            final_text = current_text.strip()
-                            used_method = method_name
-            except KeyboardInterrupt:
-                logging.info("Extraction interrupted by user.")
-                raise
-            except Exception as e:
-                logging.warning(f"PDFExtractor: Method {method_name} failed for {pdf_path}: {e}")
-                if self._debug: traceback.print_exc()
         
-        # If no good text from core methods, or force_ocr, try OCR
-        if not final_text or force_ocr:
-            if self._debug and not force_ocr: logging.debug("Text layer extraction yielded no/low quality text or force_ocr. Trying OCR.")
-            
-            ocr_methods_to_try = []
-            if ocr_method and ocr_method != 'auto' and self.available_methods.get(ocr_method):
-                 ocr_methods_to_try.append(ocr_method)
-            ocr_methods_to_try.extend([m for m in self.OCR_METHODS if m != ocr_method and self.available_methods.get(m)])
+        # --- NEW: Trackers for core method failures ---
+        core_method_total_attempts = 0
+        core_method_fatal_structure_failures = 0
+        # Keywords indicating a PDF is likely unrecoverable for image conversion / OCR
+        fatal_error_keywords = [
+            "empty file", "no /root object", "document stream is empty",
+            "no pages found", "cannot open empty file", "is this really a pdf"
+        ]
 
-            for method_name in ocr_methods_to_try:
-                if shutdown_flag.is_set(): break
+        # Determine effective CORE methods to try
+        core_methods_to_try = []
+        if not force_ocr: # If not forcing OCR, try core methods first
+            if preferred_method and preferred_method in self.CORE_METHODS and self.available_methods.get(preferred_method):
+                core_methods_to_try.append(preferred_method)
+            core_methods_to_try.extend([
+                m for m in self.CORE_METHODS 
+                if m != preferred_method and self.available_methods.get(m)
+            ])
+        
+        if self._debug and not force_ocr: 
+            logging.debug(f"PDFExtractor: Core methods to try for '{os.path.basename(pdf_path)}': {core_methods_to_try}")
+        elif self._debug and force_ocr:
+            logging.debug(f"PDFExtractor: Force OCR enabled for '{os.path.basename(pdf_path)}'. Skipping direct core text extraction attempts first.")
+
+
+        # Attempt text layer extraction (CORE METHODS), only if not force_ocr
+        if not force_ocr and core_methods_to_try:
+            for method_name in core_methods_to_try:
+                if shutdown_flag.is_set():
+                    logging.info(f"PDFExtractor: Shutdown signal during core method processing for {pdf_path}.")
+                    break
+                
                 if not hasattr(self, f'extract_with_{method_name}'):
-                    if self._debug: logging.debug(f"OCR Method {method_name} not implemented.")
-                    continue
-                if not self._init_ocr(method_name): # Ensure OCR engine is ready
-                    if self._debug: logging.debug(f"OCR Method {method_name} failed to initialize.")
+                    if self._debug: logging.debug(f"PDFExtractor: Method {method_name} not implemented.")
                     continue
 
-                if self._debug: logging.debug(f"PDFExtractor: Trying OCR method {method_name}")
-                if progress_callback: progress_callback(1, f"pdf_ocr_{method_name}")
+                core_method_total_attempts += 1
+                if self._debug: logging.debug(f"PDFExtractor: Trying core method {method_name} for {pdf_path}")
+                if progress_callback: progress_callback(1, f"pdf_{method_name}")
+                
                 try:
                     extraction_func = getattr(self, f'extract_with_{method_name}')
                     current_text = extraction_func(pdf_path, progress_callback=progress_callback)
                     if current_text and current_text.strip():
-                        # OCR text is generally taken as is, quality assessment might be less strict
-                        final_text = current_text.strip() 
+                        quality = self._assess_text_quality(current_text)
+                        if self._debug: logging.debug(f"PDFExtractor: Method {method_name} extracted {len(current_text)} chars, quality: {quality:.2f} for {pdf_path}")
+                        if quality > 0.5: # Threshold for "good enough" text
+                            final_text = current_text.strip()
+                            used_method = method_name
+                            break # Successful extraction from core method
+                        else:
+                            if not final_text: # Keep first non-empty result if all are low quality
+                                final_text = current_text.strip()
+                                used_method = method_name
+                except KeyboardInterrupt:
+                    logging.info(f"PDFExtractor: Extraction with {method_name} interrupted by user for {pdf_path}.")
+                    raise
+                except Exception as e:
+                    error_str_lower = str(e).lower()
+                    logging.warning(f"PDFExtractor: Core method {method_name} failed for {pdf_path}: {e}")
+                    if any(keyword in error_str_lower for keyword in fatal_error_keywords):
+                        core_method_fatal_structure_failures += 1
+                        if self._debug: logging.debug(f"PDFExtractor: Core method {method_name} encountered a fatal structure error for {pdf_path}.")
+                    if self._debug: traceback.print_exc()
+            
+            if final_text: # If a core method succeeded with good quality text
+                 if self._debug: logging.info(f"PDFExtractor: Core extraction successful with '{used_method}' for {pdf_path}.")
+
+        # --- MODIFIED OCR DECISION LOGIC ---
+        # Proceed to OCR if:
+        # 1. force_ocr is true (user explicitly wants OCR)
+        # OR
+        # 2. No usable text was found from core methods (`not final_text`)
+        #    AND we haven't encountered too many fatal structural errors from core methods.
+        
+        proceed_to_ocr = False
+        if force_ocr:
+            proceed_to_ocr = True
+            if self._debug: logging.debug(f"PDFExtractor: Force OCR is enabled for {pdf_path}. Proceeding to OCR.")
+        elif not final_text: # No good text from core methods
+            # Heuristic: If most/all attempted core methods failed with fatal structural errors,
+            # it's unlikely OCR (which relies on converting PDF to image) will work.
+            # Threshold: if more than half of attempted core methods had fatal errors, or at least 2 such errors.
+            min_fatal_failures_to_skip_ocr = 2
+            if core_method_total_attempts > 0 and \
+               core_method_fatal_structure_failures >= min_fatal_failures_to_skip_ocr and \
+               core_method_fatal_structure_failures >= core_method_total_attempts / 2:
+                if self._debug:
+                    logging.warning(f"PDFExtractor: Skipping OCR for {pdf_path}. {core_method_fatal_structure_failures}/{core_method_total_attempts} "
+                                    f"core methods failed with fatal structural errors. File likely too corrupt for OCR.")
+            else:
+                proceed_to_ocr = True
+                if self._debug: logging.debug(f"PDFExtractor: No usable text from core methods for {pdf_path} (or few fatal errors). Proceeding to OCR.")
+        
+        if proceed_to_ocr:
+            ocr_methods_to_try = []
+            # Prioritize user's specific ocr_method if valid and available
+            if ocr_method and ocr_method != 'auto' and self.available_methods.get(ocr_method) and ocr_method in self.OCR_METHODS:
+                 ocr_methods_to_try.append(ocr_method)
+            # Add other available OCR methods, ensuring no duplicates and preferred one is first
+            ocr_methods_to_try.extend([
+                m for m in self.OCR_METHODS 
+                if m not in ocr_methods_to_try and self.available_methods.get(m)
+            ])
+
+            if self._debug: logging.debug(f"PDFExtractor: OCR methods to try for '{os.path.basename(pdf_path)}': {ocr_methods_to_try}")
+
+            for method_name in ocr_methods_to_try:
+                if shutdown_flag.is_set():
+                    logging.info(f"PDFExtractor: Shutdown signal during OCR method processing for {pdf_path}.")
+                    break
+                
+                if not hasattr(self, f'extract_with_{method_name}'):
+                    if self._debug: logging.debug(f"PDFExtractor: OCR Method {method_name} not implemented.")
+                    continue
+                
+                if not self._init_ocr(method_name): # Ensure OCR engine is ready
+                    if self._debug: logging.debug(f"PDFExtractor: OCR Method {method_name} failed to initialize for {pdf_path}.")
+                    continue
+
+                if self._debug: logging.debug(f"PDFExtractor: Trying OCR method {method_name} for {pdf_path}")
+                if progress_callback: progress_callback(1, f"pdf_ocr_{method_name}")
+                
+                try:
+                    extraction_func = getattr(self, f'extract_with_{method_name}')
+                    current_text = extraction_func(pdf_path, progress_callback=progress_callback) # Pass callback
+                    if current_text and current_text.strip():
+                        # Assuming OCR text is valuable if found, could add quality check here too
+                        final_text = current_text.strip()
                         used_method = f"{method_name} (OCR)"
+                        if self._debug: logging.info(f"PDFExtractor: OCR successful with '{used_method}' for {pdf_path}.")
                         break # Successful OCR
                 except KeyboardInterrupt:
-                    logging.info("OCR Extraction interrupted by user.")
+                    logging.info(f"PDFExtractor: OCR Extraction with {method_name} interrupted by user for {pdf_path}.")
                     raise
                 except Exception as e:
                     logging.warning(f"PDFExtractor: OCR method {method_name} failed for {pdf_path}: {e}")
                     if self._debug: traceback.print_exc()
                     self._ocr_failed_methods.add(method_name)
+        
+        if not final_text and self._debug:
+             logging.warning(f"PDFExtractor: All attempted methods failed to extract text from {pdf_path}.")
 
 
         if self._debug: logging.info(f"PDFExtractor: Finished extraction for {pdf_path} using {used_method}. Length: {len(final_text)}")
 
-        # Table extraction (if requested and text was extracted or forced)
-        if extract_tables: # (and (final_text or force_ocr)): # ensure tables are extracted even if text is empty but forced
+        if extract_tables:
             if self._debug: logging.info(f"PDFExtractor: Attempting table extraction for {pdf_path}")
             try:
-                # _table_extractor should be initialized in __init__
                 tables_data = self._table_extractor.extract_tables(pdf_path, password=self._password)
                 if tables_data:
-                    # Append table data to text or handle separately
-                    # For now, let's just log it. DocumentProcessor will get it via result dict.
-                    # This `extract_text` method is expected to return string.
-                    # We will handle tables in the DocumentProcessor or ExtractionManager layer.
-                    # Here, we can store it in an instance variable if this instance is reused,
-                    # or rely on the manager to call a separate table extraction method.
-                    # For simplicity now, table data isn't appended to text here.
-                    if self._debug: logging.info(f"Extracted {len(tables_data)} tables from {pdf_path}.")
-                    # Store them if the calling context can retrieve them.
-                    # For now, this PDFExtractor method only returns text.
-                    # The main DocumentProcessor will handle storing table results.
-                    # We can add a property to PDFExtractor to get last extracted tables.
-                    self._last_extracted_tables = tables_data 
+                    if self._debug: logging.info(f"PDFExtractor: Extracted {len(tables_data)} tables from {pdf_path}.")
+                    self._last_extracted_tables = tables_data
+                else:
+                    self._last_extracted_tables = [] # Ensure it's reset if no tables found
             except Exception as te:
-                logging.error(f"Table extraction failed for {pdf_path} in PDFExtractor: {te}")
-
+                logging.error(f"Table extraction failed for {pdf_path} in PDFExtractor: {te}", exc_info=self._debug)
+                self._last_extracted_tables = []
 
         self._cleanup()
         return final_text
@@ -675,12 +744,6 @@ class PDFExtractor:
                 if self._debug: logging.debug(f"Error applying PyTorch settings: {e}")
     
     # --- Individual Extraction Methods ---
-    # (extract_with_pymupdf, extract_with_pdfplumber, extract_with_pypdf,
-    #  extract_with_pdfminer, extract_with_tesseract, extract_with_easyocr,
-    #  extract_with_paddleocr, extract_with_doctr, extract_with_kraken,
-    #  extract_with_kraken_cli, extract_with_calibre)
-    # These methods need to be moved from the main script into this class.
-    # Ensure they use self._import_cache, self._safe_import, self.get_binary_path(), etc.
 
     def extract_with_pymupdf(self, pdf_path: str, progress_callback=None) -> str:
         fitz = self._safe_import('fitz')
@@ -733,24 +796,31 @@ class PDFExtractor:
         text_parts = []
         pdf = None
         try:
+            if self._debug: logging.debug(f"PdfPlumber: >>> BEFORE pdfplumber.open for {pdf_path}")
             with pdfplumber_module.open(pdf_path, password=self._password) as pdf:
+                if self._debug: logging.debug(f"PdfPlumber: <<< AFTER pdfplumber.open, processing pages for {pdf_path}")
                 self._current_doc = pdf
                 total_pages = len(pdf.pages)
                 for i, page in enumerate(pdf.pages):
                     if shutdown_flag.is_set(): break
-                    # Try with layout preservation
+                    if self._debug: logging.debug(f"PdfPlumber: >>> BEFORE page.extract_text for page {i+1} of {pdf_path}")
                     page_text = page.extract_text(x_tolerance=3, y_tolerance=3, layout=True, keep_blank_chars=False)
-                    if not page_text or not page_text.strip(): # Fallback to simpler extraction
+                    if self._debug: logging.debug(f"PdfPlumber: <<< AFTER page.extract_text (layout=True) for page {i+1} of {pdf_path}")
+                    if not page_text or not page_text.strip():
+                        if self._debug: logging.debug(f"PdfPlumber: >>> BEFORE page.extract_text (fallback) for page {i+1} of {pdf_path}")
                         page_text = page.extract_text(keep_blank_chars=False)
-                    
+                        if self._debug: logging.debug(f"PdfPlumber: <<< AFTER page.extract_text (fallback) for page {i+1} of {pdf_path}")
+
                     if page_text and page_text.strip(): text_parts.append(page_text.strip())
                     if progress_callback: progress_callback(1)
+            if self._debug: logging.debug(f"PdfPlumber: Finished processing pages for {pdf_path}")
             return "\n\n".join(text_parts)
         except Exception as e:
-            if self._debug: logging.error(f"pdfplumber extraction failed for {pdf_path}: {e}")
+            if self._debug: logging.error(f"pdfplumber extraction failed for {pdf_path}: {e}", exc_info=True) # Add exc_info
             return ""
         finally:
-            self._current_doc = None # pdfplumber closes file automatically with 'with'
+            self._current_doc = None
+            if self._debug: logging.debug(f"PdfPlumber: Cleanup complete for {pdf_path}")
 
     def extract_with_pypdf(self, pdf_path: str, progress_callback=None) -> str:
         pypdf_module = self._safe_import('pypdf', 'PdfReader')
@@ -847,6 +917,7 @@ class PDFExtractor:
         text_parts = []
         images = None
         poppler_path_dir = self._get_poppler_path()
+        conversion_timeout = 60 # Timeout in seconds for pdf2image conversion
 
         try:
             conversion_args = {'dpi': 300, 'thread_count': 1, 'grayscale': True, 
@@ -854,7 +925,7 @@ class PDFExtractor:
             # Remove None values from args
             conversion_args = {k: v for k, v in conversion_args.items() if v is not None}
 
-            images = pdf2image.convert_from_path(pdf_path, **conversion_args)
+            images = pdf2image.convert_from_path(pdf_path, timeout=conversion_timeout, **conversion_args)
             
             for i, image in enumerate(images):
                 if shutdown_flag.is_set(): break
@@ -902,7 +973,11 @@ class PDFExtractor:
                     return p_path
         return None # Let pdf2image try to find it if None
 
+    # wrapper to make it safer (ensure logging does not break e.g.)
     def extract_with_easyocr(self, pdf_path: str, progress_callback=None) -> str:
+        return self._safe_library_call(self._extract_with_easyocr_wrapped, pdf_path, progress_callback)
+
+    def _extract_with_easyocr_wrapped(self, pdf_path: str, progress_callback=None) -> str:
         if not self._init_ocr('easyocr'): return ""
         # Implementation similar to main script, using self._easyocr_reader
         # ... (ensure pdf2image, numpy are imported via self._safe_import)
@@ -914,10 +989,16 @@ class PDFExtractor:
         text_parts = []
         images = None
         poppler_path_dir = self._get_poppler_path()
+        conversion_timeout = 60 # Timeout in seconds for pdf2image conversion
+
         try:
             conversion_args = {'dpi': 300, 'thread_count': 1, 'userpw': self._password, 'poppler_path': poppler_path_dir}
             conversion_args = {k: v for k, v in conversion_args.items() if v is not None}
-            images = pdf2image_module.convert_from_path(pdf_path, **conversion_args)
+            images = pdf2image_module.convert_from_path(
+                pdf_path,
+                timeout=conversion_timeout, # <<< MODIFIED: Added timeout
+                **conversion_args
+            )
 
             for image in images:
                 if shutdown_flag.is_set(): break
@@ -942,15 +1023,6 @@ class PDFExtractor:
                     except: pass
             self._clear_gpu_memory() # Clear GPU after EasyOCR
 
-    # ... (Implement extract_with_paddleocr, extract_with_doctr, extract_with_kraken, extract_with_kraken_cli similarly)
-    # For brevity, these are omitted here but should follow the pattern of:
-    # 1. Call self._init_ocr('method_name')
-    # 2. Import dependencies using self._safe_import
-    # 3. Convert PDF to images using pdf2image (ensure poppler_path is handled)
-    # 4. Loop through images, call OCR engine, append text
-    # 5. Handle errors and progress_callback
-    # 6. Clean up (close images, clear GPU if applicable)
-
     def extract_with_paddleocr(self, pdf_path: str, progress_callback=None) -> str:
         if not self._init_ocr('paddleocr') or not hasattr(self, '_paddleocr'):
              logging.warning("PaddleOCR not properly initialized.")
@@ -965,10 +1037,12 @@ class PDFExtractor:
         text_parts = []
         images = None
         poppler_path_dir = self._get_poppler_path()
+        conversion_timeout = 60 # Timeout in seconds
+
         try:
             conversion_args = {'dpi': 200, 'thread_count': 1, 'fmt': 'jpeg', 'userpw': self._password, 'poppler_path': poppler_path_dir}
             conversion_args = {k: v for k, v in conversion_args.items() if v is not None}
-            images = pdf2image_module.convert_from_path(pdf_path, **conversion_args)
+            images = pdf2image_module.convert_from_path(pdf_path, timeout=conversion_timeout, **conversion_args)
 
             for i, image in enumerate(images):
                 if shutdown_flag.is_set(): break
@@ -1018,10 +1092,12 @@ class PDFExtractor:
         text_parts = []
         images = None
         poppler_path_dir = self._get_poppler_path()
+        conversion_timeout = 60 # Timeout in seconds
+
         try:
             conversion_args = {'dpi': 300, 'thread_count': 1, 'userpw': self._password, 'poppler_path': poppler_path_dir}
             conversion_args = {k: v for k, v in conversion_args.items() if v is not None}
-            images = pdf2image_module.convert_from_path(pdf_path, **conversion_args)
+            images = pdf2image_module.convert_from_path(pdf_path, timeout=conversion_timeout, **conversion_args)
 
             for i, image in enumerate(images):
                 if shutdown_flag.is_set(): break
@@ -1056,6 +1132,7 @@ class PDFExtractor:
         text_parts = []
         images = None
         poppler_path_dir = self._get_poppler_path()
+        conversion_timeout = 60 
         
         with tempfile.TemporaryDirectory() as temp_dir:
             try:
@@ -1064,7 +1141,7 @@ class PDFExtractor:
                                    'poppler_path': poppler_path_dir}
                 conversion_args = {k: v for k, v in conversion_args.items() if v is not None}
                 # convert_from_path returns list of PIL images, but also saves them if output_folder is given
-                pil_images = pdf2image_module.convert_from_path(pdf_path, **conversion_args)
+                pil_images = pdf2image_module.convert_from_path(pdf_path, timeout=conversion_timeout, **conversion_args)
                 
                 image_paths = sorted([os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.endswith('.png')])
                 if not image_paths: return ""
@@ -1123,6 +1200,7 @@ class PDFExtractor:
         images = None
         model = None
         poppler_path_dir = self._get_poppler_path()
+        conversion_timeout = 60
 
         try:
             # Load default model once
@@ -1152,7 +1230,7 @@ class PDFExtractor:
 
             conversion_args = {'dpi': 300, 'thread_count': 1, 'grayscale': True, 'userpw': self._password, 'poppler_path': poppler_path_dir}
             conversion_args = {k: v for k, v in conversion_args.items() if v is not None}
-            images = pdf2image_module.convert_from_path(pdf_path, **conversion_args)
+            images = pdf2image_module.convert_from_path(pdf_path, timeout=conversion_timeout, **conversion_args)
 
             for i, pil_image in enumerate(images):
                 if shutdown_flag.is_set(): break
