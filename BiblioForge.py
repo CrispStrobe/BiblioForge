@@ -114,7 +114,7 @@ def signal_handler(signum, frame):
 
 
 def main():
-    # --- Argument Parser Setup (ensure all new LLM args are defined here as shown in previous response) ---
+    # --- Argument Parser Setup (ensure all new LLM args are defined here as in previous full file) ---
     parser = argparse.ArgumentParser(
         description="BiblioForge: Document Text Extraction & Management Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -152,27 +152,25 @@ def main():
     )
     parser.add_argument('--llm-model', default=None, help="Specific model name for the chosen LLM provider OR repo_id for LlamaCPP if specific repo arg not used.")
     parser.add_argument('--api-key', default=None, help="API key for cloud-based LLM providers.")
-    parser.add_argument('--temperature', type=float, default=0.3, help="LLM temperature (0.0-2.0).")
-    parser.add_argument('--max-tokens', type=int, default=300, help="LLM max tokens for metadata extraction.")
+    parser.add_argument('--temperature', type=float, default=0.3, help="LLM temperature (0.0-2.0).") # Explicit parameter for process_files
+    parser.add_argument('--max-tokens', type=int, default=300, help="LLM max tokens for metadata extraction.") # Explicit parameter for process_files
 
     parser.add_argument('--ollama-host', default=os.environ.get("OLLAMA_HOST"), help="Host for Ollama server (e.g., http://localhost:11434). Uses library default if not set.")
     parser.add_argument('--local-openai-base-url', default=os.environ.get("LOCAL_OPENAI_BASE_URL"), help="Base URL for Local OpenAI compatible servers (e.g., LM Studio's http://localhost:1234/v1/).")
     
     parser.add_argument('--llamacpp-repo-id', default=None, help="HuggingFace Repo ID for LlamaCPP GGUF model (e.g., TheBloke/phi-2-GGUF). Overrides --llm-model for LlamaCPP repo.")
     parser.add_argument('--llamacpp-gguf-filename', default=None, help="Specific GGUF filename from the HF repo for LlamaCPP (e.g., phi-2.Q4_K_M.gguf).")
-    parser.add_argument('--llamacpp-n-ctx', type=int, default=None, help="Context size (n_ctx) for LlamaCPP (e.g., 2048).") # Default in provider
-    parser.add_argument('--llamacpp-n-gpu-layers', type=int, default=None, help="Number of layers to offload to GPU for LlamaCPP (-1 for all, 0 for CPU).") # Default in provider
-    parser.add_argument('--llamacpp-chat-format', default=None, help="Chat format for LlamaCPP (e.g., llama-2, chatml).") # Default in provider
+    parser.add_argument('--llamacpp-n-ctx', type=int, default=None, help="Context size (n_ctx) for LlamaCPP (e.g., 2048).")
+    parser.add_argument('--llamacpp-n-gpu-layers', type=int, default=None, help="Number of layers to offload to GPU for LlamaCPP (-1 for all, 0 for CPU).")
+    parser.add_argument('--llamacpp-chat-format', default=None, help="Chat format for LlamaCPP (e.g., llama-2, chatml).")
 
     parser.add_argument('-v', '--verbose', action='count', default=0, help="Increase verbosity: -v INFO, -vv DEBUG.")
     parser.add_argument('-d', '--debug', action='store_const', const=2, dest='verbose', help="Enable debug logging (shortcut for -vv).")
     
-    # === Start of the replacement section ===
     args = parser.parse_args()
-    setup_logging(args.verbose) # setup_logging is from utils.py
+    setup_logging(args.verbose) 
     logging.debug(f"Arguments received: {args}")
 
-    # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     if platform.system() != 'Windows':
@@ -183,66 +181,54 @@ def main():
 
     # --- File Discovery ---
     input_files_discovered: List[str] = []
-    
-    # Determine supported extensions for filtering
-    # Assuming ExtractionManager is imported and has this class variable
     all_supported_extensions = list(ExtractionManager.SUPPORTED_EXTENSIONS.keys())
     active_supported_extensions = all_supported_extensions
 
     if args.file_types:
         user_types = [f".{ext.strip().lower()}" for ext in args.file_types.split(',') if ext.strip()]
-        # Filter user types against all supported types
         active_supported_extensions = [ext for ext in user_types if ext in all_supported_extensions]
         if not active_supported_extensions:
             logging.error(f"No valid file types specified in --file-types: '{args.file_types}'. Please check against supported types.")
             logging.info(f"Available types: {', '.join(k.lstrip('.') for k in all_supported_extensions)}")
-            return 1 # Exit if no valid types are selected by the user
+            return 1
         logging.info(f"Processing user-specified file types: {', '.join(active_supported_extensions)}")
     else:
-        logging.info(f"Processing all supported file types: {', '.join(active_supported_extensions)}")
-
+        logging.info(f"Processing all supported file types: {', '.join(k.lstrip('.') for k in active_supported_extensions)}") # Cleaned up logging
 
     if not args.files: 
-        scan_path = Path(".").resolve() # Scan current resolved directory
-        logging.info(f"No input files/patterns specified. Scanning '{str(scan_path)}' for: {', '.join(active_supported_extensions)}")
+        scan_path = Path(".").resolve()
+        logging.info(f"No input files/patterns specified. Scanning '{str(scan_path)}' for specified types.")
         if args.recursive:
-            for item in scan_path.rglob('*'): # rglob for recursive
+            for item in scan_path.rglob('*'):
                 if item.is_file() and item.suffix.lower() in active_supported_extensions:
                     input_files_discovered.append(str(item))
         else:
-            for item in scan_path.glob('*'): # glob for non-recursive
+            for item in scan_path.glob('*'):
                 if item.is_file() and item.suffix.lower() in active_supported_extensions:
                     input_files_discovered.append(str(item))
     else:
         for pattern_item in args.files:
-            # Handle cases where the shell might not expand wildcards (e.g., on Windows or if quoted)
-            # and cases where it does expand. glob.glob handles both.
-            # If pattern_item is a directory, glob won't list its contents unless pattern includes '/*'
-            
             potential_path = Path(pattern_item)
             if potential_path.is_dir():
                 if args.recursive:
                     for item in potential_path.rglob('*'):
                         if item.is_file() and item.suffix.lower() in active_supported_extensions:
                             input_files_discovered.append(str(item))
-                else: # Non-recursive directory scan
+                else: 
                     for item in potential_path.glob('*'):
                         if item.is_file() and item.suffix.lower() in active_supported_extensions:
                             input_files_discovered.append(str(item))
-            else: # Assume it's a file or a glob pattern string
-                # Use glob to expand patterns. If it's a single file, glob returns it in a list.
+            else: 
                 expanded_items = glob.glob(pattern_item, recursive=args.recursive)
                 for item_str_path in expanded_items:
                     item_path_obj = Path(item_str_path)
                     if item_path_obj.is_file() and item_path_obj.suffix.lower() in active_supported_extensions:
                         input_files_discovered.append(str(item_path_obj))
-                    elif args.recursive and item_path_obj.is_dir(): # If a glob pattern resolved to a directory
+                    elif args.recursive and item_path_obj.is_dir(): 
                          for sub_item in item_path_obj.rglob('*'):
                             if sub_item.is_file() and sub_item.suffix.lower() in active_supported_extensions:
                                 input_files_discovered.append(str(sub_item))
 
-
-    # Deduplicate and ensure absolute paths, then sort for consistent processing order (optional but good)
     final_input_files = sorted(list(set(str(Path(p).resolve()) for p in input_files_discovered)))
 
     if not final_input_files:
@@ -251,20 +237,16 @@ def main():
     
     logging.info(f"Found {len(final_input_files)} unique file(s) to process.")
     if args.verbose > 1: 
-        for f_idx, f_path in enumerate(final_input_files[:20]): # Log first 20
+        for f_idx, f_path in enumerate(final_input_files[:20]):
             logging.debug(f"  File {f_idx+1}: {f_path}")
         if len(final_input_files) > 20: logging.debug(f"  ... and {len(final_input_files)-20} more files.")
 
     processor = DocumentProcessor(debug=(args.verbose > 1))
     
-    # Prepare kwargs for LLM provider initialization and other settings for process_files
-    # These will be extracted from **kwargs within process_files when calling get_llm_provider,
-    # or used by _process_single_file for its LLM calls.
-    forwardable_kwargs = {
-        # General LLM config (explicit params to process_files)
-        # 'temperature': args.temperature,
-        # 'max_tokens': args.max_tokens,
-        # Provider specific config from CLI
+    # Prepare kwargs for LLM provider initialization.
+    # These are passed to process_files, which then passes them to get_llm_provider.
+    llm_config_kwargs = {
+        # 'llm_model' is for the specific model identifier within the provider
         'llm_model': args.llm_model, 
         'api_key': args.api_key,
         'ollama_host': args.ollama_host,
@@ -273,16 +255,21 @@ def main():
         'llamacpp_gguf_filename': args.llamacpp_gguf_filename,
         'llamacpp_n_ctx': args.llamacpp_n_ctx,
         'llamacpp_n_gpu_layers': args.llamacpp_n_gpu_layers,
-        'llamacpp_chat_format': args.llamacpp_chat_format
+        'llamacpp_chat_format': args.llamacpp_chat_format,
+        # Pass the main debug flag for providers to use
+        'debug': (args.verbose > 1) 
     }
     # Filter out None values, so defaults in get_llm_provider/provider classes are used
-    # for any CLI args that were not provided by the user.
-    llm_config_kwargs_to_pass = {k: v for k, v in forwardable_kwargs.items() if v is not None}
+    llm_config_kwargs_to_pass = {k: v for k, v in llm_config_kwargs.items() if v is not None}
+    
+    # Add sort_arg_from_main for summary display logic in process_files
+    # This specific kwarg is for process_files itself, not get_llm_provider.
+    llm_config_kwargs_to_pass['sort_arg_from_main'] = args.sort 
+
     if args.verbose > 1:
         logging.debug(f"main: Filtered LLM config kwargs to pass to process_files: {llm_config_kwargs_to_pass}")
 
     try:
-        # Call process_files, passing the provider type string and the **kwargs bundle
         processing_results_summary = processor.process_files(
             input_files=final_input_files,
             output_dir=args.output_dir,
@@ -295,10 +282,9 @@ def main():
             noskip=args.noskip,
             sort=args.sort, 
             rename_script_path=args.rename_script,
-            llm_provider_arg=args.llm_provider, # This is the provider type string for get_llm_provider
-            temperature=args.temperature,   # Explicitly passed to process_files
-            max_tokens=args.max_tokens,     # Explicitly passed to process_files
-            sort_arg_from_main=args.sort,   # Pass original sort intent for summary display
+            llm_provider_arg=args.llm_provider, 
+            temperature=args.temperature,   # Explicitly passed
+            max_tokens=args.max_tokens,     # Explicitly passed
             **llm_config_kwargs_to_pass     # Pass all other relevant configs
         )
 
@@ -306,7 +292,6 @@ def main():
             json_output_path = args.json
             logging.info(f"Saving detailed processing results to {json_output_path}")
             try:
-                # Use counters from the returned summary
                 summary_counters = processing_results_summary.get('counters', {})
                 serializable_summary = {
                     "total_files_attempted": summary_counters.get('total', len(final_input_files)),
@@ -321,17 +306,14 @@ def main():
                     "detailed_results_per_file": processing_results_summary.get('processed', {}),
                     "critical_failures_list": processing_results_summary.get('failed', [])
                 }
-                # Ensure the directory for the JSON file exists
                 Path(json_output_path).parent.mkdir(parents=True, exist_ok=True)
                 with open(json_output_path, 'w', encoding='utf-8') as f_json:
                     json.dump(full_json_output, f_json, indent=2, ensure_ascii=False)
             except Exception as e_json:
                 logging.error(f"Failed to save JSON results to '{json_output_path}': {e_json}")
 
-        # Determine final rename script path for messaging and execution
         final_rename_script_path_for_user: Optional[str] = None
         if args.sort and args.rename_script:
-            # Path is resolved inside process_files, use that logic for consistency in messaging
             if os.path.isabs(args.rename_script) or os.path.dirname(args.rename_script):
                 final_rename_script_path_for_user = str(Path(args.rename_script).resolve())
             else:
@@ -362,7 +344,6 @@ def main():
     except KeyboardInterrupt:
         logging.warning("\nOperation cancelled by user (KeyboardInterrupt in main).")
         if args.sort and args.rename_script:
-            # Construct the potential path to inform the user
             script_path_to_check = args.rename_script
             if not (os.path.isabs(script_path_to_check) or os.path.dirname(script_path_to_check)):
                 script_path_to_check = str(Path(args.output_dir).resolve() / script_path_to_check)
