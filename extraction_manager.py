@@ -15,9 +15,9 @@ from tqdm import tqdm
 # Imports from our new modules
 from extractors import ( # Direct import of the 'extractors' package/module
     PDFExtractor, EPUBExtractor, DJVUExtractor, 
-    MOBIExtractor, TextExtractor, HTMLExtractor
+    MOBIExtractor, TextExtractor, HTMLExtractor, PPTXExtractor
 )
-from utils import (      # Direct import of 'utils' module
+from utils import (     # Direct import of 'utils' module
     ImportCache, parse_metadata, sanitize_filename, 
     add_rename_command, validate_and_fix_year, file_lock, shutdown_flag
 )
@@ -39,6 +39,7 @@ class ExtractionManager:
         '.docx': 'Text', '.doc': 'Text', '.rtf': 'Text', '.fb2': 'Text',
         '.pdb': 'Text', '.lit': 'Text', '.odt': 'Text', '.lrf': 'Text',
         '.cbz': 'Text', '.cbr': 'Text', '.chm': 'Text', '.snb': 'Text', '.tcr': 'Text',
+        '.pptx': 'PPTX', '.ppt': 'PPTX',
     }
 
     def __init__(self, debug: bool = False):
@@ -112,13 +113,13 @@ class ExtractionManager:
                 try:
                     versions[package] = pkg_resources.get_distribution(package).version
                 except pkg_resources.DistributionNotFound:
-                     if self._debug: logging.debug(f"Package {package} not found by pkg_resources.")
+                    if self._debug: logging.debug(f"Package {package} not found by pkg_resources.")
                 except Exception as e_pkg:
-                     if self._debug: logging.debug(f"Error getting version for {package} using pkg_resources: {e_pkg}")
+                    if self._debug: logging.debug(f"Error getting version for {package} using pkg_resources: {e_pkg}")
         
         if self._debug:
             for pkg, ver in versions.items():
-                 logging.debug(f"Found {pkg} version {ver}")
+                    logging.debug(f"Found {pkg} version {ver}")
         return versions
 
 
@@ -138,6 +139,7 @@ class ExtractionManager:
             elif extractor_type == 'MOBI': extractor_class = MOBIExtractor
             elif extractor_type == 'Text': extractor_class = TextExtractor
             elif extractor_type == 'HTML': extractor_class = HTMLExtractor
+            elif extractor_type == 'PPTX': extractor_class = PPTXExtractor
             
             if extractor_class:
                 try:

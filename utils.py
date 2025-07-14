@@ -732,23 +732,34 @@ def add_rename_command(
 def escape_special_chars(filename: str) -> str:
     """
     Enhanced shell escaping that handles complex filenames with special characters.
-    Uses a combination of strategies for maximum compatibility.
+    Specifically designed to work correctly in echo statements within bash scripts.
     """
     filename_str = str(filename)
     
-    # For very complex filenames, use double quotes with internal escaping
-    # This handles most problematic characters while remaining readable
-    if any(char in filename_str for char in ["'", '"', '[', ']', '(', ')', '&', ';', '|', '<', '>', '`', '$', '!', '*', '?']):
-        # Escape characters that are problematic even within double quotes
-        escaped = filename_str.replace('\\', '\\\\')  # Escape backslashes first
-        escaped = escaped.replace('"', '\\"')        # Escape double quotes
-        escaped = escaped.replace('`', '\\`')        # Escape backticks (command substitution)
-        escaped = escaped.replace('$', '\\$')        # Escape dollar signs (variable expansion)
-        escaped = escaped.replace('!', '\\!')        # Escape exclamation marks (history expansion in bash)
-        return f'"{escaped}"'
+    # For bash scripts, we need to be very careful with echo statements
+    # The safest approach is to use single quotes when possible, but escape single quotes within
+    
+    # If the filename contains single quotes, we need to handle them specially
+    if "'" in filename_str:
+        # Split on single quotes and handle each part
+        parts = filename_str.split("'")
+        escaped_parts = []
+        for i, part in enumerate(parts):
+            if i == 0:
+                # First part - wrap in single quotes if not empty
+                if part:
+                    escaped_parts.append(f"'{part}'")
+            else:
+                # Add escaped single quote and wrap the part in single quotes
+                if part:
+                    escaped_parts.append(f"\"'\"'{part}'")
+                else:
+                    escaped_parts.append("\"'\"")
+        return "".join(escaped_parts)
     else:
-        # For simpler filenames, use shlex.quote which is very robust
-        return shlex.quote(filename_str)
+        # No single quotes - we can safely wrap the entire string in single quotes
+        # This protects against all other special characters including $, `, ", (, ), etc.
+        return f"'{filename_str}'"
 
 def _escape_for_batch(path: str) -> str:
     """
@@ -757,29 +768,25 @@ def _escape_for_batch(path: str) -> str:
     """
     path_str = str(path)
     
-    # Check if the path contains problematic characters
-    problematic_chars = ["'", "(", ")", "[", "]", "&", "|", "<", ">", "^", "%", "!", "="]
+    # For batch files, we need to escape special characters and wrap in quotes
+    # Escape caret first (the batch escape character)
+    escaped = path_str.replace("^", "^^")
     
-    if any(char in path_str for char in problematic_chars):
-        # For batch files, we need to escape special characters differently
-        escaped = path_str.replace("^", "^^")  # Escape caret first
-        escaped = escaped.replace("&", "^&")   # Escape ampersand
-        escaped = escaped.replace("|", "^|")   # Escape pipe
-        escaped = escaped.replace("<", "^<")   # Escape less than
-        escaped = escaped.replace(">", "^>")   # Escape greater than
-        escaped = escaped.replace("(", "^(")   # Escape opening parenthesis
-        escaped = escaped.replace(")", "^)")   # Escape closing parenthesis
-        escaped = escaped.replace("[", "^[")   # Escape opening bracket
-        escaped = escaped.replace("]", "^]")   # Escape closing bracket
-        escaped = escaped.replace("!", "^!")   # Escape exclamation mark
-        escaped = escaped.replace("=", "^=")   # Escape equals sign
-        escaped = escaped.replace("%", "%%")   # Escape percent sign (different rule)
-        
-        # Wrap in quotes for extra safety
-        return f'"{escaped}"'
-    else:
-        # For simpler paths, just use quotes
-        return f'"{path_str}"'
+    # Escape other special characters
+    escaped = escaped.replace("&", "^&")   # Escape ampersand
+    escaped = escaped.replace("|", "^|")   # Escape pipe
+    escaped = escaped.replace("<", "^<")   # Escape less than
+    escaped = escaped.replace(">", "^>")   # Escape greater than
+    escaped = escaped.replace("(", "^(")   # Escape opening parenthesis
+    escaped = escaped.replace(")", "^)")   # Escape closing parenthesis
+    escaped = escaped.replace("[", "^[")   # Escape opening bracket
+    escaped = escaped.replace("]", "^]")   # Escape closing bracket
+    escaped = escaped.replace("!", "^!")   # Escape exclamation mark
+    escaped = escaped.replace("=", "^=")   # Escape equals sign
+    escaped = escaped.replace("%", "%%")   # Escape percent sign (different rule)
+    
+    # Wrap in quotes for extra safety
+    return f'"{escaped}"'
     
 def add_rename_command_old(
     rename_script_paths: Dict[str, Optional[str]], 
