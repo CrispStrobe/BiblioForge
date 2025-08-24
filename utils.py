@@ -312,76 +312,56 @@ def clean_author_name(author_name: str) -> str:
     author_name = re.sub(r'\s+', ' ', author_name).strip()
     return author_name
 
-def valid_author_name(author_name: Optional[str]) -> bool:
+def valid_author_name(name: str) -> bool:
     """
-    Comprehensive validation for author names, consolidating all previous logic.
+    Enhanced validation for author names to reduce false negatives
     """
-    if not author_name:
+    if not name or not isinstance(name, str):
         return False
     
-    # Basic cleaning and normalization
-    name_lower = author_name.lower().strip()
-    
-    # Remove potential prefixes that LLMs sometimes add
-    name_to_check = re.sub(r"^(>?(Main Author|Author|Editor|By):?\s*)", "", name_lower, flags=re.IGNORECASE).strip()
-    
-    # Check minimum length
-    if len(name_to_check) < 2:
+    cleaned = name.strip()
+    if len(cleaned) < 2:
         return False
     
-    # Extensive list of invalid patterns/keywords
-    invalid_patterns = [
-        # Direct invalid values
-        "unknownauthor", "unknown author", "n/a", "na", "lastname firstname", 
-        "firstname lastname", "surname name", "author name", "name author",
-        
-        # Placeholder text that LLMs sometimes return
-        "first", "author", "lastname", "firstname", "surname", "name",
-        "unknown", "main author", "primary author", "contributor", "writer", 
-        "creator", "by", "from", "extracted", "publication", "document", 
-        "title", "various", "multiple", "et al", "and others", "anonymous",
-        
-        # Multi-language variants
-        "nicht verfügbar", "unbekannt", "autor", "verfasser", "auteur",
-        "escritor", "scrittore", "författare",
-        
-        # Just the prefix symbols
-        ">", ">>", ":",
-        
-        # Common editor/role indicators
-        "editor", "editors", "ed.", "eds.", "herausgeber", "hrsg.",
+    # Remove common prefixes that might be added by LLMs
+    cleaned = re.sub(r"^(>?(Main Author|Author|Editor|By):?\s*)", "", cleaned, flags=re.IGNORECASE).strip()
+    
+    # Check for placeholder values that indicate failed extraction
+    invalid_keywords = [
+        'unknown', 'unknownauthor', 'lastname firstname', 'firstname lastname',
+        'author name', 'main author', 'n/a', 'na', 'nicht verfügbar'
     ]
     
-    # Check for exact matches with invalid patterns
-    if name_to_check in invalid_patterns:
+    if cleaned.lower() in invalid_keywords:
         return False
     
-    # Check if any invalid keywords are contained in the name
-    for pattern in ["unknownauthor", "lastname", "firstname", "surname", "main author", "primary author"]:
-        if pattern in name_to_check:
+    # Must contain at least some alphabetic characters
+    if not any(c.isalpha() for c in cleaned):
+        return False
+    
+    # Must not be entirely punctuation or numbers
+    meaningful_chars = ''.join(c for c in cleaned if c.isalnum())
+    if len(meaningful_chars) < 2:
+        return False
+    
+    # Allow reasonable names even if they don't perfectly match expected patterns
+    # Check for obviously invalid patterns but be more permissive
+    # Split into words
+    words = cleaned.split()
+    if len(words) == 0:
+        return False
+    
+    # If it's a single word, it might be a mononym (like "Plato") - allow it if reasonable length
+    if len(words) == 1:
+        return 2 <= len(words[0]) <= 30 and any(c.isalpha() for c in words[0])
+    
+    # For multi-word names, check that each word has reasonable characteristics
+    for word in words[:3]:  # Check up to 3 words to handle compound names
+        if len(word) < 1 or len(word) > 30:
             return False
-    
-    # Check for valid character patterns (allow international characters)
-    if not re.match(r'^[\w\s.\'-áéíóúàèìòùäëïöüÄËÏÖÜâêîôûÂÊÎÔÛñÑçÇşŞıİğĞüÜöÖçÇ]+$', name_to_check, re.UNICODE):
-        return False
-    
-    # Check word length constraints
-    parts = name_to_check.split()
-    if not parts:
-        return False
-    
-    # Ensure reasonable word lengths
-    if any(len(part) < 1 or len(part) > 35 for part in parts):
-        return False
-    
-    # Check for too short total meaningful content
-    meaningful_chars = ''.join(c for c in name_to_check if c.isalnum())
-    if len(meaningful_chars) < 3:
-        return False
-    
-    # Special case: allow "Unknown" as a valid fallback
-    if name_to_check == "unknown" and len(parts) == 1:
-        return True
+        # Allow words with letters, hyphens, apostrophes, and periods (for initials)
+        if not re.match(r"^[A-Za-zÀ-ÿ\-'\.]+$", word):
+            return False
     
     return True
 

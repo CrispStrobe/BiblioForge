@@ -847,16 +847,40 @@ def get_llm_provider(provider_type: str = "ollama",
 
 
 # --- Core LLM Interaction Functions  ---
+def fix_malformed_xml_tags(text: str) -> str:
+    """
+    Fix common XML tag malformations from LLM responses
+    """
+    import re
+    
+    # Fix tags with equals signs: <TAG=value</TAG> -> <TAG>value</TAG>
+    # Pattern: <(TAG)[=\s]+([^>]*)</TAG>
+    def fix_malformed_tag(match):
+        tag_name = match.group(1)
+        content = match.group(2).strip()
+        # Remove quotes if present
+        if content.startswith('"') and content.endswith('"'):
+            content = content[1:-1]
+        elif content.startswith("'") and content.endswith("'"):
+            content = content[1:-1]
+        return f"<{tag_name}>{content}</{tag_name}>"
+    
+    # Fix patterns like <AUTHOR=Watanabe, Morimichi</AUTHOR>
+    text = re.sub(r'<(TITLE|AUTHOR|YEAR|LANGUAGE)[=\s]+([^>]*)</\1>', fix_malformed_tag, text, flags=re.IGNORECASE)
+    
+    # Fix unclosed malformed tags: <TAG=value> -> <TAG>value</TAG>
+    text = re.sub(r'<(TITLE|AUTHOR|YEAR|LANGUAGE)[=\s]+([^<>]+)(?=\s*(?:<|$))', r'<\1>\2</\1>', text, flags=re.IGNORECASE)
+    
+    return text
 
 def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
                 max_attempts: int = 3, # Max attempts for the *same* prompt template
                 verbose: bool = False,
                 temperature_arg: float = 0.5, max_tokens_arg: Optional[int] = 300,
-                prompt_template_index: int = 0  # for retrires with diffrent templates
+                prompt_template_index: int = 0  # for retries with different templates
                 ) -> str:
     base_retry_wait = 5.0
-    # Ensure prompt_templates is defined in this scope or passed appropriately
-    # Using the structure provided by the user in the previous turn
+    # Using the same prompt templates as before
     prompt_templates_definition = [
         ( # This is a TUPLE of strings
             f"Extract metadata from the following file extraction snippet. We need "
@@ -929,28 +953,51 @@ def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
                 timeout_seconds=120 # Default overall timeout for the call
             )
             output = response_data.get("content", "").strip()
-            if provider_debug_flag or verbose: logging.debug(f"send_to_llm: Raw LLM response for '{filename}' (template index {prompt_template_index}, attempt {attempt}): '{output}'")
+            if provider_debug_flag or verbose: 
+                logging.debug(f"send_to_llm: Raw LLM response for '{filename}' (template index {prompt_template_index}, attempt {attempt}): '{output}'")
 
-            has_title = "<TITLE>" in output
-            has_author = "<AUTHOR>" in output
-            has_year = "<YEAR>" in output
+            # FIXED: More robust XML tag detection
+            def has_valid_tag(output_text: str, tag_name: str) -> bool:
+                """Check if output contains a valid XML tag, handling malformed variations"""
+                import re
+                # Check for proper format: <TAG>content</TAG>
+                proper_pattern = f"<{tag_name}>"
+                if proper_pattern in output_text:
+                    return True
+                
+                # Check for malformed format with equals: <TAG=content</TAG> or <TAG="content"</TAG>
+                malformed_pattern = rf"<{tag_name}[=\s][^>]*>"
+                if re.search(malformed_pattern, output_text, re.IGNORECASE):
+                    if provider_debug_flag or verbose:
+                        logging.debug(f"send_to_llm: Found malformed {tag_name} tag in response, will attempt to fix")
+                    return True
+                
+                return False
+
+            has_title = has_valid_tag(output, "TITLE")
+            has_author = has_valid_tag(output, "AUTHOR") 
+            has_year = has_valid_tag(output, "YEAR")
 
             if output and has_title and has_author and has_year:
-                return output
-            elif output and ("<PUBLICATION TITLE>" in output or "<PUBLICATIONTITLE>" in output) and \
+                # FIXED: Clean up malformed tags before returning
+                cleaned_output = fix_malformed_xml_tags(output)
+                return cleaned_output
+            elif output and (has_valid_tag(output, "PUBLICATION TITLE") or has_valid_tag(output, "PUBLICATIONTITLE")) and \
                  has_author and has_year:
-                if provider_debug_flag or verbose: logging.debug(f"send_to_llm: LLM for '{filename}' used alternative title tag. Standardizing.")
-                output = output.replace("<PUBLICATION TITLE>", "<TITLE>").replace("<PUBLICATIONTITLE>", "<TITLE>")
-                return output
+                if provider_debug_flag or verbose: 
+                    logging.debug(f"send_to_llm: LLM for '{filename}' used alternative title tag. Standardizing.")
+                cleaned_output = fix_malformed_xml_tags(output)
+                cleaned_output = cleaned_output.replace("<PUBLICATION TITLE>", "<TITLE>").replace("<PUBLICATIONTITLE>", "<TITLE>")
+                cleaned_output = cleaned_output.replace("</PUBLICATION TITLE>", "</TITLE>").replace("</PUBLICATIONTITLE>", "</TITLE>")
+                return cleaned_output
             else:
                 # This log means the response was received but was structurally bad for THIS attempt with THIS template
                 logging.warning(f"send_to_llm: LLM response for '{filename}' (template index {prompt_template_index}, attempt {attempt}, model '{provider_instance.model_name}') "
                                 f"missing key tags (TITLE, AUTHOR, YEAR) or empty: '{output[:100]}...'")
                 # If max_attempts for this specific prompt template is reached, return the malformed output.
-                # The outer loop in _process_single_file will then decide to try the next template.
                 if attempt == max_attempts:
                     logging.error(f"send_to_llm: Max attempts ({max_attempts}) reached for '{filename}' with prompt template index {prompt_template_index}. Returning last (malformed) output.")
-                    return output # Return whatever was received
+                    return fix_malformed_xml_tags(output) # Still try to fix what we can
 
         except (OpenAIAPIConnectionError, OpenAITimeout, ollama.ResponseError if ollama else RuntimeError) as e_net:
             log_msg = f"send_to_llm: LLM network/timeout error for '{filename}' with {provider_instance.__class__.__name__} (template index {prompt_template_index}, attempt {attempt}): {e_net}."
@@ -1104,23 +1151,27 @@ Sample conversions:
             if verbose:
                 logging.debug(f"sort_author_names: LLM request for '{author_names_input}' (file: {filename_for_logging}) to {type(provider_arg).__name__} ('{provider_arg.model_name}'), template {prompt_template_index}, attempt {attempt + 1}")
             
-            response = provider_arg.send_request(
+            # FIX: Use chat_completion instead of send_request
+            response = provider_arg.chat_completion(
                 messages=[{"role": "user", "content": selected_prompt}],
                 temperature=0.1,  # Low temperature for consistent sorting
                 max_tokens=100,
-                **kwargs
+                timeout_seconds=30
             )
             
-            if verbose:
-                logging.debug(f"sort_author_names: Raw LLM response for '{author_names_input}': '{response}'")
+            # Extract content from the response dictionary
+            response_text = response.get("content", "") if isinstance(response, dict) else str(response)
             
-            if not response:
+            if verbose:
+                logging.debug(f"sort_author_names: Raw LLM response for '{author_names_input}': '{response_text}'")
+            
+            if not response_text:
                 if verbose:
                     logging.warning(f"sort_author_names: Empty response for '{author_names_input}' (template {prompt_template_index}, attempt {attempt + 1})")
                 continue
             
             # Extract author name from response
-            author_match = re.search(r'<AUTHOR[^>]*>(.*?)</AUTHOR>', response, re.DOTALL | re.IGNORECASE)
+            author_match = re.search(r'<AUTHOR[^>]*>(.*?)</AUTHOR>', response_text, re.DOTALL | re.IGNORECASE)
             if author_match:
                 sorted_author = author_match.group(1).strip()
                 
@@ -1137,7 +1188,7 @@ Sample conversions:
                         logging.warning(f"sort_author_names: Extracted author name too short: '{sorted_author}' (template {prompt_template_index}, attempt {attempt + 1})")
             else:
                 if verbose:
-                    logging.warning(f"sort_author_names: Could not extract <AUTHOR> tags from response: '{response[:100]}...' (template {prompt_template_index}, attempt {attempt + 1})")
+                    logging.warning(f"sort_author_names: Could not extract <AUTHOR> tags from response: '{response_text[:100]}...' (template {prompt_template_index}, attempt {attempt + 1})")
         
         except Exception as e:
             if verbose:

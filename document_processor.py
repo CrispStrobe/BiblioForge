@@ -69,12 +69,32 @@ class DocumentProcessor:
         if not valid_author_name(author_name):
             return "UnknownAuthor"
         
-        # If name is already in "Lastname Firstname" format, might not need sorting
+        # Pre-process comma-separated names
         if ',' in author_name:
-            # Pre-sort comma-separated names
             parts = [p.strip() for p in author_name.split(',')]
             if len(parts) == 2 and all(valid_author_name(p) for p in parts):
-                return f"{parts[0]} {parts[1]}"
+                formatted_name = f"{parts[0]} {parts[1]}"
+                if self._debug:
+                    logging.debug(f"sort_author_with_retries: Pre-sorted comma-separated name '{author_name}' to '{formatted_name}'")
+                return formatted_name
+        
+        # FIXED: Check if name is already in correct "Lastname Firstname" format
+        def is_likely_correct_format(name: str) -> bool:
+            """Check if name is likely already in 'Lastname Firstname' format"""
+            parts = name.split()
+            if len(parts) == 2:
+                lastname, firstname = parts
+                # Basic heuristics: both parts capitalized, reasonable length
+                if (lastname[0].isupper() and firstname[0].isupper() and 
+                    2 <= len(lastname) <= 20 and 2 <= len(firstname) <= 20 and
+                    lastname.isalpha() and firstname.replace('-', '').replace("'", '').isalpha()):
+                    return True
+            return False
+        
+        if is_likely_correct_format(author_name):
+            if self._debug:
+                logging.debug(f"sort_author_with_retries: '{author_name}' already appears to be in correct 'Lastname Firstname' format")
+            return author_name
         
         all_results = []
         
@@ -96,14 +116,15 @@ class DocumentProcessor:
                     **kwargs_from_main
                 )
                 
-                if sorted_name and valid_author_name(sorted_name) and sorted_name != author_name:
+                # FIXED: Accept results even if they're the same as input (already correctly formatted)
+                if sorted_name and valid_author_name(sorted_name):
                     all_results.append(sorted_name)
                     if self._debug:
-                        logging.debug(f"sort_author_with_retries: Template {template_idx} result: '{sorted_name}'")
+                        logging.debug(f"sort_author_with_retries: Template {template_idx} result: '{sorted_name}' (same as input: {sorted_name == author_name})")
                 else:
                     if self._debug:
-                        logging.warning(f"sort_author_with_retries: Template {template_idx} returned unusable result: '{sorted_name}'")
-                        
+                        logging.warning(f"sort_author_with_retries: Template {template_idx} returned invalid result: '{sorted_name}'")
+                            
             except Exception as e:
                 if self._debug:
                     logging.warning(f"sort_author_with_retries: Template {template_idx} failed: {e}")
@@ -132,19 +153,16 @@ class DocumentProcessor:
                 if self._debug:
                     logging.debug(f"sort_author_with_retries: Using majority result: '{final_result}' (appeared {most_common[1]} times out of {len(all_results)})")
             else:
-                # All results are unique - use heuristic to pick best one
-                # Prefer results that look more like "Lastname Firstname" format
+                # All results are unique - prefer results that look more like "Lastname Firstname"
                 best_result = all_results[0]
                 for result in all_results:
-                    parts = result.split()
-                    if len(parts) == 2 and parts[0][0].isupper() and parts[1][0].isupper():
-                        # Looks like proper "Lastname Firstname" format
+                    if is_likely_correct_format(result):
                         best_result = result
                         break
                 
                 final_result = best_result
                 if self._debug:
-                    logging.warning(f"sort_author_with_retries: All templates differ {all_results}, using heuristic choice: '{final_result}'")
+                    logging.info(f"sort_author_with_retries: All templates differ {all_results}, using heuristic choice: '{final_result}'")
             
             return final_result
 
@@ -250,33 +268,45 @@ class DocumentProcessor:
     def has_invalid_author_keywords(self, author_name: str) -> bool:
         """
         Check if author name contains invalid placeholder keywords that indicate LLM failure.
+        Uses word boundary matching to avoid false positives.
         """
         if not author_name:
             return True
         
         author_lower = author_name.lower().strip()
         
+        # Remove potential prefixes that LLMs sometimes add
+        author_to_check = re.sub(r"^(>?(Main Author|Author|Editor|By):?\s*)", "", author_lower, flags=re.IGNORECASE).strip()
+        
+        # Check minimum length
+        if len(author_to_check) < 2:
+            return True
+        
         # Keywords that indicate the LLM failed to extract a real author name
-        invalid_keywords = [
-            'first', 'author', 'lastname', 'firstname', 'surname', 'name',
-            'unknown', 'unknownauthor', 'main author', 'primary author',
-            'editor', 'contributor', 'writer', 'creator', 'by', 'from',
-            'extracted', 'publication', 'document', 'title', 'various',
-            'multiple', 'et al', 'and others', 'anonymous', 'n/a', 'na',
-            'nicht verfügbar', 'unbekannt', 'autor', 'verfasser'
+        # Use word boundaries to avoid false positives with legitimate names
+        invalid_patterns = [
+            r'\bunknownauthor\b', r'\bunknown\s+author\b', r'\bunknown\b',
+            r'\blastname\s+firstname\b', r'\bfirstname\s+lastname\b', r'\bsurname\s+name\b',
+            r'\bauthor\s+name\b', r'\bname\s+author\b', r'\bmain\s+author\b', r'\bprimary\s+author\b',
+            r'\bcontributor\b', r'\bwriter\b', r'\bcreator\b', r'\beditor\b', r'\beditors\b',
+            r'\bextracted\b', r'\bpublication\b', r'\bdocument\b', r'\bvarious\b',
+            r'\bmultiple\b', r'\bet\s+al\b', r'\band\s+others\b', r'\banonymous\b',
+            r'\bn/?a\b', r'\bnicht\s+verfügbar\b', r'\bunbekannt\b', r'\bautor\b', r'\bverfasser\b'
         ]
         
-        # Check if the author name contains any invalid keywords
-        for keyword in invalid_keywords:
-            if keyword in author_lower:
+        # Check for word boundary matches with invalid patterns
+        for pattern in invalid_patterns:
+            if re.search(pattern, author_to_check):
                 return True
         
-        # Check for patterns like "Lastname Firstname" (literal placeholder)
-        if author_lower in ['lastname firstname', 'firstname lastname', 'surname name']:
+        # Check for exact matches with problematic placeholders
+        exact_invalid = ['lastname firstname', 'firstname lastname', 'surname name']
+        if author_to_check in exact_invalid:
             return True
         
         # Check if it's too short or just punctuation
-        if len(author_lower.replace(' ', '').replace('.', '').replace(',', '')) < 3:
+        meaningful_chars = ''.join(c for c in author_to_check if c.isalnum())
+        if len(meaningful_chars) < 3:
             return True
         
         return False
