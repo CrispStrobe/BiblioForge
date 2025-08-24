@@ -911,17 +911,39 @@ def execute_rename_commands(script_path_to_execute: str):
 
 # --- Metadata Parsing ---
 def _extract_tag_content(content: str, tag: str, default: str = "") -> str:
-    logging.debug(f"Extracting tag content from {content} for {tag}.")
-    # Allow optional spaces around tag name in closing tag and content
-    # Handle attributes in opening tag
-    match = re.search(f"<{tag}[^>]*>(.*?)</\s*{tag}\s*>", content, re.DOTALL | re.IGNORECASE)
-    # If no match, or match is empty after stripping, return default
-    if not match or not match.group(1).strip():
+    """
+    Extract content from XML-like tags, handling various edge cases.
+    Should work reliably across macOS, Windows, and Linux.
+    """
+    if not content or not tag:
         return default
-    found = match.group(1).strip()
-
-    logging.debug(f"... find: {found}.")
-    return found
+    
+    try:
+        # Use raw f-string for regex patterns to handle escape sequences correctly
+        # This pattern handles:
+        # - Optional attributes in opening tag: <tag attr="value">
+        # - Optional whitespace in closing tag: </ tag >  
+        # - Multiline content with re.DOTALL
+        pattern = rf"<{re.escape(tag)}[^>]*>(.*?)</\s*{re.escape(tag)}\s*>"
+        match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
+        
+        if not match:
+            return default
+            
+        found = match.group(1).strip()
+        if not found:
+            return default
+            
+        # Clean up any excessive whitespace while preserving intentional formatting
+        found = re.sub(r'\n\s*\n', '\n\n', found)  # Preserve paragraph breaks
+        found = re.sub(r'[ \t]+', ' ', found)       # Normalize spaces/tabs
+        
+        return found
+        
+    except Exception as e:
+        # Log the error but don't crash - return default instead
+        logging.debug(f"Error extracting tag '{tag}' from content: {e}")
+        return default
 
 def parse_metadata(content: str, filename: str = "Unknown Filename") -> Dict[str, str]:
     raw_title = _extract_tag_content(content, 'TITLE')
