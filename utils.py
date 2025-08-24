@@ -732,34 +732,29 @@ def add_rename_command(
 def escape_special_chars(filename: str) -> str:
     """
     Enhanced shell escaping that handles complex filenames with special characters.
-    Specifically designed to work correctly in echo statements within bash scripts.
+    Tries to use shlex.quote() first (most reliable), falls back to manual escaping.
     """
     filename_str = str(filename)
     
-    # For bash scripts, we need to be very careful with echo statements
-    # The safest approach is to use single quotes when possible, but escape single quotes within
+    # First, try to use shlex.quote() - the most reliable approach
+    try:
+        import shlex
+        return shlex.quote(filename_str)
+    except ImportError:
+        # Fallback to manual escaping if shlex is not available
+        pass
     
-    # If the filename contains single quotes, we need to handle them specially
-    if "'" in filename_str:
-        # Split on single quotes and handle each part
-        parts = filename_str.split("'")
-        escaped_parts = []
-        for i, part in enumerate(parts):
-            if i == 0:
-                # First part - wrap in single quotes if not empty
-                if part:
-                    escaped_parts.append(f"'{part}'")
-            else:
-                # Add escaped single quote and wrap the part in single quotes
-                if part:
-                    escaped_parts.append(f"\"'\"'{part}'")
-                else:
-                    escaped_parts.append("\"'\"")
-        return "".join(escaped_parts)
-    else:
-        # No single quotes - we can safely wrap the entire string in single quotes
-        # This protects against all other special characters including $, `, ", (, ), etc.
+    # Manual escaping fallback
+    # If no single quotes, we can safely wrap the entire string in single quotes
+    # This protects against all other special characters including $, `, ", (, ), etc.
+    if "'" not in filename_str:
         return f"'{filename_str}'"
+    
+    # Handle single quotes using the standard bash escape pattern: '\''
+    # This means: end single quote, escaped single quote, start single quote
+    # So 'Dr.Thusandso'\''s-Thesis' represents "Dr.Thusandso's-Thesis"
+    escaped = filename_str.replace("'", "'\\''")
+    return f"'{escaped}'"
 
 def _escape_for_batch(path: str) -> str:
     """
