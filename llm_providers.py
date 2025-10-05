@@ -1125,9 +1125,9 @@ Instructions:
 - Convert to: Surname GivenName
 - For Western names: "John Smith" becomes "Smith John"
 - For names with particles: "van der Berg, Jan" becomes "van der Berg Jan"
+- For hyphenated surnames, keep them together: "Carsten Schlüter-Knauer" becomes "Schlüter-Knauer Carsten" # <--- ADD THIS EXAMPLE
 - Remove academic titles (Dr., Prof., etc.)
 - If uncertain about name order, judge according to your knowledge about what is likelier as a Firstname.
-- For compound surnames, keep them together
 
 Response format: <AUTHOR>Surname GivenName</AUTHOR>
 

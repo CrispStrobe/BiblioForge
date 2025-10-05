@@ -167,17 +167,19 @@ class ExtractionManager:
                 sort: bool = False, 
                 llm_provider_arg: Optional[Any] = None, 
                 rename_script_path: Optional[str] = None,
-                # Added for passing to LLM functions if needed by sort logic here
                 temperature: float = 0.5, 
                 max_tokens: int = 250,
                 **kwargs) -> Dict[str, Any]:
         
-        result_data: Dict[str, Any] = { # Ensure type for result_data
+        result_data: Dict[str, Any] = {
             "success": False, "text": "", "output_path": output_path, "skipped": False, 
             "error": None, "tables": [], "metadata_llm": None, "renamed_info": None
         }
         
         try:
+            # Log which file is being extracted
+            logging.info(f"Extracting: {os.path.basename(input_path)}")
+            
             file_ext = os.path.splitext(input_path)[1].lower()
             if file_ext not in self.SUPPORTED_EXTENSIONS:
                 result_data["error"] = f"Unsupported file type: {input_path}"
@@ -191,19 +193,19 @@ class ExtractionManager:
             if hasattr(extractor, 'set_password') and password:
                 extractor.set_password(password)
             
-            # Simplified progress callback for internal extractor use
             def _internal_progress_cb(n=1, engine_info=None):
                 if self._debug and engine_info:
                     logging.debug(f"Extractor ({engine_info}) progress step: {n}")
 
             extractor_kwargs = {'preferred_method': method}
-            if isinstance(extractor, PDFExtractor): # Check specific type for PDF args
+            if isinstance(extractor, PDFExtractor):
                 extractor_kwargs.update({
                     'ocr_method': ocr_method,
                     'force_ocr': force_ocr,
                     'extract_tables': extract_tables
                 })
             
+            # Extract without signal-based timeout (subprocess timeouts handle this)
             extracted_text = extractor.extract_text(
                 input_path, 
                 progress_callback=_internal_progress_cb,
@@ -213,15 +215,15 @@ class ExtractionManager:
             if extracted_text and extracted_text.strip():
                 result_data["text"] = extracted_text
                 result_data["success"] = True
-                if self._debug: logging.debug(f"Successfully extracted {len(extracted_text)} chars from {input_path}")
+                if self._debug: 
+                    logging.debug(f"Successfully extracted {len(extracted_text)} chars from {input_path}")
                 
                 if isinstance(extractor, PDFExtractor) and extract_tables:
                     tables_df_list = extractor.get_last_extracted_tables()
                     if tables_df_list:
                         result_data["tables"] = [df.to_dict('records') for df in tables_df_list]
-                        if self._debug: logging.info(f"Stored {len(tables_df_list)} tables from {input_path}.")
 
-                if output_path: # If an output path for the .txt file is provided
+                if output_path:
                     try:
                         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
                         with open(output_path, 'w', encoding='utf-8') as f:
@@ -232,20 +234,10 @@ class ExtractionManager:
                         result_data["success"] = False 
             else:
                 result_data["error"] = f"No text extracted from {input_path}"
-                result_data["success"] = False # Ensure success is false if no text
-
-            # LLM-based sorting (moved most of this to DocumentProcessor)
-            # This manager's extract method focuses on text/table extraction.
-            # Sorting and renaming logic is better handled at a higher level (DocumentProcessor)
-            # after extraction is complete.
-            # However, if this `extract` method is called per file with sort=True, it might need to do it.
-            # Let's assume for now that the sorting logic in _process_single_file of DocumentProcessor
-            # calls this extract method and then handles sorting.
-            # So, this `extract` method doesn't need the full sorting logic itself.
-            # It just needs to return the text and success.
+                result_data["success"] = False
 
         except Exception as e:
-            result_data["error"] = f"ExtractionManager.extract for {input_path} failed: {str(e)}"
+            result_data["error"] = f"ExtractionManager.extract failed: {str(e)}"
             logging.error(result_data["error"], exc_info=self._debug)
             result_data["success"] = False
         

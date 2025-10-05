@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm 
 import subprocess # For run_process and Popen type hint
-import sys # <<< ADDED IMPORT FOR SYS
+import sys
 import warnings
 
 # --- Global Variables / Flags ---
@@ -526,36 +526,213 @@ def run_process(cmd: List[str], timeout_sec: Optional[int] = None, **kwargs) -> 
     return subprocess.CompletedProcess(args=cmd_str, returncode=returncode, stdout=stdout or "", stderr=stderr or "")
 
 # --- File Operations & Renaming Script Logic ---
-def is_file_in_rename_script(rename_script_path: str, input_file: str) -> bool:
-    # (Implementation from before)
+def is_file_in_rename_script(rename_script_path: str, input_file: str, text_file: Optional[str] = None) -> bool:
+    """
+    Check if a file (and optionally its associated .txt file) already has rename commands in the script.
+    
+    Args:
+        rename_script_path: Path to the rename script to check
+        input_file: Path to the original input file
+        text_file: Optional path to the associated .txt file
+    
+    Returns:
+        True if commands for this file exist in the script
+    """
     is_windows = platform.system() == 'Windows'
     script_ext = os.path.splitext(rename_script_path)[1].lower()
     scripts_to_check = [rename_script_path]
+    
     if is_windows and script_ext != '.bat':
         batch_script_path = os.path.splitext(rename_script_path)[0] + '.bat'
-        if os.path.exists(batch_script_path): scripts_to_check.append(batch_script_path)
-    abs_input_file = os.path.abspath(input_file) # Normalize input file path
-
-    for script_path_check in scripts_to_check: # Renamed script_path
-        if not os.path.exists(script_path_check): continue
+        if os.path.exists(batch_script_path):
+            scripts_to_check.append(batch_script_path)
+    
+    abs_input_file = os.path.abspath(input_file)
+    files_to_check = [abs_input_file]
+    
+    if text_file:
+        abs_text_file = os.path.abspath(text_file)
+        files_to_check.append(abs_text_file)
+    
+    for script_path_check in scripts_to_check:
+        if not os.path.exists(script_path_check):
+            continue
+        
         try:
-            with open(script_path_check, 'r', encoding='utf-8') as f: content = f.read()
-            # Check various forms of the path
+            with open(script_path_check, 'r', encoding='utf-8') as f:
+                content = f.read()
             
-            # Construct the doubly escaped path for batch files separately
-            win_path_doubly_escaped_for_fstring_literal = abs_input_file.replace("/", "\\\\")
-
-            paths_to_check_in_script = [
-                abs_input_file, 
-                abs_input_file.replace('/', '\\'), 
-                shlex.quote(abs_input_file),
-                f'"{abs_input_file}"', 
-                f'"{win_path_doubly_escaped_for_fstring_literal}"' # Use the pre-constructed string
-            ]
-            if any(p in content for p in paths_to_check_in_script): return True
+            # Check each file we're looking for
+            for file_to_find in files_to_check:
+                # Construct various forms of the path that might appear in the script
+                win_path_doubly_escaped = file_to_find.replace("/", "\\\\")
+                
+                paths_to_check_in_script = [
+                    file_to_find,
+                    file_to_find.replace('/', '\\'),
+                    shlex.quote(file_to_find),
+                    f'"{file_to_find}"',
+                    f'"{win_path_doubly_escaped}"',
+                    os.path.basename(file_to_find)  # Also check just the filename
+                ]
+                
+                # If any form of the file path is found, return True
+                if any(p in content for p in paths_to_check_in_script):
+                    return True
+                    
         except Exception as e:
             logging.error(f"Error checking rename script {script_path_check}: {e}")
+            continue
+    
     return False
+
+def should_process_file(
+    input_file: str,
+    output_txt_path: str,
+    rename_script_path: Optional[str],
+    sort_enabled: bool,
+    noskip: bool = False
+) -> Dict[str, bool]:
+    """
+    Determine what processing steps should be performed for a file.
+    
+    Args:
+        input_file: Path to the input file
+        output_txt_path: Path where the .txt extraction would be/is
+        rename_script_path: Path to the rename script (if sorting is enabled)
+        sort_enabled: Whether sorting/renaming is enabled
+        noskip: If True, always reprocess even if outputs exist
+    
+    Returns:
+        Dict with:
+        - 'skip_entirely': True if file should be completely skipped
+        - 'skip_extraction': True if extraction can be skipped (txt exists)
+        - 'skip_llm_and_rename': True if LLM and rename command generation should be skipped
+    """
+    result = {
+        'skip_entirely': False,
+        'skip_extraction': False,
+        'skip_llm_and_rename': False
+    }
+    
+    # Check if noskip is enabled - if so, never skip anything
+    if noskip:
+        return result
+    
+    # Check if .txt file exists and is not empty
+    txt_exists = os.path.exists(output_txt_path)
+    txt_has_content = False
+    
+    if txt_exists:
+        try:
+            txt_size = os.path.getsize(output_txt_path)
+            txt_has_content = txt_size > 0
+        except OSError:
+            txt_has_content = False
+    
+    # If sorting is not enabled, simple logic
+    if not sort_enabled:
+        if txt_exists and txt_has_content:
+            result['skip_entirely'] = True
+        return result
+    
+    # Sorting is enabled - check rename script
+    in_rename_script = False
+    if rename_script_path and os.path.exists(rename_script_path):
+        in_rename_script = is_file_in_rename_script(
+            rename_script_path,
+            input_file,
+            output_txt_path
+        )
+    
+    # Determine skip logic
+    if txt_exists and txt_has_content:
+        result['skip_extraction'] = True
+        
+        if in_rename_script:
+            # Both txt exists AND in rename script - skip everything
+            result['skip_entirely'] = True
+            result['skip_llm_and_rename'] = True
+        else:
+            # Txt exists but NOT in rename script - load txt, do LLM, add to script
+            result['skip_llm_and_rename'] = False
+    
+    return result
+
+def safe_initialize_rename_scripts(rename_script_path_base: str, append_mode: bool = True, reset_mode: bool = False) -> Dict[str, Optional[str]]:
+    """
+    Initialize or safely append to rename scripts without overwriting existing content.
+    
+    Args:
+        rename_script_path_base: Base path for the rename script
+        append_mode: If True and files exist, append with separator. If False, create fresh.
+        reset_mode: If True, force creation of fresh scripts (overrides append_mode)
+    
+    Returns:
+        Dict with 'bash_script' and 'batch_script' paths
+    """
+    is_windows = platform.system() == 'Windows'
+    base_name, main_ext = os.path.splitext(rename_script_path_base)
+    actual_bash_path, actual_batch_path = rename_script_path_base, rename_script_path_base
+    
+    if main_ext.lower() == '.bat':
+        actual_bash_path = base_name + '.sh'
+    elif main_ext.lower() == '.sh':
+        if is_windows:
+            actual_batch_path = base_name + '.bat'
+    else:
+        actual_bash_path = rename_script_path_base
+        if is_windows:
+            actual_batch_path = base_name + '.bat'
+    
+    # If reset_mode, ignore append_mode and create fresh
+    effective_append = append_mode and not reset_mode
+    
+    # Handle bash script
+    if not is_windows or actual_bash_path == rename_script_path_base or main_ext.lower() != '.bat':
+        bash_exists = os.path.exists(actual_bash_path)
+        
+        with file_lock:
+            if bash_exists and effective_append:
+                # File exists, append with separator
+                with open(actual_bash_path, "a", encoding='utf-8') as bash_file:
+                    bash_file.write(f"\n# ===== New BiblioForge Run: {datetime.now().isoformat()} =====\n\n")
+                logging.debug(f"Appending to existing bash script: {actual_bash_path}")
+            else:
+                # Create fresh file (either doesn't exist, or reset mode)
+                if bash_exists and reset_mode:
+                    logging.info(f"Reset mode: Overwriting existing bash script: {actual_bash_path}")
+                with open(actual_bash_path, "w", encoding='utf-8') as bash_file:
+                    bash_file.write("#!/bin/bash\n# Encoding: UTF-8\n\n")
+                logging.debug(f"Created fresh bash script: {actual_bash_path}")
+        
+        try:
+            os.chmod(actual_bash_path, 0o755)
+        except Exception as e:
+            logging.warning(f"Could not chmod {actual_bash_path}: {e}")
+    
+    # Handle batch script on Windows
+    if is_windows:
+        batch_exists = os.path.exists(actual_batch_path)
+        
+        with file_lock:
+            if batch_exists and effective_append:
+                # File exists, append with separator
+                with open(actual_batch_path, "a", encoding='utf-8') as batch_file:
+                    batch_file.write(f"\nREM ===== New BiblioForge Run: {datetime.now().isoformat()} =====\n\n")
+                logging.debug(f"Appending to existing batch script: {actual_batch_path}")
+            else:
+                # Create fresh file
+                if batch_exists and reset_mode:
+                    logging.info(f"Reset mode: Overwriting existing batch script: {actual_batch_path}")
+                with open(actual_batch_path, "w", encoding='utf-8') as batch_file:
+                    batch_file.write("@echo off\nchcp 65001 > nul\nsetlocal enabledelayedexpansion\n\nrem Rename script for Windows\n\n")
+                logging.debug(f"Created fresh batch script: {actual_batch_path}")
+    
+    return {
+        'bash_script': actual_bash_path if (not is_windows or actual_bash_path == rename_script_path_base or main_ext.lower() != '.bat') else None,
+        'batch_script': actual_batch_path if is_windows else None
+    }
 
 def initialize_rename_scripts(rename_script_path_base: str) -> Dict[str, Optional[str]]:
     # (Implementation from before)
@@ -590,124 +767,381 @@ def initialize_rename_scripts(rename_script_path_base: str) -> Dict[str, Optiona
     }
 
 def add_rename_command(
-    rename_script_paths: Dict[str, Optional[str]], 
-    source_path_original_file: str, 
-    actual_text_content_file_path: Optional[str], # Path to the .txt file (original or extracted)
-    target_dir_name: str, 
-    new_filename_base: str, 
-    output_dir_for_sorted_files: str, 
+    rename_script_paths: Dict[str, Optional[str]],
+    source_path_original_file: str,
+    actual_text_content_file_path: str,
+    target_dir_name: str,
+    new_filename_base: str,
+    output_dir_for_sorted_files: str,
     debug: bool = False
 ) -> Optional[Dict[str, Any]]:
-    if debug:
-        logging.debug(
-            f"add_rename_command: Inputs - source_path_original_file='{source_path_original_file}', "
-            f"actual_text_content_file_path='{actual_text_content_file_path}', "
-            f"target_dir_name='{target_dir_name}', new_filename_base='{new_filename_base}', "
-            f"output_dir_for_sorted_files='{output_dir_for_sorted_files}'"
-        )
-        logging.debug(f"add_rename_command: Script paths received: {rename_script_paths}")
-
-    target_dir_name_sanitized = sanitize_filename(target_dir_name.replace(',', ''))
-    new_filename_base_sanitized = sanitize_filename(new_filename_base)
-    
-    if not target_dir_name_sanitized: target_dir_name_sanitized = "UnknownAuthor"
-    if not new_filename_base_sanitized: new_filename_base_sanitized = "UnknownTitle"
-
-    full_target_dir_abs = Path(output_dir_for_sorted_files).resolve() / target_dir_name_sanitized
-    
-    # --- Handle the original file (PDF, EPUB, original .txt, etc.) ---
-    orig_ext = Path(source_path_original_file).suffix.lower()
-    final_new_filename_original = new_filename_base_sanitized + orig_ext
-    final_new_filename_original = re.sub(r'\.{2,}', '.', final_new_filename_original)
-
-    if debug:
-        logging.debug(f"add_rename_command: Original source='{source_path_original_file}'")
-        logging.debug(f"add_rename_command: Target directory for author='{str(full_target_dir_abs)}'")
-        logging.debug(f"add_rename_command: New filename for original file='{final_new_filename_original}'")
-
-    commands_written_to_any_script = False
-    abs_source_original_file = Path(source_path_original_file).resolve()
-
-    # Commands for the original file
-    bash_script_p_str = rename_script_paths.get('bash_script')
-    if bash_script_p_str:
-        if debug: logging.debug(f"add_rename_command: Appending main file move to BASH script: {bash_script_p_str}")
-        with file_lock:
-            with open(bash_script_p_str, "a", encoding='utf-8') as bash_f:
-                bash_f.write(f"\n# Renaming for: {os.path.basename(str(abs_source_original_file))}\n")
-                bash_f.write(f"mkdir -p {escape_special_chars(str(full_target_dir_abs))}\n")
-                bash_f.write(f"mv -v {escape_special_chars(str(abs_source_original_file))} {escape_special_chars(str(full_target_dir_abs / final_new_filename_original))}\n")
-        commands_written_to_any_script = True
-    
-    batch_script_p_str = rename_script_paths.get('batch_script')
-    if batch_script_p_str:
-        if debug: logging.debug(f"add_rename_command: Appending main file move to BATCH script: {batch_script_p_str}")
-        with file_lock:
-            with open(batch_script_p_str, "a", encoding='utf-8') as batch_f:
-                batch_f.write(f"\nREM Renaming for: {os.path.basename(str(abs_source_original_file))}\n")
-                # For Windows batch files, use a more robust escaping approach
-                batch_f.write(f"if not exist {_escape_for_batch(str(full_target_dir_abs))} mkdir {_escape_for_batch(str(full_target_dir_abs))}\n")
-                batch_f.write(f"move /Y {_escape_for_batch(str(abs_source_original_file))} {_escape_for_batch(str(full_target_dir_abs / final_new_filename_original))}\n")
-        commands_written_to_any_script = True
-
-    # --- Handle the associated text content file ---
-    # This is the .txt file that either *is* the original (if source was .txt) or was extracted.
-    # Its new name will be based on the original file's new name, but with .txt extension.
-    txt_target_filename_stem = Path(final_new_filename_original).stem
-    txt_target_path_abs = full_target_dir_abs / (txt_target_filename_stem + ".txt")
-
-    if actual_text_content_file_path and os.path.exists(actual_text_content_file_path):
-        abs_actual_text_content_file_path = Path(actual_text_content_file_path).resolve()
-        
-        # Check if the original file IS the text content file.
-        # This happens if source_path_original_file was already a .txt file and no separate extraction was made.
-        if abs_source_original_file == abs_actual_text_content_file_path:
-            if debug: logging.debug(f"add_rename_command: Original file '{str(abs_source_original_file)}' is also the text content file. Primary 'mv' command already handled it.")
-            # No additional 'mv' needed for the .txt file in this case.
-        else:
-            # This is a separate text file (e.g., extracted from PDF, or an _1.txt variant)
-            if debug: logging.debug(f"add_rename_command: Adding move for separate text content file '{str(abs_actual_text_content_file_path)}' to '{str(txt_target_path_abs)}'")
-            if bash_script_p_str:
-                with file_lock:
-                    with open(bash_script_p_str, "a", encoding='utf-8') as bash_f:
-                        bash_f.write(f"if [ -f {escape_special_chars(str(abs_actual_text_content_file_path))} ]; then\n")
-                        bash_f.write(f"  mv -v {escape_special_chars(str(abs_actual_text_content_file_path))} {escape_special_chars(str(txt_target_path_abs))}\n")
-                        bash_f.write(f"else\n")
-                        bash_f.write(f"  echo \"Info: Associated text file {escape_special_chars(str(abs_actual_text_content_file_path))} not found for move (original: {escape_special_chars(os.path.basename(str(abs_source_original_file)))})\" >&2\n")
-                        bash_f.write(f"fi\n")
-            if batch_script_p_str:
-                with file_lock:
-                    with open(batch_script_p_str, "a", encoding='utf-8') as batch_f:
-                        batch_f.write(f"if exist {_escape_for_batch(str(abs_actual_text_content_file_path))} (\n")
-                        batch_f.write(f"  move /Y {_escape_for_batch(str(abs_actual_text_content_file_path))} {_escape_for_batch(str(txt_target_path_abs))}\n")
-                        batch_f.write(f") else (\n")
-                        batch_f.write(f"  echo Info: Associated text file {_escape_for_batch(str(abs_actual_text_content_file_path))} not found for move ^(original: {_escape_for_batch(os.path.basename(str(abs_source_original_file)))}^) 1>&2\n")
-                        batch_f.write(f")\n")
-            commands_written_to_any_script = True # Ensure this is true if any command was written
-    elif debug:
-        logging.debug(f"add_rename_command: No 'actual_text_content_file_path' provided or it does not exist ('{actual_text_content_file_path}'). No separate .txt move generated.")
-
-    # Ensure newline after each file's block in the scripts if commands were written
-    if commands_written_to_any_script:
-        if bash_script_p_str:
-            with file_lock:
-                with open(bash_script_p_str, "a", encoding='utf-8') as bash_f: bash_f.write("\n")
-        if batch_script_p_str:
-            with file_lock:
-                with open(batch_script_p_str, "a", encoding='utf-8') as batch_f: batch_f.write("\n")
-
-        rename_details = {
-            "original_source_path": source_path_original_file,
-            "target_directory_path": str(full_target_dir_abs),
-            "new_filename_original_with_ext": final_new_filename_original,
-            "actual_text_content_source_path": str(abs_actual_text_content_file_path) if actual_text_content_file_path and os.path.exists(actual_text_content_file_path) else None,
-            "new_text_content_file_path": str(txt_target_path_abs) if actual_text_content_file_path and os.path.exists(actual_text_content_file_path) else None,
-        }
-        if debug: logging.debug(f"add_rename_command: Successfully formulated rename details: {rename_details}")
-        return rename_details
-    else:
-        if debug: logging.debug("add_rename_command: No script paths provided or no commands were applicable/written.")
+    """
+    Enhanced add_rename_command with duplicate detection and safe shell escaping.
+    Will not add duplicate commands if file is already in the script.
+    """
+    if not rename_script_paths:
+        if debug:
+            logging.debug("add_rename_command: No rename script paths provided")
         return None
+    
+    # **DUPLICATE CHECK**: Check if this file already has commands in the script
+    for script_type, script_path in rename_script_paths.items():
+        if script_path and os.path.exists(script_path):
+            if is_file_in_rename_script(script_path, source_path_original_file, actual_text_content_file_path):
+                if debug:
+                    logging.debug(f"add_rename_command: File '{source_path_original_file}' already in {script_type} script. Skipping duplicate.")
+                return None
+
+    try:
+        # Sanitize inputs
+        clean_target_dir = sanitize_filename(target_dir_name)
+        clean_filename_base = sanitize_filename(new_filename_base)
+        
+        if not clean_target_dir or not clean_filename_base:
+            if debug:
+                logging.warning(f"add_rename_command: Sanitization resulted in empty names. "
+                               f"Target: '{clean_target_dir}', Base: '{clean_filename_base}'")
+            return None
+
+        # Resolve paths safely
+        try:
+            from pathlib import Path
+            source_path_resolved = str(Path(source_path_original_file).resolve())
+            text_path_resolved = str(Path(actual_text_content_file_path).resolve())
+            output_base_resolved = str(Path(output_dir_for_sorted_files).resolve())
+        except Exception:
+            source_path_resolved = os.path.abspath(source_path_original_file)
+            text_path_resolved = os.path.abspath(actual_text_content_file_path)
+            output_base_resolved = os.path.abspath(output_dir_for_sorted_files)
+        
+        # Determine file extensions
+        source_ext = os.path.splitext(source_path_original_file)[1]
+        
+        # Build target paths
+        try:
+            from pathlib import Path
+            target_dir_full = Path(output_base_resolved) / clean_target_dir
+            new_source_filename = f"{clean_filename_base}{source_ext}"
+            new_text_filename = f"{clean_filename_base}.txt"
+            
+            target_source_path = target_dir_full / new_source_filename
+            target_text_path = target_dir_full / new_text_filename
+        except Exception:
+            target_dir_full = os.path.join(output_base_resolved, clean_target_dir)
+            new_source_filename = f"{clean_filename_base}{source_ext}"
+            new_text_filename = f"{clean_filename_base}.txt"
+            
+            target_source_path = os.path.join(target_dir_full, new_source_filename)
+            target_text_path = os.path.join(target_dir_full, new_text_filename)
+
+        # Create directory structure in script
+        mkdir_command = f"mkdir -p {safe_shell_path(str(target_dir_full))}"
+        
+        # Build move commands with proper escaping
+        source_move_cmd = (f"mv {safe_shell_path(source_path_resolved)} "
+                          f"{safe_shell_path(str(target_source_path))}")
+        
+        text_move_cmd = (f"mv {safe_shell_path(text_path_resolved)} "
+                        f"{safe_shell_path(str(target_text_path))}")
+
+        # Build info/error messages with safe escaping
+        source_info_msg = (f'echo {shell_escape_message(f"Moved: {os.path.basename(source_path_resolved)} -> {target_source_path}")}')
+        
+        text_info_msg = (f'echo {shell_escape_message(f"Moved: {os.path.basename(text_path_resolved)} -> {target_text_path}")}')
+        
+        text_not_found_msg = (f'echo {shell_escape_message(f"Info: Associated text file {text_path_resolved} not found for move (original: {source_path_resolved})")} >&2')
+
+        # Prepare command blocks for Unix shell script
+        unix_commands = [
+            f"# Moving files for: {shell_escape_message(os.path.basename(source_path_original_file))}",
+            mkdir_command,
+            "",
+            "# Move original file",
+            f"if [ -f {safe_shell_path(source_path_resolved)} ]; then",
+            f"  {source_move_cmd}",
+            f"  {source_info_msg}",
+            "else",
+            f'  echo {shell_escape_message(f"Error: Source file {source_path_resolved} not found")} >&2',
+            "fi",
+            "",
+            "# Move associated text file",
+            f"if [ -f {safe_shell_path(text_path_resolved)} ]; then",
+            f"  {text_move_cmd}",
+            f"  {text_info_msg}",
+            "else",
+            f"  {text_not_found_msg}",
+            "fi",
+            "",
+            "# ================================",
+            ""
+        ]
+
+        # Prepare command blocks for Windows batch file
+        batch_commands = [
+            f"REM Moving files for: {os.path.basename(source_path_original_file)}",
+            f'if not exist {escape_for_batch(str(target_dir_full))} mkdir {escape_for_batch(str(target_dir_full))}',
+            "",
+            "REM Move original file",
+            f'if exist {escape_for_batch(source_path_resolved)} (',
+            f'  move {escape_for_batch(source_path_resolved)} {escape_for_batch(str(target_source_path))}',
+            f'  echo Moved: {os.path.basename(source_path_resolved)} ^-^> {target_source_path}',
+            ") else (",
+            f'  echo Error: Source file {source_path_resolved} not found >&2',
+            ")",
+            "",
+            "REM Move associated text file", 
+            f'if exist {escape_for_batch(text_path_resolved)} (',
+            f'  move {escape_for_batch(text_path_resolved)} {escape_for_batch(str(target_text_path))}',
+            f'  echo Moved: {os.path.basename(text_path_resolved)} ^-^> {target_text_path}',
+            ") else (",
+            f'  echo Info: Associated text file {text_path_resolved} not found for move',
+            ")",
+            "",
+            "REM ================================",
+            ""
+        ]
+
+        # Write to script files with file locking
+        with file_lock:
+            for script_type, script_path in rename_script_paths.items():
+                if script_path and os.path.exists(os.path.dirname(script_path)):
+                    try:
+                        # Choose appropriate command set based on file extension
+                        if script_path.endswith('.bat'):
+                            commands_to_write = batch_commands
+                        else:
+                            commands_to_write = unix_commands
+                            
+                        with open(script_path, 'a', encoding='utf-8') as f:
+                            for cmd in commands_to_write:
+                                f.write(cmd + '\n')
+                        
+                        # Make shell script executable (Unix only)
+                        if script_path.endswith('.sh'):
+                            try:
+                                os.chmod(script_path, 0o755)
+                            except Exception:
+                                pass
+                            
+                        if debug:
+                            logging.debug(f"add_rename_command: Successfully wrote to {script_type}: {script_path}")
+                            
+                    except Exception as e:
+                        logging.error(f"add_rename_command: Failed to write to {script_type} script {script_path}: {e}")
+
+        # Return info about what was generated
+        return {
+            "source_original": source_path_original_file,
+            "source_target": str(target_source_path),
+            "text_original": actual_text_content_file_path,
+            "text_target": str(target_text_path),
+            "target_directory": str(target_dir_full),
+            "commands_generated": len(unix_commands)
+        }
+
+    except Exception as e:
+        logging.error(f"add_rename_command: Failed to generate rename commands: {e}", exc_info=debug)
+        return None
+    
+# --- Purge non-existent files from rename script ---
+def purge_rename_script(rename_script_path: str, debug: bool = False) -> Dict[str, int]:
+    """
+    Remove entries from rename script for files that no longer exist.
+    Also cleans up orphaned separator lines.
+    
+    Args:
+        rename_script_path: Path to the rename script to clean
+        debug: Enable debug logging
+    
+    Returns:
+        Dict with counts: {'total_blocks': int, 'removed_blocks': int, 'kept_blocks': int}
+    """
+    if not os.path.exists(rename_script_path):
+        if debug:
+            logging.debug(f"purge_rename_script: Script '{rename_script_path}' does not exist, nothing to purge.")
+        return {'total_blocks': 0, 'removed_blocks': 0, 'kept_blocks': 0}
+    
+    is_batch = rename_script_path.endswith('.bat')
+    
+    try:
+        with open(rename_script_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except Exception as e:
+        logging.error(f"purge_rename_script: Failed to read script '{rename_script_path}': {e}")
+        return {'total_blocks': 0, 'removed_blocks': 0, 'kept_blocks': 0}
+    
+    if not lines:
+        return {'total_blocks': 0, 'removed_blocks': 0, 'kept_blocks': 0}
+    
+    # Parse the script into blocks
+    blocks = []
+    current_block = []
+    current_block_files = []
+    header_lines = []
+    
+    in_header = True
+    
+    for line in lines:
+        # Check if this is the run separator (keep these)
+        if (line.strip().startswith('# ===== New BiblioForge Run:') or 
+            line.strip().startswith('REM ===== New BiblioForge Run:')):
+            
+            # Save any pending block
+            if current_block:
+                blocks.append({
+                    'lines': current_block,
+                    'files': current_block_files
+                })
+                current_block = []
+                current_block_files = []
+            
+            # Keep run separator
+            blocks.append({
+                'lines': [line, '\n'],  # Add blank line after separator
+                'files': [],
+                'is_run_separator': True
+            })
+            in_header = False
+            continue
+        
+        # Skip old-style per-file separators (orphaned)
+        if (line.strip() == '# ================================' or 
+            line.strip() == 'REM ================================'):
+            continue  # Just skip these entirely
+        
+        # Keep header lines (shebang, encoding, etc.)
+        if in_header and (line.startswith('#!') or 
+                         line.strip().startswith('# Encoding:') or
+                         line.strip().startswith('@echo off') or
+                         line.strip().startswith('chcp') or
+                         line.strip().startswith('setlocal') or
+                         line.strip().startswith('rem Rename script')):
+            header_lines.append(line)
+            continue
+        
+        in_header = False
+        current_block.append(line)
+        
+        # Extract file paths from move/mv commands
+        line_stripped = line.strip()
+        
+        if is_batch:
+            if line_stripped.startswith('if exist '):
+                match = re.search(r'if exist\s+(["\']?)([^"\'(]+)\1', line_stripped)
+                if match:
+                    file_path = match.group(2).strip()
+                    file_path = file_path.replace('^^', '^').replace('^&', '&')
+                    current_block_files.append(file_path)
+            elif line_stripped.startswith('move '):
+                match = re.search(r'move\s+(?:/Y\s+)?(["\']?)([^"\']+)\1', line_stripped)
+                if match:
+                    file_path = match.group(2).strip()
+                    file_path = file_path.replace('^^', '^').replace('^&', '&')
+                    current_block_files.append(file_path)
+        else:
+            if 'if [ -f' in line_stripped or 'if test -f' in line_stripped:
+                match = re.search(r'\[\s*-f\s+(["\']?)([^"\';\]]+)\1', line_stripped)
+                if match:
+                    file_path = match.group(2).strip()
+                    current_block_files.append(file_path)
+            elif line_stripped.startswith('mv '):
+                match = re.search(r'mv\s+(?:-v\s+)?(["\']?)([^"\']+)\1', line_stripped)
+                if match:
+                    file_path = match.group(2).strip()
+                    current_block_files.append(file_path)
+    
+    # Don't forget the last block
+    if current_block:
+        blocks.append({
+            'lines': current_block,
+            'files': current_block_files
+        })
+    
+    # Now check which blocks to keep
+    kept_blocks = header_lines.copy() if header_lines else []
+    total_blocks = 0
+    removed_blocks = 0
+    kept_blocks_count = 0
+    
+    for block in blocks:
+        # Always keep run separators
+        if block.get('is_run_separator'):
+            kept_blocks.extend(block['lines'])
+            continue
+        
+        # Skip blocks with no files (just comments/whitespace)
+        if not block.get('files'):
+            # But keep comment-only blocks if they have meaningful content
+            has_content = any(
+                line.strip() and not line.strip().startswith('#') and not line.strip().startswith('REM')
+                for line in block['lines']
+            )
+            if has_content or len(block['lines']) > 2:
+                kept_blocks.extend(block['lines'])
+            continue
+        
+        total_blocks += 1
+        
+        # Check if any of the files in this block exist
+        any_file_exists = False
+        for file_path in block['files']:
+            if os.path.exists(file_path):
+                any_file_exists = True
+                break
+        
+        if any_file_exists:
+            kept_blocks.extend(block['lines'])
+            kept_blocks_count += 1
+            if debug:
+                logging.debug(f"purge_rename_script: Keeping block with files: {block['files'][:2]}")
+        else:
+            removed_blocks += 1
+            if debug:
+                logging.debug(f"purge_rename_script: Removing block with non-existent files: {block['files'][:2]}")
+    
+    # Clean up excessive blank lines (more than 2 in a row)
+    cleaned_lines = []
+    blank_count = 0
+    for line in kept_blocks:
+        if line.strip() == '':
+            blank_count += 1
+            if blank_count <= 2:
+                cleaned_lines.append(line)
+        else:
+            blank_count = 0
+            cleaned_lines.append(line)
+    
+    # Write the cleaned script back
+    if removed_blocks > 0 or len(cleaned_lines) != len(lines):
+        try:
+            with file_lock:
+                temp_script = rename_script_path + '.tmp'
+                with open(temp_script, 'w', encoding='utf-8') as f:
+                    f.writelines(cleaned_lines)
+                
+                shutil.move(temp_script, rename_script_path)
+                
+                if not is_batch:
+                    try:
+                        os.chmod(rename_script_path, 0o755)
+                    except Exception:
+                        pass
+                
+                if removed_blocks > 0:
+                    logging.info(f"Cleaned rename script: removed {removed_blocks} blocks for non-existent files, kept {kept_blocks_count} blocks")
+                else:
+                    logging.info(f"Cleaned up formatting in rename script")
+        except Exception as e:
+            logging.error(f"purge_rename_script: Failed to write cleaned script: {e}")
+    else:
+        if debug:
+            logging.debug(f"purge_rename_script: No changes needed in '{rename_script_path}'")
+    
+    return {
+        'total_blocks': total_blocks,
+        'removed_blocks': removed_blocks,
+        'kept_blocks': kept_blocks_count
+    }
 
 def escape_special_chars(filename: str) -> str:
     """
@@ -736,7 +1170,7 @@ def escape_special_chars(filename: str) -> str:
     escaped = filename_str.replace("'", "'\\''")
     return f"'{escaped}'"
 
-def _escape_for_batch(path: str) -> str:
+def escape_for_batch(path: str) -> str:
     """
     Special escaping function for Windows batch files.
     Batch files have different escaping rules than bash.
@@ -762,6 +1196,35 @@ def _escape_for_batch(path: str) -> str:
     
     # Wrap in quotes for extra safety
     return f'"{escaped}"'
+
+def safe_shell_path(path_str: str) -> str:
+    """
+    Safely escape a file path for shell usage, handling special characters
+    like apostrophes, spaces, brackets, etc. Uses the safe import pattern.
+    """
+    if not path_str:
+        return "''"
+    
+    # Convert to string and normalize path
+    try:
+        from pathlib import Path
+        normalized_path = str(Path(path_str).resolve())
+    except Exception:
+        # Fallback if Path isn't available or path is invalid
+        normalized_path = str(path_str)
+    
+    # Use our safe escaping function
+    return escape_special_chars(normalized_path)
+
+def shell_escape_message(message: str) -> str:
+    """
+    Safely escape a message string for use in shell echo commands.
+    Handles complex strings with quotes, apostrophes, and special characters.
+    """
+    if not message:
+        return "''"
+    
+    return escape_special_chars(str(message))
     
 def add_rename_command_old(
     rename_script_paths: Dict[str, Optional[str]], 

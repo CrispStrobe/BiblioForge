@@ -8,15 +8,18 @@ from typing import Optional, List, Dict, Any, Union, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import time
+import platform
 import traceback # For more detailed error logging if needed
+from concurrent.futures import TimeoutError as FutureTimeoutError
+
 
 # --- Corrected Imports for sibling modules ---
 from extraction_manager import ExtractionManager
 from utils import (
     file_lock, parse_metadata, sanitize_filename, 
     validate_and_fix_year, add_rename_command, 
-    shutdown_flag, valid_author_name, initialize_rename_scripts,
-    setup_logging, _restore_logging_if_corrupted
+    shutdown_flag, valid_author_name, initialize_rename_scripts, safe_initialize_rename_scripts,
+    setup_logging, _restore_logging_if_corrupted, should_process_file, purge_rename_script
 )
 from llm_providers import (
     extract_metadata as llm_extract_metadata, 
@@ -55,17 +58,21 @@ class DocumentProcessor:
             setup_logging(2)  # Debug level
             logging.warning("Logging configuration was corrupted and has been restored.")
 
+    # --- MODIFIED: sort_author_with_retries with timeout ---
     def sort_author_with_retries(
         self, 
         author_name: str, 
         llm_provider_instance, 
         input_file: str, 
         max_template_retries: int = 3,
+        sort_timeout: int = 60,  # NEW: 1 minute timeout per sort attempt
         **kwargs_from_main
     ) -> str:
         """
-        Sort author name with multiple prompt templates and retry logic for consistency.
+        Sort author name with timeout protection.
         """
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        
         if not valid_author_name(author_name):
             return "UnknownAuthor"
         
@@ -78,52 +85,61 @@ class DocumentProcessor:
                     logging.debug(f"sort_author_with_retries: Pre-sorted comma-separated name '{author_name}' to '{formatted_name}'")
                 return formatted_name
         
-        # FIXED: Check if name is already in correct "Lastname Firstname" format
         def is_likely_correct_format(name: str) -> bool:
-            """Check if name is likely already in 'Lastname Firstname' format"""
             parts = name.split()
-            if len(parts) == 2:
-                lastname, firstname = parts
-                # Basic heuristics: both parts capitalized, reasonable length
-                if (lastname[0].isupper() and firstname[0].isupper() and 
-                    2 <= len(lastname) <= 20 and 2 <= len(firstname) <= 20 and
-                    lastname.isalpha() and firstname.replace('-', '').replace("'", '').isalpha()):
+            if len(parts) >= 2:
+                lastname = parts[0]
+                firstname_parts = " ".join(parts[1:])
+                
+                is_lastname_valid = lastname.replace('-', '').replace("'", '').isalpha()
+                is_firstname_valid = firstname_parts.replace('-', '').replace("'", '').isalpha()
+
+                if (lastname[0].isupper() and firstname_parts[0].isupper() and
+                    2 <= len(lastname) <= 30 and 2 <= len(firstname_parts) <= 30 and
+                    is_lastname_valid and is_firstname_valid):
                     return True
             return False
         
         if is_likely_correct_format(author_name):
             if self._debug:
-                logging.debug(f"sort_author_with_retries: '{author_name}' already appears to be in correct 'Lastname Firstname' format")
+                logging.debug(f"sort_author_with_retries: '{author_name}' already in correct format")
             return author_name
         
         all_results = []
         
-        # Try different prompt templates
         for template_idx in range(max_template_retries):
             if shutdown_flag.is_set():
                 break
-                
+                    
             if self._debug:
-                logging.debug(f"sort_author_with_retries: Trying template {template_idx} for '{author_name}' (file: {input_file})")
+                logging.debug(f"sort_author_with_retries: Trying template {template_idx} for '{author_name}'")
             
             try:
-                sorted_name = sort_author_names(
-                    author_names_input=author_name,
-                    provider_arg=llm_provider_instance,
-                    verbose=self._debug,
-                    filename_for_logging=input_file,
-                    prompt_template_index=template_idx,
-                    **kwargs_from_main
-                )
+                # Use ThreadPoolExecutor with timeout for sort call
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        sort_author_names,
+                        author_names_input=author_name,
+                        provider_arg=llm_provider_instance,
+                        verbose=self._debug,
+                        filename_for_logging=input_file,
+                        prompt_template_index=template_idx,
+                        **kwargs_from_main
+                    )
+                    
+                    try:
+                        sorted_name = future.result(timeout=sort_timeout)
+                    except FutureTimeoutError:
+                        logging.warning(f"sort_author_with_retries: Sort timed out after {sort_timeout}s for '{author_name}' (template {template_idx})")
+                        continue
                 
-                # FIXED: Accept results even if they're the same as input (already correctly formatted)
                 if sorted_name and valid_author_name(sorted_name):
                     all_results.append(sorted_name)
                     if self._debug:
-                        logging.debug(f"sort_author_with_retries: Template {template_idx} result: '{sorted_name}' (same as input: {sorted_name == author_name})")
+                        logging.debug(f"sort_author_with_retries: Template {template_idx} result: '{sorted_name}'")
                 else:
                     if self._debug:
-                        logging.warning(f"sort_author_with_retries: Template {template_idx} returned invalid result: '{sorted_name}'")
+                        logging.warning(f"sort_author_with_retries: Template {template_idx} returned invalid: '{sorted_name}'")
                             
             except Exception as e:
                 if self._debug:
@@ -132,45 +148,45 @@ class DocumentProcessor:
         
         if not all_results:
             if self._debug:
-                logging.warning(f"sort_author_with_retries: All template attempts failed for '{author_name}', using original")
+                logging.warning(f"sort_author_with_retries: All attempts failed for '{author_name}'")
             return author_name if valid_author_name(author_name) else "UnknownAuthor"
         
         # Analyze results for consistency
         if len(set(all_results)) == 1:
-            # All templates agree - high confidence
-            final_result = all_results[0]
-            if self._debug:
-                logging.debug(f"sort_author_with_retries: All templates agreed on: '{final_result}'")
-            return final_result
+            return all_results[0]
         else:
-            # Results differ - use majority voting or most reasonable result
             from collections import Counter
             result_counts = Counter(all_results)
             most_common = result_counts.most_common(1)[0]
             
-            if most_common[1] > 1:  # More than one occurrence
-                final_result = most_common[0]
-                if self._debug:
-                    logging.debug(f"sort_author_with_retries: Using majority result: '{final_result}' (appeared {most_common[1]} times out of {len(all_results)})")
+            if most_common[1] > 1:
+                return most_common[0]
             else:
-                # All results are unique - prefer results that look more like "Lastname Firstname"
                 best_result = all_results[0]
                 for result in all_results:
                     if is_likely_correct_format(result):
                         best_result = result
                         break
-                
-                final_result = best_result
-                if self._debug:
-                    logging.info(f"sort_author_with_retries: All templates differ {all_results}, using heuristic choice: '{final_result}'")
-            
-            return final_result
+                return best_result
 
     def _extract_pdf_metadata(self, file_path: str) -> Dict[str, Any]:
         metadata = {}
         if PdfReader is None:
             if self._debug: logging.debug(f"_extract_pdf_metadata: pypdf not available for {file_path}.")
             return metadata
+        
+        # Check file size before attempting to read
+        try:
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                if self._debug: 
+                    logging.debug(f"_extract_pdf_metadata: Skipping 0-byte file: {file_path}")
+                return metadata
+        except OSError as e:
+            if self._debug: 
+                logging.debug(f"_extract_pdf_metadata: Cannot access file {file_path}: {e}")
+            return metadata
+        
         try:
             with open(file_path, "rb") as f:
                 reader = PdfReader(f)
@@ -191,11 +207,24 @@ class DocumentProcessor:
         if epub is None:
             if self._debug: logging.debug(f"_extract_epub_metadata: ebooklib not available for {file_path}.")
             return metadata
+        
+        # Check file size before attempting to read
+        try:
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                if self._debug: 
+                    logging.debug(f"_extract_epub_metadata: Skipping 0-byte file: {file_path}")
+                return metadata
+        except OSError as e:
+            if self._debug: 
+                logging.debug(f"_extract_epub_metadata: Cannot access file {file_path}: {e}")
+            return metadata
+        
         try:
             book = epub.read_epub(file_path)
             dc_fields = ['title', 'creator', 'subject', 'description', 'publisher', 
-                         'contributor', 'date', 'type', 'format', 'identifier', 
-                         'source', 'language', 'relation', 'coverage', 'rights']
+                        'contributor', 'date', 'type', 'format', 'identifier', 
+                        'source', 'language', 'relation', 'coverage', 'rights']
             for field in dc_fields:
                 meta_values = book.get_metadata('DC', field)
                 if meta_values:
@@ -217,21 +246,41 @@ class DocumentProcessor:
         metadata = {}
         try:
             file_info = Path(file_path)
-            metadata.update({
-                'filename': file_info.name,
-                'size': file_info.stat().st_size,
-                'modified_datetime': datetime.datetime.fromtimestamp(file_info.stat().st_mtime).isoformat()
-            })
             
+            # Get basic file stats
+            try:
+                file_stat = file_info.stat()
+                file_size = file_stat.st_size
+                
+                metadata.update({
+                    'filename': file_info.name,
+                    'size': file_size,
+                    'modified_datetime': datetime.datetime.fromtimestamp(file_stat.st_mtime).isoformat()
+                })
+                
+                # Skip format-specific metadata extraction for 0-byte files
+                if file_size == 0:
+                    if self._debug: 
+                        logging.debug(f"_extract_document_inherent_metadata: Skipping format-specific metadata for 0-byte file: {file_path}")
+                    return metadata
+                    
+            except OSError as e:
+                if self._debug: 
+                    logging.debug(f"_extract_document_inherent_metadata: Cannot stat file {file_path}: {e}")
+                return metadata
+            
+            # Extract format-specific metadata only if file has content
             file_suffix_lower = file_info.suffix.lower()
             if file_suffix_lower == '.pdf':
                 metadata.update(self._extract_pdf_metadata(file_path))
             elif file_suffix_lower == '.epub':
                 metadata.update(self._extract_epub_metadata(file_path))
             
-            if self._debug: logging.debug(f"_extract_document_inherent_metadata: Extracted for {file_path}: {str(metadata)[:200]}...")
+            if self._debug: 
+                logging.debug(f"_extract_document_inherent_metadata: Extracted for {file_path}: {str(metadata)[:200]}...")
         except Exception as e:
-            if self._debug: logging.error(f"_extract_document_inherent_metadata: Failed for {file_path}: {e}", exc_info=self._debug)
+            if self._debug: 
+                logging.error(f"_extract_document_inherent_metadata: Failed for {file_path}: {e}", exc_info=self._debug)
         return metadata
         
     def _get_unique_output_path(self, input_file: str, output_dir_base_str: Optional[str] = None, noskip: bool = False) -> str:
@@ -310,7 +359,56 @@ class DocumentProcessor:
             return True
         
         return False
+    
+    def _preprocess_author_name(self, author_name: str) -> str:
+        """
+        Cleans and pre-formats author names before more complex validation or LLM sorting.
+        This function handles the most common "dirty" formats.
+        """
+        if not author_name or not isinstance(author_name, str):
+            return "" # Return empty string to be caught by validation
+        
+        # Strip XML tags and common LLM boilerplate text
+        cleaned_name = re.sub(r"^\s*<AUTHOR>\s*|\s*</AUTHOR>\s*$", "", author_name, flags=re.IGNORECASE).strip()
+        cleaned_name = re.sub(r"^(By|Author|Editor|Written by)[s]?:\s*", "", cleaned_name, flags=re.IGNORECASE).strip()
 
+        # If multiple authors are listed, take only the first one for simplicity in sorting and filing.
+        # This splits by common delimiters like ';', '&', ' and ', or a newline.
+        cleaned_name = re.split(r'\s*;\s*|\s*&\s*|\s+and\s+|\s*\n\s*', cleaned_name, flags=re.IGNORECASE)[0].strip()
+
+        # Directly handle "Lastname, Firstname" format, which is a very common, reliable pattern.
+        if ',' in cleaned_name:
+            parts = [p.strip() for p in cleaned_name.split(',', 1)]
+            if len(parts) == 2 and parts[0] and parts[1]:
+                # Reconstruct as "Lastname Firstname" and return, as it's likely already correct.
+                return f"{parts[0]} {parts[1]}"
+        
+        return cleaned_name
+
+    def _is_valid_title(self, title: str) -> bool:
+        """
+        Checks if the extracted title is a valid, meaningful title and not a placeholder.
+        """
+        if not title or not isinstance(title, str) or len(title.strip()) < 3:
+            return False
+        
+        lower_title = title.lower().strip()
+        
+        # List of common invalid or placeholder patterns returned by LLMs
+        invalid_patterns = [
+            r'^untitled$', r'^unknown$', r'^no title$', r'^title$',
+            r'^document$', r'^untitled document$', r'extracted publication title',
+            r'^publication title$', r'the exact title of the publication',
+            r'^[.,\-_/\s]+$' # Title is only punctuation or whitespace
+        ]
+        
+        for pattern in invalid_patterns:
+            if re.search(pattern, lower_title):
+                return False
+        
+        return True
+
+    # --- MODIFIED: process_llm_metadata_with_retries with threading timeout ---
     def process_llm_metadata_with_retries(
         self,
         text: str, 
@@ -318,155 +416,140 @@ class DocumentProcessor:
         llm_provider_instance, 
         temperature_for_metadata: float,
         max_tokens_for_metadata: int,
+        llm_timeout: int = 120,  # 2 minute timeout per LLM call
         **kwargs_from_main
     ) -> Optional[Dict[str, str]]:
         """
-        Process LLM metadata with enhanced retry logic for invalid author names.
+        Enhanced with per-call timeout using threading (works in worker threads).
         """
-        max_llm_metadata_attempts = 3
-        max_author_retry_attempts = 3  # Additional retries specifically for bad author names
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
         
-        for template_attempt in range(max_llm_metadata_attempts):
+        max_llm_template_attempts = 3
+        
+        for template_attempt in range(max_llm_template_attempts):
             if shutdown_flag.is_set():
+                logging.info("Shutdown detected, aborting LLM metadata processing.")
                 break
                 
             if self._debug:
-                logging.debug(f"DS_Proc: Processing LLM metadata for '{input_file}', template attempt {template_attempt + 1}/{max_llm_metadata_attempts}")
-            
-            # Try up to max_author_retry_attempts for each template
-            for author_retry in range(max_author_retry_attempts):
-                current_llm_response_str = llm_extract_metadata(
-                    text=text, 
-                    filename=input_file,
-                    llm_provider_arg=llm_provider_instance,
-                    verbose=self._debug,
-                    temperature_arg=temperature_for_metadata,
-                    max_tokens_arg=max_tokens_for_metadata,
-                    prompt_template_index_to_try=template_attempt,
-                    **kwargs_from_main
-                )
+                logging.debug(f"DS_Proc: Metadata attempt {template_attempt + 1}/{max_llm_template_attempts} for '{os.path.basename(input_file)}'")
 
-                if not current_llm_response_str:
-                    if self._debug:
-                        logging.warning(f"DS_Proc: LLM returned no metadata string for '{input_file}' on template {template_attempt + 1}, author retry {author_retry + 1}")
-                    break  # Try next template if no response
-                
-                if self._debug:
-                    logging.debug(f"DS_Proc: LLM returned for metadata (template {template_attempt + 1}, author retry {author_retry + 1}): '{current_llm_response_str[:150]}...' for '{input_file}'")
-                
-                parsed_meta = parse_metadata(current_llm_response_str, filename=os.path.basename(input_file))
-                
-                if not parsed_meta:
-                    if self._debug:
-                        logging.warning(f"DS_Proc: Failed to parse LLM metadata for '{input_file}' (template {template_attempt + 1}, author retry {author_retry + 1})")
-                    break  # Try next template if parsing failed
-                
-                # Validate year
-                year_str_from_llm = parsed_meta.get('year')
-                validated_year = validate_and_fix_year(year_str_from_llm)
-                parsed_meta['year'] = validated_year
-                
-                # Get and validate author
-                author_to_sort = parsed_meta.get('author', "UnknownAuthor")
-                
-                # Check if author contains invalid keywords
-                if self.has_invalid_author_keywords(author_to_sort):
-                    if self._debug:
-                        logging.warning(f"DS_Proc: Author '{author_to_sort}' contains invalid keywords for '{input_file}' (template {template_attempt + 1}, author retry {author_retry + 1}). Retrying...")
-                    
-                    # If this is not the last author retry, continue to next author retry
-                    if author_retry < max_author_retry_attempts - 1:
-                        continue
-                    else:
-                        # If this was the last author retry for this template, break to try next template
-                        if self._debug:
-                            logging.warning(f"DS_Proc: Exhausted author retries for template {template_attempt + 1} on '{input_file}'")
-                        break
-                
-                # Author seems valid, proceed with author sorting
-                corrected_author = "UnknownAuthor"
-                if valid_author_name(author_to_sort):
-                    if self._debug:
-                        logging.debug(f"DS_Proc: Attempting enhanced author sorting for '{author_to_sort}' for '{input_file}' (template {template_attempt + 1}, author retry {author_retry + 1})")
-                    
-                    corrected_author = self.sort_author_with_retries(
-                        author_name=author_to_sort,
-                        llm_provider_instance=llm_provider_instance,
-                        input_file=input_file,
-                        max_retries=2,  # 2 retries for sorting consistency
+            try:
+                # Use ThreadPoolExecutor with timeout for LLM call
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        llm_extract_metadata,
+                        text=text, 
+                        filename=input_file,
+                        llm_provider_arg=llm_provider_instance,
+                        verbose=self._debug,
+                        prompt_template_index_to_try=template_attempt,
                         **kwargs_from_main
                     )
                     
+                    try:
+                        llm_response_str = future.result(timeout=llm_timeout)
+                    except FutureTimeoutError:
+                        logging.error(f"DS_Proc: LLM call timed out after {llm_timeout}s for '{os.path.basename(input_file)}' (template {template_attempt})")
+                        continue
+                
+                if not llm_response_str:
                     if self._debug:
-                        logging.debug(f"DS_Proc: Enhanced sorted author name: '{corrected_author}' for '{input_file}'")
-                else:
-                    corrected_author = author_to_sort if valid_author_name(author_to_sort) else "UnknownAuthor"
+                        logging.warning(f"DS_Proc: LLM returned empty response on template {template_attempt}")
+                    continue
+
+                # Rest of existing logic
+                parsed_meta = parse_metadata(llm_response_str, filename=os.path.basename(input_file))
+                if not parsed_meta:
+                    if self._debug:
+                        logging.warning(f"DS_Proc: Failed to parse LLM response on template {template_attempt}")
+                    continue
+
+                raw_author = parsed_meta.get('author', "")
+                preprocessed_author = self._preprocess_author_name(raw_author)
                 
-                parsed_meta['author'] = corrected_author
-                
-                # Final validation for sorting
-                title_from_llm = parsed_meta.get('title', "")
-                
-                is_valid_for_sorting = (
-                    valid_author_name(corrected_author) and
-                    title_from_llm and
-                    title_from_llm.lower() not in ['unknowntitle', 'unknown', 'the full title', ''] and
-                    validated_year != "UnknownYear"
+                raw_title = parsed_meta.get('title', "")
+                validated_year = validate_and_fix_year(parsed_meta.get('year'))
+
+                if not self._is_valid_title(raw_title):
+                    if self._debug:
+                        logging.warning(f"DS_Proc: Invalid title '{raw_title}' on template {template_attempt}")
+                    continue
+
+                if self.has_invalid_author_keywords(preprocessed_author):
+                    if self._debug:
+                        logging.warning(f"DS_Proc: Invalid author '{preprocessed_author}' on template {template_attempt}")
+                    continue
+
+                if self._debug:
+                    logging.debug(f"DS_Proc: Initial validation passed. Performing advanced sort.")
+
+                final_author = self.sort_author_with_retries(
+                    author_name=preprocessed_author,
+                    llm_provider_instance=llm_provider_instance,
+                    input_file=input_file,
+                    **kwargs_from_main
+                )
+
+                final_metadata = {
+                    'title': raw_title,
+                    'year': validated_year,
+                    'author': final_author,
+                    'language': parsed_meta.get('language', 'un')
+                }
+
+                is_fully_valid = (
+                    valid_author_name(final_metadata['author']) and
+                    self._is_valid_title(final_metadata['title']) and
+                    final_metadata['year'] != "UnknownYear"
                 )
                 
-                if is_valid_for_sorting:
-                    if self._debug:
-                        logging.info(f"DS_Proc: LLM metadata is VALID for sorting '{input_file}' (template {template_attempt + 1}, author retry {author_retry + 1})")
-                    return parsed_meta
+                if is_fully_valid:
+                    logging.info(f"DS_Proc: Successfully extracted metadata for '{os.path.basename(input_file)}'")
+                    return final_metadata
                 else:
                     if self._debug:
-                        logging.warning(f"DS_Proc: LLM metadata is INVALID for sorting '{input_file}' (template {template_attempt + 1}, author retry {author_retry + 1}). Author='{corrected_author}', Title='{title_from_llm}', Year='{validated_year}'")
-                    
-                    # If author is the main problem and we have retries left, continue
-                    if not valid_author_name(corrected_author) and author_retry < max_author_retry_attempts - 1:
-                        continue
-                    else:
-                        break  # Try next template
-        
-        # All attempts failed
-        if self._debug:
-            logging.warning(f"DS_Proc: All LLM attempts failed to produce valid metadata for '{input_file}'")
-        
+                        logging.warning(f"DS_Proc: Final validation failed for template {template_attempt}")
+
+            except Exception as e:
+                logging.error(f"DS_Proc: Error in LLM metadata extraction: {e}", exc_info=self._debug)
+                continue
+
+        logging.error(f"DS_Proc: All {max_llm_template_attempts} attempts failed for '{os.path.basename(input_file)}'")
         return None
 
-
     def _process_single_file(self, input_file: str,
-                         current_output_dir_base_str: str,
-                         method: Optional[str],
-                         ocr_method: Optional[str],
-                         password: Optional[str],
-                         extract_tables: bool,
-                         force_ocr: bool,
-                         noskip: bool,
-                         effective_sort_flag: bool,
-                         rename_script_base_path_for_unparseables: Optional[str],
-                         initialized_rename_script_paths: Optional[Dict[str, Optional[str]]],
-                         llm_provider_instance: Optional[LLMProvider],
-                         temperature_for_metadata: float,
-                         max_tokens_for_metadata: int,
-                         **kwargs_from_main) -> Dict[str, Any]:
+                        current_output_dir_base_str: str,
+                        method: Optional[str],
+                        ocr_method: Optional[str],
+                        password: Optional[str],
+                        extract_tables: bool,
+                        force_ocr: bool,
+                        noskip: bool,
+                        effective_sort_flag: bool,
+                        rename_script_base_path_for_unparseables: Optional[str],
+                        initialized_rename_script_paths: Optional[Dict[str, Optional[str]]],
+                        llm_provider_instance: Optional[LLMProvider],
+                        temperature_for_metadata: float,
+                        max_tokens_for_metadata: int,
+                        **kwargs_from_main) -> Dict[str, Any]:
 
-        # logging.critical(f"DEBUG: >>>>>>> Attempting to process: {input_file} <<<<<<<")
         debug = self._debug
         
         if self._debug:
             logging.debug(f"DS_Proc: Starting _process_single_file for: '{input_file}'")
+            logging.debug(f"Processing: {os.path.basename(input_file)}")
 
-        # INITIALIZE result FIRST - this is the critical fix!
+        # INITIALIZE result FIRST
         result: Dict[str, Any] = {
             'success': False, 'text': '', 'output_path': None, 'skipped': False,
             'error': None, 'tables': [], 'metadata_llm': None, 'renamed_info': None,
             'input_file': input_file, 'inherent_metadata': {}
         }
         
-        actual_text_content_path_for_llm_and_rename: Optional[str] = None # Initialize here
+        actual_text_content_path_for_llm_and_rename: Optional[str] = None
 
-        # --- EARLY FILE VALIDATION (now that result is initialized) ---
+        # --- EARLY FILE VALIDATION ---
         try:
             file_path = Path(input_file)
             if not file_path.exists():
@@ -475,20 +558,19 @@ class DocumentProcessor:
                 result['error'] = error_message
                 result['success'] = False
                 return result
-                
+                    
             file_size = file_path.stat().st_size
             if file_size == 0:
                 error_message = f"File '{input_file}' is 0 bytes and cannot be processed."
                 logging.warning(f"DS_Proc: {error_message}")
                 result['error'] = error_message
                 result['success'] = False
-                # Optionally, still attempt to get inherent metadata if useful
                 try: 
                     result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
                 except: 
                     pass
                 return result
-                
+                    
             # Check for very small files that might be corrupted
             if file_size < 100 and not input_file.lower().endswith(('.txt', '.md')):
                 error_message = f"File '{input_file}' is suspiciously small ({file_size} bytes) and might be corrupted."
@@ -496,7 +578,7 @@ class DocumentProcessor:
                 result['error'] = error_message
                 result['success'] = False
                 return result
-                
+                    
         except OSError as e_size:
             error_message = f"Could not access file '{input_file}': {e_size}"
             logging.warning(f"DS_Proc: {error_message}")
@@ -504,17 +586,81 @@ class DocumentProcessor:
             result['success'] = False
             return result
         
-        # --- Start of Text Extraction Logic (simplified from your provided code) ---
+        # --- NEW: Determine skip logic BEFORE any processing ---
         if shutdown_flag.is_set():
             result['error'] = "Processing aborted due to shutdown signal"
             return result
+        
         try:
             is_source_direct_text_type = input_file.lower().endswith(('.txt', '.md'))
             text_loaded_from_file = False
             
+            # Determine output path
             if is_source_direct_text_type:
-                result['output_path'] = input_file
+                determined_extraction_output_path = input_file
                 actual_text_content_path_for_llm_and_rename = input_file
+            else:
+                determined_extraction_output_path = self._get_unique_output_path(
+                    input_file, current_output_dir_base_str, noskip
+                )
+                actual_text_content_path_for_llm_and_rename = determined_extraction_output_path
+            
+            result['output_path'] = determined_extraction_output_path
+            
+            # **NEW: Check what processing should be done**
+            rename_script_to_check = None
+            if initialized_rename_script_paths:
+                # Use the first available script path for checking
+                rename_script_to_check = (
+                    initialized_rename_script_paths.get('bash_script') or 
+                    initialized_rename_script_paths.get('batch_script')
+                )
+            
+            skip_info = should_process_file(
+                input_file=input_file,
+                output_txt_path=determined_extraction_output_path,
+                rename_script_path=rename_script_to_check,
+                sort_enabled=effective_sort_flag,
+                noskip=noskip
+            )
+            
+            if self._debug:
+                logging.debug(f"DS_Proc: Skip info for '{input_file}': {skip_info}")
+            
+            # **Case 1: Skip entirely** (txt exists AND in rename script)
+            if skip_info['skip_entirely']:
+                logging.info(f"Skipping '{input_file}' - already processed and in rename script.")
+                result['skipped'] = True
+                result['success'] = True
+                try:
+                    result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
+                except:
+                    pass
+                return result
+            
+            # **Case 2: Skip extraction only** (txt exists but NOT in rename script)
+            if skip_info['skip_extraction'] and not is_source_direct_text_type:
+                if self._debug:
+                    logging.debug(f"DS_Proc: Loading existing text from '{determined_extraction_output_path}' for '{input_file}'")
+                try:
+                    with open(determined_extraction_output_path, 'r', encoding='utf-8') as f:
+                        result['text'] = f.read()
+                    if result['text'].strip():
+                        result['success'] = True
+                        text_loaded_from_file = True
+                        if self._debug:
+                            logging.debug(f"DS_Proc: Successfully loaded {len(result['text'])} chars from existing file")
+                    else:
+                        if self._debug:
+                            logging.warning(f"DS_Proc: Existing text file is empty, will re-extract")
+                        result['success'] = False
+                except Exception as e_load:
+                    if self._debug:
+                        logging.warning(f"DS_Proc: Failed to load existing text file: {e_load}, will re-extract")
+                    result['success'] = False
+            
+            # **Case 3: Full extraction** (txt doesn't exist or failed to load)
+            if is_source_direct_text_type and not text_loaded_from_file:
                 try:
                     with open(input_file, 'r', encoding='utf-8', errors='replace') as f:
                         result['text'] = f.read()
@@ -527,89 +673,73 @@ class DocumentProcessor:
                     result['error'] = f"Failed to read source text file '{input_file}': {e_read_txt}"
             
             if not text_loaded_from_file and not is_source_direct_text_type:
-                determined_extraction_output_path = self._get_unique_output_path(input_file, current_output_dir_base_str, noskip)
-                result['output_path'] = determined_extraction_output_path
-                actual_text_content_path_for_llm_and_rename = determined_extraction_output_path
-
-                if not noskip and os.path.exists(determined_extraction_output_path):
-                    if not effective_sort_flag:
-                        logging.info(f"Skipping '{input_file}' - output '{determined_extraction_output_path}' exists, noskip=False, and sort=False.")
-                        result['skipped'] = True
-                        result['success'] = True
-                        try: 
-                            result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
-                        except: 
-                            pass
-                        return result
-                    else:
-                        try:
-                            with open(determined_extraction_output_path, 'r', encoding='utf-8') as f:
-                                result['text'] = f.read()
-                            if result['text'].strip():
-                                result['success'] = True
-                                text_loaded_from_file = True
-                            else: 
-                                result['success'] = False # Will trigger re-extraction
-                        except Exception: 
-                            result['success'] = False # Will trigger re-extraction
+                if self._debug:
+                    logging.debug(f"DS_Proc: Performing extraction for '{input_file}'")
                 
-                if not text_loaded_from_file:
-                    extraction_result = self.manager.extract(
-                        input_path=input_file, output_path=actual_text_content_path_for_llm_and_rename,
-                        method=method, ocr_method=ocr_method, password=password,
-                        extract_tables=extract_tables, force_ocr=force_ocr,
-                        temperature=temperature_for_metadata, max_tokens=max_tokens_for_metadata,
-                        **kwargs_from_main
-                    )
-                    result['text'] = extraction_result.get('text', '')
-                    result['success'] = extraction_result.get('success', False)
-                    result['tables'] = extraction_result.get('tables', [])
-                    if extraction_result.get('error'): 
-                        result['error'] = extraction_result.get('error')
-                    if result['success']: 
-                        result['output_path'] = actual_text_content_path_for_llm_and_rename
-        # --- End of Text Extraction Logic (simplified) ---
+                extraction_result = self.manager.extract(
+                    input_path=input_file, 
+                    output_path=actual_text_content_path_for_llm_and_rename,
+                    method=method, ocr_method=ocr_method, password=password,
+                    extract_tables=extract_tables, force_ocr=force_ocr,
+                    temperature=temperature_for_metadata, max_tokens=max_tokens_for_metadata,
+                    **kwargs_from_main
+                )
+                result['text'] = extraction_result.get('text', '')
+                result['success'] = extraction_result.get('success', False)
+                result['tables'] = extraction_result.get('tables', [])
+                if extraction_result.get('error'): 
+                    result['error'] = extraction_result.get('error')
+                if result['success']: 
+                    result['output_path'] = actual_text_content_path_for_llm_and_rename
             
-            # --- Enhanced Sorting Logic with Author-specific Retries ---
+            # --- LLM Metadata Extraction and Sorting ---
             if result['success'] and result['text'] and actual_text_content_path_for_llm_and_rename and effective_sort_flag:
-                if llm_provider_instance:
-                    if not initialized_rename_script_paths and self._debug:
-                        logging.warning(f"DS_Proc: Sort is True for '{input_file}', but rename scripts not initialized. Cannot generate rename commands.")
+                # **NEW: Check if we should skip LLM processing**
+                if skip_info.get('skip_llm_and_rename', False):
+                    if self._debug:
+                        logging.debug(f"DS_Proc: Skipping LLM and rename for '{input_file}' - already in script")
+                else:
+                    if llm_provider_instance:
+                        if not initialized_rename_script_paths and self._debug:
+                            logging.warning(f"DS_Proc: Sort is True for '{input_file}', but rename scripts not initialized. Cannot generate rename commands.")
 
-                    final_parsed_llm_meta = self.process_llm_metadata_with_retries(
-                        text=result["text"],
-                        input_file=input_file,
-                        llm_provider_instance=llm_provider_instance,
-                        temperature_for_metadata=temperature_for_metadata,
-                        max_tokens_for_metadata=max_tokens_for_metadata,
-                        **kwargs_from_main
-                    )
+                        final_parsed_llm_meta = self.process_llm_metadata_with_retries(
+                            text=result["text"],
+                            input_file=input_file,
+                            llm_provider_instance=llm_provider_instance,
+                            temperature_for_metadata=temperature_for_metadata,
+                            max_tokens_for_metadata=max_tokens_for_metadata,
+                            llm_timeout=180,  # 3 minute timeout
+                            **kwargs_from_main
+                        )
 
-                    if final_parsed_llm_meta:
-                        result['metadata_llm'] = final_parsed_llm_meta
-                        if initialized_rename_script_paths:
-                            if self._debug:
-                                logging.debug(f"DS_Proc: Generating rename command for '{input_file}' with Author='{final_parsed_llm_meta['author']}', Year='{final_parsed_llm_meta['year']}', Title='{final_parsed_llm_meta['title']}'")
-                            
-                            rename_info_dict = add_rename_command(
-                                rename_script_paths=initialized_rename_script_paths,
-                                source_path_original_file=input_file,
-                                actual_text_content_file_path=actual_text_content_path_for_llm_and_rename,
-                                target_dir_name=final_parsed_llm_meta['author'],
-                                new_filename_base=f"{final_parsed_llm_meta['year']} {final_parsed_llm_meta['title']}",
-                                output_dir_for_sorted_files=str(current_output_dir_base_str),
-                                debug=self._debug
-                            )
-                            result["renamed_info"] = rename_info_dict
-                            if self._debug and rename_info_dict:
-                                logging.debug(f"DS_Proc: Rename command generated for {input_file}. Info: {rename_info_dict}")
-                    else:
-                        logging.warning(f"DS_Proc: All enhanced LLM attempts (including author-specific retries) failed for '{input_file}'")
-                        if rename_script_base_path_for_unparseables:
-                            unparseables_path = Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst"
-                            with file_lock:
-                                with open(unparseables_path, "a", encoding='utf-8') as f_unp:
-                                    f_unp.write(f"{input_file} - All LLM attempts (including author retries) failed to yield sortable metadata.\n")
+                        if final_parsed_llm_meta:
+                            result['metadata_llm'] = final_parsed_llm_meta
+                            if initialized_rename_script_paths:
+                                if self._debug:
+                                    logging.debug(f"DS_Proc: Generating rename command for '{input_file}' with Author='{final_parsed_llm_meta['author']}', Year='{final_parsed_llm_meta['year']}', Title='{final_parsed_llm_meta['title']}'")
+                                
+                                rename_info_dict = add_rename_command(
+                                    rename_script_paths=initialized_rename_script_paths,
+                                    source_path_original_file=input_file,
+                                    actual_text_content_file_path=actual_text_content_path_for_llm_and_rename,
+                                    target_dir_name=final_parsed_llm_meta['author'],
+                                    new_filename_base=f"{final_parsed_llm_meta['year']} {final_parsed_llm_meta['title']}",
+                                    output_dir_for_sorted_files=str(current_output_dir_base_str),
+                                    debug=self._debug
+                                )
+                                result["renamed_info"] = rename_info_dict
+                                if self._debug and rename_info_dict:
+                                    logging.debug(f"DS_Proc: Rename command generated for {input_file}. Info: {rename_info_dict}")
+                                elif self._debug and not rename_info_dict:
+                                    logging.debug(f"DS_Proc: add_rename_command returned None (likely duplicate) for {input_file}")
+                        else:
+                            logging.warning(f"DS_Proc: All enhanced LLM attempts failed for '{input_file}'")
+                            if rename_script_base_path_for_unparseables:
+                                unparseables_path = Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst"
+                                with file_lock:
+                                    with open(unparseables_path, "a", encoding='utf-8') as f_unp:
+                                        f_unp.write(f"{input_file} - All LLM attempts failed to yield sortable metadata.\n")
             
             elif not result['success'] and not result.get('skipped'):
                 if not result.get("error"): 
@@ -622,7 +752,8 @@ class DocumentProcessor:
                 try:
                     result['inherent_metadata'] = self._extract_document_inherent_metadata(input_file)
                 except Exception as e_meta_final:
-                    if self._debug: logging.debug(f"DS_Proc: Could not get inherent metadata for '{input_file}' at the end: {e_meta_final}")
+                    if self._debug: 
+                        logging.debug(f"DS_Proc: Could not get inherent metadata for '{input_file}' at the end: {e_meta_final}")
 
         except Exception as e:
             result['error'] = f"Overall processing of '{input_file}' failed in _process_single_file: {str(e)}"
@@ -630,14 +761,10 @@ class DocumentProcessor:
             result['success'] = False
             if effective_sort_flag and rename_script_base_path_for_unparseables:
                 try:
-                    logging.debug(f"DS_Proc: Attempting to acquire file_lock for unparseables.lst for {input_file}")
                     with file_lock:
-                        logging.debug(f"DS_Proc: Acquired file_lock for unparseables.lst for {input_file}")
                         unparseables_path = Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst"
                         with open(unparseables_path, "a", encoding='utf-8') as f_unp:
                             f_unp.write(f"{input_file} - Overall Error in _process_single_file: {str(e)}\n")
-                        logging.debug(f"DS_Proc: Wrote to unparseables.lst for {input_file}")
-                    logging.debug(f"DS_Proc: Released file_lock for unparseables.lst for {input_file}")
                 except Exception as e_unp:
                     logging.error(f"Failed to write to unparseables.lst for {input_file}: {e_unp}")
         
@@ -645,34 +772,30 @@ class DocumentProcessor:
             logging.debug(f"DS_Proc: Finished _process_single_file for: '{input_file}', "
                         f"Success: {result['success']}, Error: {result.get('error')}, "
                         f"Renamed: {bool(result.get('renamed_info'))}, "
-                        f"Skipped: {result.get('skipped')}, "
-                        f"Final text content path in result (result['output_path']): {result.get('output_path')}, "
-                        f"Actual text content path used for LLM/Rename: {actual_text_content_path_for_llm_and_rename}")
+                        f"Skipped: {result.get('skipped')}")
         return result
 
     def process_files(self, input_files: List[str], 
-                      output_dir: Optional[str] = None,
-                      method: Optional[str] = None,
-                      ocr_method: Optional[str] = None,
-                      password: Optional[str] = None,
-                      extract_tables: bool = False,  
-                      force_ocr: bool = False,
-                      max_workers: Optional[int] = None,
-                      noskip: bool = False,
-                      sort: bool = False,          
-                      rename_script_path: Optional[str] = None, 
-                      llm_provider_arg: Optional[Any] = None, 
-                      temperature: float = 0.7,       
-                      max_tokens: int = 300,
-                      # **kwargs will capture all other CLI args like ollama_host, llamacpp_repo_id, etc.
-                      # and also sort_arg_from_main if BiblioForge.py passes it
-                      **kwargs) -> Dict[str, Any]: 
+                  output_dir: Optional[str] = None,
+                  method: Optional[str] = None,
+                  ocr_method: Optional[str] = None,
+                  password: Optional[str] = None,
+                  extract_tables: bool = False,  
+                  force_ocr: bool = False,
+                  max_workers: Optional[int] = None,
+                  noskip: bool = False,
+                  sort: bool = False,          
+                  rename_script_path: Optional[str] = None,
+                  reset_rename_script: bool = False,  # NEW
+                  noremove_from_script: bool = False,  # NEW
+                  llm_provider_arg: Optional[Any] = None, 
+                  temperature: float = 0.7,       
+                  max_tokens: int = 300,
+                  **kwargs) -> Dict[str, Any]:
         
         if self._debug:
             logging.debug(f"process_files: Starting. Total input_files: {len(input_files)}")
             logging.debug(f"process_files: output_dir='{output_dir}', sort (original intent)='{sort}', rename_script_path='{rename_script_path}'")
-            logging.debug(f"process_files: Received explicit temperature={temperature}, max_tokens={max_tokens}")
-            logging.debug(f"process_files: Received **kwargs: {kwargs}")
 
         final_results: Dict[str, Any] = {'processed': {}, 'failed': [], 'skipped': [], 'counters': {}}
         counters = {'total': len(input_files), 'processed_ok': 0, 'skipped': 0, 
@@ -680,25 +803,23 @@ class DocumentProcessor:
 
         eff_output_dir = Path(output_dir or '.').resolve()
         eff_output_dir.mkdir(parents=True, exist_ok=True)
-        if self._debug: logging.debug(f"process_files: Effective output directory: {eff_output_dir}")
+        if self._debug: 
+            logging.debug(f"process_files: Effective output directory: {eff_output_dir}")
 
         llm_provider_instance: Optional[LLMProvider] = None
-        effective_sort_flag = sort # Start with the user's intent for sorting
+        effective_sort_flag = sort
 
         if effective_sort_flag:
             if isinstance(llm_provider_arg, LLMProvider):
                 llm_provider_instance = llm_provider_arg
-                if self._debug: logging.debug("process_files: Using pre-passed LLMProvider instance.")
+                if self._debug: 
+                    logging.debug("process_files: Using pre-passed LLMProvider instance.")
             elif isinstance(llm_provider_arg, str) or llm_provider_arg is None:
                 provider_name_str = llm_provider_arg if isinstance(llm_provider_arg, str) else "ollama"
                 try:
-                    # Extract general LLM args from kwargs (passed from BiblioForge.py)
-                    # These keys must match what get_llm_provider expects.
                     model_name_for_provider = kwargs.get('llm_model') 
                     api_key_for_provider = kwargs.get('api_key')    
                     
-                    # Gather all other provider-specific arguments from kwargs
-                    # These keys should match parameters in get_llm_provider
                     provider_specific_constructor_args = {
                         "ollama_host": kwargs.get('ollama_host'),
                         "local_openai_base_url": kwargs.get('local_openai_base_url'),
@@ -707,25 +828,20 @@ class DocumentProcessor:
                         "llamacpp_n_ctx": kwargs.get('llamacpp_n_ctx'),
                         "llamacpp_n_gpu_layers": kwargs.get('llamacpp_n_gpu_layers'),
                         "llamacpp_chat_format": kwargs.get('llamacpp_chat_format')
-                        # Add other specific args here if get_llm_provider is updated to handle them
                     }
-                    # Filter out None values so get_llm_provider uses its internal defaults for non-provided args
                     provider_specific_constructor_args = {k: v for k, v in provider_specific_constructor_args.items() if v is not None}
 
                     if self._debug: 
-                        logging.debug(f"process_files: Attempting to initialize LLM provider '{provider_name_str}' "
-                                      f"with model_name='{model_name_for_provider}', api_key_present={bool(api_key_for_provider)}, "
-                                      f"constructor_specific_args={provider_specific_constructor_args}")
+                        logging.debug(f"process_files: Attempting to initialize LLM provider '{provider_name_str}'")
                     
                     llm_provider_instance = get_llm_provider(
                         provider_type=provider_name_str,
-                        model_name=model_name_for_provider, # This is args.llm_model
-                        api_key=api_key_for_provider,       # This is args.api_key
-                        **provider_specific_constructor_args # Pass the collected specific args
+                        model_name=model_name_for_provider,
+                        api_key=api_key_for_provider,
+                        **provider_specific_constructor_args
                     )
                     if llm_provider_instance and self._debug:
-                         logging.debug(f"process_files: LLM provider '{llm_provider_instance.__class__.__name__}' "
-                                       f"for model '{llm_provider_instance.model_name}' initialized successfully.")
+                        logging.debug(f"process_files: LLM provider initialized successfully.")
 
                 except Exception as e:
                     logging.error(f"Failed to initialize LLM provider '{provider_name_str}' for sorting: {e}. Sorting will be disabled.", exc_info=self._debug)
@@ -737,9 +853,9 @@ class DocumentProcessor:
         actual_max_workers = max_workers
         if actual_max_workers is None:
             is_local_llm_active = effective_sort_flag and llm_provider_instance and \
-                                  (isinstance(llm_provider_instance, OllamaProvider) or \
-                                   isinstance(llm_provider_instance, LlamaCPPProvider) or \
-                                   'local_openai' in llm_provider_instance.__class__.__name__.lower()) # Check LocalOpenAIProvider too
+                                (isinstance(llm_provider_instance, OllamaProvider) or \
+                                isinstance(llm_provider_instance, LlamaCPPProvider) or \
+                                'local_openai' in llm_provider_instance.__class__.__name__.lower())
             cpu_count = os.cpu_count() or 1
             actual_max_workers = min(4, cpu_count) if is_local_llm_active else min(8, cpu_count)
         
@@ -755,13 +871,36 @@ class DocumentProcessor:
                 temp_path_obj = eff_output_dir / rename_script_path
                 actual_rename_script_base_path_str = str(temp_path_obj.resolve())
             
-            if self._debug: logging.debug(f"process_files: Determined rename script base path string: {actual_rename_script_base_path_str}")
+            if self._debug: 
+                logging.debug(f"process_files: Determined rename script base path string: {actual_rename_script_base_path_str}")
             
-            initialized_script_paths_map = initialize_rename_scripts(actual_rename_script_base_path_str)
-            if self._debug: logging.debug(f"process_files: Rename scripts initialized. Paths map: {initialized_script_paths_map}")
+            # **NEW: Purge non-existent files from script (unless --noremove)**
+            if not noremove_from_script and not reset_rename_script:
+                if os.path.exists(actual_rename_script_base_path_str):
+                    logging.info(f"Cleaning rename script: removing entries for non-existent files...")
+                    purge_stats = purge_rename_script(actual_rename_script_base_path_str, debug=self._debug)
+                    if purge_stats['removed_blocks'] > 0:
+                        logging.info(f"Removed {purge_stats['removed_blocks']} command blocks for deleted files")
+                
+                # Also check for .bat version on Windows
+                if platform.system() == 'Windows':
+                    batch_version = os.path.splitext(actual_rename_script_base_path_str)[0] + '.bat'
+                    if os.path.exists(batch_version):
+                        purge_stats_batch = purge_rename_script(batch_version, debug=self._debug)
+                        if purge_stats_batch['removed_blocks'] > 0:
+                            logging.info(f"Removed {purge_stats_batch['removed_blocks']} command blocks from batch script")
+            
+            # **CHANGED: Pass reset_mode to safe_initialize_rename_scripts**
+            initialized_script_paths_map = safe_initialize_rename_scripts(
+                actual_rename_script_base_path_str,
+                append_mode=True,
+                reset_mode=reset_rename_script  # NEW: respect --reset flag
+            )
+            if self._debug: 
+                logging.debug(f"process_files: Rename scripts initialized. Paths map: {initialized_script_paths_map}")
         elif effective_sort_flag and not rename_script_path:
             logging.warning("Sorting is enabled but no rename script path was effectively determined. Rename command generation will be skipped.")
-            # Keep effective_sort_flag for metadata, but initialized_script_paths_map will be None.
+
 
         with ThreadPoolExecutor(max_workers=actual_max_workers) as executor:
             futures = {}
@@ -770,9 +909,9 @@ class DocumentProcessor:
                     logging.info(f"Shutdown initiated, no more files will be submitted. {len(futures)} already submitted.")
                     break
                 
-                if self._debug: logging.debug(f"process_files: Submitting job for file: {input_file_item}")
+                if self._debug: 
+                    logging.debug(f"process_files: Submitting job for file: {input_file_item}")
                 
-                # Pass explicit temperature and max_tokens for metadata, and **kwargs for provider init within helpers if necessary
                 futures[executor.submit(
                     self._process_single_file,
                     input_file_item, 
@@ -783,27 +922,27 @@ class DocumentProcessor:
                     actual_rename_script_base_path_str,
                     initialized_script_paths_map,          
                     llm_provider_instance, 
-                    temperature, # Temperature specifically for metadata extraction via llm_extract_metadata
-                    max_tokens,  # Max_tokens specifically for metadata extraction via llm_extract_metadata
-                    **kwargs     # Pass all other CLI args (like llm_model, api_key, provider_specifics)
-                                 # This is for llm_extract_metadata/sort_author_names if they internally
-                                 # call get_llm_provider (though they shouldn't if instance is passed)
+                    temperature,
+                    max_tokens,
+                    **kwargs
                 )] = input_file_item
             
             for future in tqdm(as_completed(futures), total=len(futures), desc="Overall File Processing", unit="file"):
                 if shutdown_flag.is_set() and not future.done(): 
-                    if self._debug: logging.debug(f"process_files: Cancelling future for {futures[future]} due to shutdown.")
+                    if self._debug: 
+                        logging.debug(f"process_files: Cancelling future for {futures[future]} due to shutdown.")
                     future.cancel()
                 
                 input_file_path_completed = futures[future]
                 try:
-                    single_file_result = future.result() 
+                    # **NEW: Add timeout to future.result() to prevent indefinite hangs**
+                    # Timeout: 30 minutes per file (adjust as needed)
+                    single_file_result = future.result(timeout=1800)  
+                    
                     if self._debug: 
                         logging.debug(f"process_files: Result for '{input_file_path_completed}': "
-                                      f"Success={single_file_result.get('success')}, "
-                                      f"Skipped={single_file_result.get('skipped')}, "
-                                      f"RenamedInfo_is_present={bool(single_file_result.get('renamed_info'))}, "
-                                      f"Error='{single_file_result.get('error', 'None')}'")
+                                    f"Success={single_file_result.get('success')}, "
+                                    f"Skipped={single_file_result.get('skipped')}")
                     
                     final_results['processed'][input_file_path_completed] = single_file_result
                     if single_file_result.get('skipped'):
@@ -813,34 +952,36 @@ class DocumentProcessor:
                         counters['processed_ok'] += 1
                         if single_file_result.get('renamed_info'): 
                             counters['sorted_commands_generated'] +=1
-                            if self._debug: logging.debug(f"process_files: Incremented sorted_commands_generated for {input_file_path_completed}. Count: {counters['sorted_commands_generated']}")
-                        elif effective_sort_flag: # If sort was intended, but no rename info generated (e.g. bad metadata)
+                        elif effective_sort_flag:
                             counters['sort_failed_metadata'] +=1
-                            if self._debug: logging.debug(f"process_files: Incremented sort_failed_metadata for {input_file_path_completed} (sort active but no rename_info). Count: {counters['sort_failed_metadata']}")
-                    else: # Not skipped, not success (extraction or direct read failed)
+                    else:
                         counters['failed_extraction'] += 1
                         final_results['failed'].append({'file': input_file_path_completed, 'error': single_file_result.get('error', 'Unknown processing error')})
-                        if self._debug: logging.debug(f"process_files: Incremented failed_extraction for {input_file_path_completed}. Error: {single_file_result.get('error')}")
                 
+                except FutureTimeoutError:
+                    # File processing took too long
+                    error_msg = f"Processing timed out after 30 minutes"
+                    logging.error(f"{input_file_path_completed}: {error_msg}")
+                    final_results['failed'].append({'file': input_file_path_completed, 'error': error_msg})
+                    counters['failed_extraction'] += 1
                 except Exception as e_future:
                     logging.error(f"Exception processing future for {input_file_path_completed}: {e_future}", exc_info=self._debug)
                     final_results['failed'].append({'file': input_file_path_completed, 'error': str(e_future)})
-                    counters['failed_extraction'] += 1 
-                    if self._debug: logging.debug(f"process_files: Exception for {input_file_path_completed}, incremented failed_extraction.")
-        
-        final_results['counters'] = counters 
-        logging.info("\n--- Processing Summary ---")
-        logging.info(f"Total files attempted: {counters['total']}")
-        logging.info(f"Successfully processed (text extracted/loaded): {counters['processed_ok']}")
-        if kwargs.get('sort_arg_from_main', False): # Use original sort intent from BiblioForge.py for summary
-            logging.info(f"Rename commands generated for: {counters['sorted_commands_generated']}")
-            logging.info(f"Sorting failed (metadata issues/LLM errors for successfully processed files): {counters['sort_failed_metadata']}")
-        logging.info(f"Skipped (e.g., output existed and not --noskip): {counters['skipped']}")
-        logging.info(f"Failed extraction/critical processing errors: {counters['failed_extraction']}")
-        if final_results['failed']:
-            logging.warning("Details for files that failed critical processing:")
-            for fail_info in final_results['failed']:
-                logging.warning(f"  - {fail_info['file']}: {fail_info['error']}")
-        logging.info("------------------------")
+                    counters['failed_extraction'] += 1
+            
+            final_results['counters'] = counters 
+            logging.info("\n--- Processing Summary ---")
+            logging.info(f"Total files attempted: {counters['total']}")
+            logging.info(f"Successfully processed (text extracted/loaded): {counters['processed_ok']}")
+            if kwargs.get('sort_arg_from_main', False):
+                logging.info(f"Rename commands generated for: {counters['sorted_commands_generated']}")
+                logging.info(f"Sorting failed (metadata issues/LLM errors): {counters['sort_failed_metadata']}")
+            logging.info(f"Skipped (already processed): {counters['skipped']}")
+            logging.info(f"Failed extraction/critical processing errors: {counters['failed_extraction']}")
+            if final_results['failed']:
+                logging.warning("Details for files that failed critical processing:")
+                for fail_info in final_results['failed']:
+                    logging.warning(f"  - {fail_info['file']}: {fail_info['error']}")
+            logging.info("------------------------")
 
-        return final_results
+            return final_results

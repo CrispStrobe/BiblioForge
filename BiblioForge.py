@@ -9,6 +9,8 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', category=DeprecationWarning, module='pkg_resources')
 
 import os
+os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'  # Suppress torch warnings
+
 import sys
 import logging
 import argparse
@@ -77,10 +79,15 @@ def signal_handler(signum, frame):
     # Uses shutdown_flag, active_processes, extraction_in_progress from utils.py
     if not shutdown_flag.is_set():
         signal_name_map = {signal.SIGINT: "SIGINT (Ctrl+C)", signal.SIGTERM: "SIGTERM"}
-        if platform.system() != 'Windows': signal_name_map[signal.SIGTSTP] = "SIGTSTP (Ctrl+Z)"
+        if platform.system() != 'Windows': 
+            signal_name_map[signal.SIGTSTP] = "SIGTSTP (Ctrl+Z)"
         signal_name = signal_name_map.get(signum, f"Signal {signum}")
         
         logging.info(f"\nReceived {signal_name}. Initiating graceful shutdown...")
+        
+        # Dump thread state to help diagnose hangs
+        log_hanging_threads()
+        
         shutdown_flag.set()
         
         # Attempt to terminate active processes tracked by run_process in utils
@@ -159,6 +166,20 @@ def filter_out_extracted_txt_files(file_list: List[str]) -> List[str]:
         
     return sorted(filtered_files)
 
+
+def log_hanging_threads():
+    """Log all thread states for debugging hangs"""
+    import threading
+    import traceback
+    import sys
+    
+    print("\n=== THREAD DUMP (for debugging hang) ===", file=sys.stderr)
+    for thread in threading.enumerate():
+        print(f"\nThread: {thread.name} (ID: {thread.ident})", file=sys.stderr)
+        print(f"  Alive: {thread.is_alive()}", file=sys.stderr)
+        print(f"  Daemon: {thread.daemon}", file=sys.stderr)
+    print("=== END THREAD DUMP ===\n", file=sys.stderr)
+
 def main():
     # --- Argument Parser Setup (ensure all new LLM args are defined here as in previous full file) ---
     parser = argparse.ArgumentParser(
@@ -213,6 +234,11 @@ def main():
     parser.add_argument('-v', '--verbose', action='count', default=0, help="Increase verbosity: -v INFO, -vv DEBUG.")
     parser.add_argument('-d', '--debug', action='store_const', const=2, dest='verbose', help="Enable debug logging (shortcut for -vv).")
     
+    parser.add_argument('--reset', action='store_true', 
+                   help="Force creation of fresh rename script, discarding existing one.")
+    parser.add_argument('--noremove', action='store_true', 
+                    help="Skip cleanup of rename script entries for non-existent files.")
+
     args = parser.parse_args()
     # Store verbosity for restoration
     logging._biblioforge_verbosity = args.verbose
@@ -350,11 +376,14 @@ def main():
             noskip=args.noskip,
             sort=args.sort, 
             rename_script_path=args.rename_script,
+            reset_rename_script=args.reset,      
+            noremove_from_script=args.noremove,  
             llm_provider_arg=args.llm_provider, 
-            temperature=args.temperature,   # Explicitly passed
-            max_tokens=args.max_tokens,     # Explicitly passed
-            **llm_config_kwargs_to_pass     # Pass all other relevant configs
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            **llm_config_kwargs_to_pass
         )
+
 
         # Add logging check after processing
         check_and_restore_logging()
