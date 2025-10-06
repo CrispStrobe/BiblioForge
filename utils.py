@@ -1351,7 +1351,6 @@ def execute_rename_commands(script_path_to_execute: str):
     except Exception as e:
         logging.error(f"Unexpected error executing {script_path_to_execute}: {e}")
 
-
 # --- Metadata Parsing ---
 def _extract_tag_content(content: str, tag: str, default: str = "") -> str:
     """
@@ -1362,7 +1361,10 @@ def _extract_tag_content(content: str, tag: str, default: str = "") -> str:
         return default
     
     try:
-        # Use raw f-string for regex patterns to handle escape sequences correctly
+        logging.debug(f"Extracting tag content from {content} for {tag}.")
+        
+        # Use a raw f-string (rf"...") and re.escape to handle the tag name and 
+        # ensure proper handling of escape sequences for the regex.
         # This pattern handles:
         # - Optional attributes in opening tag: <tag attr="value">
         # - Optional whitespace in closing tag: </ tag >  
