@@ -58,8 +58,50 @@ class DocumentProcessor:
             setup_logging(2)  # Debug level
             logging.warning("Logging configuration was corrupted and has been restored.")
 
-    # --- MODIFIED: sort_author_with_retries with timeout ---
     def sort_author_with_retries(
+        self,
+        author_name: str,
+        llm_provider_instance,
+        input_file: str,
+        **kwargs_from_main
+    ) -> str:
+        """
+        Sorts author names, prioritizing direct comma parsing and using the LLM
+        only when necessary. Returns a valid name or "UnknownAuthor".
+        """
+        if not valid_author_name(author_name):
+            return "UnknownAuthor"
+
+        # Pre-process to handle "Lastname, Firstname" format directly
+        cleaned_name = self._preprocess_author_name(author_name)
+        if ',' in cleaned_name:
+            parts = [p.strip() for p in cleaned_name.split(',', 1)]
+            if len(parts) == 2 and parts[0] and parts[1]:
+                # It's already in a parsable format, just re-order it.
+                formatted = f"{parts[0]} {parts[1]}"
+                return formatted if valid_author_name(formatted) else "UnknownAuthor"
+
+        # If it looks like "Firstname Lastname", use LLM to sort
+        if len(cleaned_name.split()) >= 2:
+            try:
+                # This call now directly returns the best guess from the LLM
+                sorted_name = sort_author_names(
+                    author_names_input=cleaned_name,
+                    provider_arg=llm_provider_instance,
+                    verbose=self._debug,
+                    filename_for_logging=input_file,
+                    **kwargs_from_main
+                )
+                if valid_author_name(sorted_name):
+                    return sorted_name
+            except Exception as e:
+                if self._debug:
+                    logging.warning(f"LLM sort failed for '{cleaned_name}': {e}")
+        
+        # If all else fails, return the cleaned name if it's valid, otherwise UnknownAuthor
+        return cleaned_name if valid_author_name(cleaned_name) else "UnknownAuthor"
+    
+    def sort_author_with_retries_old(
         self, 
         author_name: str, 
         llm_provider_instance, 
@@ -408,115 +450,84 @@ class DocumentProcessor:
         
         return True
 
-    # --- MODIFIED: process_llm_metadata_with_retries with threading timeout ---
     def process_llm_metadata_with_retries(
         self,
-        text: str, 
-        input_file: str, 
-        llm_provider_instance, 
-        temperature_for_metadata: float,
-        max_tokens_for_metadata: int,
-        llm_timeout: int = 120,  # 2 minute timeout per LLM call
-        **kwargs_from_main
+        text: str,
+        input_file: str,
+        llm_provider_instance,
+        **kwargs_from_main # Catches temperature, max_tokens, etc.
     ) -> Optional[Dict[str, str]]:
         """
-        Enhanced with per-call timeout using threading (works in worker threads).
+        Runs multiple prompt templates and intelligently consolidates the best results
+        from all attempts for a more robust metadata extraction.
         """
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-        
         max_llm_template_attempts = 3
-        
+        all_results = []
+
         for template_attempt in range(max_llm_template_attempts):
-            if shutdown_flag.is_set():
-                logging.info("Shutdown detected, aborting LLM metadata processing.")
-                break
-                
-            if self._debug:
-                logging.debug(f"DS_Proc: Metadata attempt {template_attempt + 1}/{max_llm_template_attempts} for '{os.path.basename(input_file)}'")
-
+            if shutdown_flag.is_set(): break
             try:
-                # Use ThreadPoolExecutor with timeout for LLM call
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        llm_extract_metadata,
-                        text=text, 
-                        filename=input_file,
-                        llm_provider_arg=llm_provider_instance,
-                        verbose=self._debug,
-                        prompt_template_index_to_try=template_attempt,
-                        **kwargs_from_main
-                    )
-                    
-                    try:
-                        llm_response_str = future.result(timeout=llm_timeout)
-                    except FutureTimeoutError:
-                        logging.error(f"DS_Proc: LLM call timed out after {llm_timeout}s for '{os.path.basename(input_file)}' (template {template_attempt})")
-                        continue
-                
-                if not llm_response_str:
-                    if self._debug:
-                        logging.warning(f"DS_Proc: LLM returned empty response on template {template_attempt}")
-                    continue
-
-                # Rest of existing logic
-                parsed_meta = parse_metadata(llm_response_str, filename=os.path.basename(input_file))
-                if not parsed_meta:
-                    if self._debug:
-                        logging.warning(f"DS_Proc: Failed to parse LLM response on template {template_attempt}")
-                    continue
-
-                raw_author = parsed_meta.get('author', "")
-                preprocessed_author = self._preprocess_author_name(raw_author)
-                
-                raw_title = parsed_meta.get('title', "")
-                validated_year = validate_and_fix_year(parsed_meta.get('year'))
-
-                if not self._is_valid_title(raw_title):
-                    if self._debug:
-                        logging.warning(f"DS_Proc: Invalid title '{raw_title}' on template {template_attempt}")
-                    continue
-
-                if self.has_invalid_author_keywords(preprocessed_author):
-                    if self._debug:
-                        logging.warning(f"DS_Proc: Invalid author '{preprocessed_author}' on template {template_attempt}")
-                    continue
-
-                if self._debug:
-                    logging.debug(f"DS_Proc: Initial validation passed. Performing advanced sort.")
-
-                final_author = self.sort_author_with_retries(
-                    author_name=preprocessed_author,
-                    llm_provider_instance=llm_provider_instance,
-                    input_file=input_file,
-                    **kwargs_from_main
+                llm_response_str = llm_extract_metadata(
+                    text=text, filename=input_file,
+                    llm_provider_arg=llm_provider_instance, verbose=self._debug,
+                    prompt_template_index_to_try=template_attempt, **kwargs_from_main
                 )
-
-                final_metadata = {
-                    'title': raw_title,
-                    'year': validated_year,
-                    'author': final_author,
-                    'language': parsed_meta.get('language', 'un')
-                }
-
-                is_fully_valid = (
-                    valid_author_name(final_metadata['author']) and
-                    self._is_valid_title(final_metadata['title']) and
-                    final_metadata['year'] != "UnknownYear"
-                )
-                
-                if is_fully_valid:
-                    logging.info(f"DS_Proc: Successfully extracted metadata for '{os.path.basename(input_file)}'")
-                    return final_metadata
-                else:
-                    if self._debug:
-                        logging.warning(f"DS_Proc: Final validation failed for template {template_attempt}")
-
+                if llm_response_str:
+                    parsed_meta = parse_metadata(llm_response_str, os.path.basename(input_file))
+                    if parsed_meta:
+                        all_results.append(parsed_meta)
             except Exception as e:
-                logging.error(f"DS_Proc: Error in LLM metadata extraction: {e}", exc_info=self._debug)
-                continue
+                logging.error(f"DS_Proc: Error on template {template_attempt}: {e}", exc_info=self._debug)
 
-        logging.error(f"DS_Proc: All {max_llm_template_attempts} attempts failed for '{os.path.basename(input_file)}'")
-        return None
+        if not all_results:
+            logging.error(f"DS_Proc: All LLM attempts failed for '{os.path.basename(input_file)}'.")
+            return None
+
+        # --- Intelligent Consolidation ---
+        best_title = ""
+        best_author = ""
+        best_year = "UnknownYear"
+        
+        # Find the best non-placeholder title (prefer longest)
+        valid_titles = [r['title'] for r in all_results if self._is_valid_title(r.get('title'))]
+        if valid_titles:
+            best_title = max(valid_titles, key=len)
+
+        # Find the best non-placeholder author (prefer longest)
+        valid_authors = [r['author'] for r in all_results if not self.has_invalid_author_keywords(r.get('author'))]
+        if valid_authors:
+            best_author = max(valid_authors, key=len)
+
+        # Find the best valid year
+        valid_years = [validate_and_fix_year(r.get('year')) for r in all_results]
+        numeric_years = [y for y in valid_years if y != "UnknownYear"]
+        if numeric_years:
+            best_year = max(numeric_years)
+
+        # --- Final Processing and Validation ---
+        if not best_title or not best_author:
+            logging.error(f"DS_Proc: Failed to consolidate a valid title and author. Best attempt: Title='{best_title}', Author='{best_author}'")
+            return None
+
+        sorted_author = self.sort_author_with_retries(
+            best_author, llm_provider_instance, input_file, **kwargs_from_main
+        )
+
+        final_metadata = {
+            'title': best_title,
+            'year': best_year,
+            'author': "UnknownAuthor", # Default to UnknownAuthor
+            'language': all_results[0].get('language', 'ul')
+        }
+
+        # Assign the sorted author name only if it's valid
+        if valid_author_name(sorted_author):
+            final_metadata['author'] = sorted_author
+        elif valid_author_name(best_author): # Fallback to the best unsorted name
+             final_metadata['author'] = best_author
+
+        logging.info(f"DS_Proc: Successfully consolidated metadata for '{os.path.basename(input_file)}'")
+        return final_metadata
 
     def _process_single_file(self, input_file: str,
                         current_output_dir_base_str: str,

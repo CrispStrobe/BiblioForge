@@ -284,6 +284,14 @@ def _restore_logging_if_corrupted():
 def sanitize_filename(name: str) -> str:
     
     if not isinstance(name, str): name = str(name)
+    
+    # Normalize Unicode punctuation to ASCII equivalents
+    name = name.replace('–', '-')  # en dash
+    name = name.replace('—', '-')  # em dash
+    name = name.replace('"', '"').replace('"', '"')  # smart quotes
+    name = name.replace(''', "'").replace(''', "'")  # smart apostrophes
+    name = name.replace('…', '...')  # ellipsis
+    
     unsafe_chars = {'\\': '-', '/': '-', ':': '-', '*': '', '?': '', '"': '', "'": "", '<': '', '>': '', '|': '-', ';': '', '`': '', '$': '', '&': 'and', '!': '', '#': '', '=': ''}
     for char, replacement in unsafe_chars.items(): name = name.replace(char, replacement)
     name = re.sub(r'\s+', ' ', name).strip()
@@ -876,25 +884,34 @@ def add_rename_command(
             ""
         ]
 
+        # Helper function to escape parentheses for ANY text in echo statements
+        def escape_basename_for_echo(basename: str) -> str:
+            """Escape parentheses in text for batch echo statements inside command blocks."""
+            return basename.replace('(', '^(').replace(')', '^)')
+
+        # Apply escaping to all basenames used in echo statements
+        source_basename_escaped = escape_basename_for_echo(os.path.basename(source_path_resolved))
+        text_basename_escaped = escape_basename_for_echo(os.path.basename(text_path_resolved))
+
         # Prepare command blocks for Windows batch file
         batch_commands = [
             f"REM Moving files for: {os.path.basename(source_path_original_file)}",
-            f'if not exist {escape_for_batch(str(target_dir_full))} mkdir {escape_for_batch(str(target_dir_full))}',
+            f'if not exist "{str(target_dir_full)}" mkdir "{str(target_dir_full)}"',
             "",
             "REM Move original file",
-            f'if exist {escape_for_batch(source_path_resolved)} (',
-            f'  move {escape_for_batch(source_path_resolved)} {escape_for_batch(str(target_source_path))}',
-            f'  echo Moved: {os.path.basename(source_path_resolved)} ^-^> {target_source_path}',
+            f'if exist "{source_path_resolved}" (',
+            f'  move "{source_path_resolved}" "{str(target_source_path)}"',
+            f'  echo Moved: {source_basename_escaped} -^> {os.path.basename(str(target_source_path))}',
             ") else (",
-            f'  echo Error: Source file {source_path_resolved} not found >&2',
+            f'  echo Error: Source file {source_basename_escaped} not found >&2',
             ")",
             "",
             "REM Move associated text file", 
-            f'if exist {escape_for_batch(text_path_resolved)} (',
-            f'  move {escape_for_batch(text_path_resolved)} {escape_for_batch(str(target_text_path))}',
-            f'  echo Moved: {os.path.basename(text_path_resolved)} ^-^> {target_text_path}',
+            f'if exist "{text_path_resolved}" (',
+            f'  move "{text_path_resolved}" "{str(target_text_path)}"',
+            f'  echo Moved: {text_basename_escaped} -^> {os.path.basename(str(target_text_path))}',
             ") else (",
-            f'  echo Info: Associated text file {text_path_resolved} not found for move',
+            f'  echo Info: Associated text file {text_basename_escaped} not found for move',
             ")",
             "",
             "REM ================================",
@@ -1171,6 +1188,16 @@ def escape_special_chars(filename: str) -> str:
     return f"'{escaped}'"
 
 def escape_for_batch(path: str) -> str:
+    """
+    Safely prepares a path for Windows batch file.
+    Since paths will be quoted, we only need to handle percent signs.
+    """
+    path_str = str(path)
+    # Only double percent signs - quotes protect everything else
+    escaped = path_str.replace("%", "%%")
+    return f'"{escaped}"'
+
+def escape_for_batch_old(path: str) -> str:
     """
     Special escaping function for Windows batch files.
     Batch files have different escaping rules than bash.
