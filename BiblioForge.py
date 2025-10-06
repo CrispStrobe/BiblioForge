@@ -218,12 +218,15 @@ def main():
         default='ollama', help="LLM provider for --sort."
     )
     parser.add_argument('--llm-model', default=None, help="Specific model name for the chosen LLM provider OR repo_id for LlamaCPP if specific repo arg not used.")
+    
     parser.add_argument('--api-key', default=None, help="API key for cloud-based LLM providers.")
     parser.add_argument('--temperature', type=float, default=0.3, help="LLM temperature (0.0-2.0).") # Explicit parameter for process_files
     parser.add_argument('--max-tokens', type=int, default=300, help="LLM max tokens for metadata extraction.") # Explicit parameter for process_files
 
     parser.add_argument('--ollama-host', default=os.environ.get("OLLAMA_HOST"), help="Host for Ollama server (e.g., http://localhost:11434). Uses library default if not set.")
     parser.add_argument('--local-openai-base-url', default=os.environ.get("LOCAL_OPENAI_BASE_URL"), help="Base URL for Local OpenAI compatible servers (e.g., LM Studio's http://localhost:1234/v1/).")
+    parser.add_argument('--ollama-allow-fallback', action='store_true', help="If the specified Ollama model is not found, allow falling back to another local model.")
+    parser.add_argument('--ollama-fallback-order', default=None, help="Comma-separated list of preferred fallback models for Ollama (e.g., 'model1:latest,model2,model3').")
     
     parser.add_argument('--llamacpp-repo-id', default=None, help="HuggingFace Repo ID for LlamaCPP GGUF model (e.g., TheBloke/phi-2-GGUF). Overrides --llm-model for LlamaCPP repo.")
     parser.add_argument('--llamacpp-gguf-filename', default=None, help="Specific GGUF filename from the HF repo for LlamaCPP (e.g., phi-2.Q4_K_M.gguf).")
@@ -342,6 +345,8 @@ def main():
         'api_key': args.api_key,
         'ollama_host': args.ollama_host,
         'local_openai_base_url': args.local_openai_base_url,
+        'ollama_allow_fallback': args.ollama_allow_fallback,
+        'ollama_fallback_order': args.ollama_fallback_order,
         'llamacpp_repo_id': args.llamacpp_repo_id,
         'llamacpp_gguf_filename': args.llamacpp_gguf_filename,
         'llamacpp_n_ctx': args.llamacpp_n_ctx,

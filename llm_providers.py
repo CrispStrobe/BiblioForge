@@ -7,6 +7,9 @@ from typing import Optional, List, Dict, Any, Union
 import re # For sort_author_names
 from pathlib import Path # For LlamaCPPProvider model path
 import json # For pretty printing debug output
+from tqdm import tqdm 
+import sys
+import json # For pretty-printing
 
 # Attempt to import necessary HTTP client libraries and LLM clients
 try:
@@ -442,164 +445,98 @@ class LocalOpenAIProvider(LLMProvider):
                 raise
 
 class OllamaProvider(LLMProvider):
-    _checked_models: set = set() 
+    _checked_models: set = set()
 
-    def __init__(self, model_name: str = DEFAULT_OLLAMA_MODEL_NAME, 
-                 host: Optional[str] = None, 
-                 debug: bool = False): 
-        super().__init__(model_name, debug=debug) # Crucially pass debug to super
+    def __init__(self, model_name: str = DEFAULT_OLLAMA_MODEL_NAME,
+                 host: Optional[str] = None,
+                 debug: bool = False,
+                 allow_fallback: bool = False,
+                 fallback_order: Optional[str] = None):
+        super().__init__(model_name, debug=debug)
         if ollama is None:
             raise ImportError("Official 'ollama' Python library not installed. 'pip install ollama'")
-        
+
+        self.original_model_name = model_name
         self.host = host
-        self._client_kwargs = {} 
-        if self.host:
-            self._client_kwargs['host'] = self.host
-        
-        # self._debug is now available
+        self.allow_fallback = allow_fallback
+        self.fallback_order = [m.strip() for m in fallback_order.split(',')] if fallback_order else []
+        self._client_kwargs = {'host': self.host} if self.host else {}
+
         if self.model_name not in OllamaProvider._checked_models:
-            if self._debug: 
-                 logging.debug(f"OllamaProvider __init__: First time encountering model '{self.model_name}' this run. Ensuring availability (debug={self._debug}).")
-            self._ensure_model_available() 
+            self._ensure_model_available()
             OllamaProvider._checked_models.add(self.model_name)
-        elif self._debug:
-            logging.debug(f"OllamaProvider __init__: Model '{self.model_name}' already checked this run.")
 
     def _ensure_model_available(self):
         """
-        Checks if the requested model is available locally via `ollama.list()`.
-        If not found, attempts to pull it using `ollama.pull()`.
-        Includes verbose debug logging and correct parsing of Model objects.
+        Final, definitive, and correct check for model availability. This version
+        handles the actual object structure returned by the ollama library.
         """
-        target_model_name_with_tag = self.model_name
-        is_debug_mode = self._debug # Assumes self._debug is set in __init__
-
-        if is_debug_mode:
-            logging.debug(f"OllamaProvider._ensure_model_available: STARTING CHECK for model '{target_model_name_with_tag}' with host '{self.host or 'Ollama default'}'.")
-
-        if ollama is None:
-            logging.error("OllamaProvider._ensure_model_available: Ollama library is not imported. Cannot proceed.")
-            return
-
-        try:
-            models_info_response = ollama.list(**self._client_kwargs) # This returns a dict like {'models': [ModelObject, ...]}
-            
-            if is_debug_mode:
-                import json
-                # Attempt to serialize, handling potential non-serializable Model objects gracefully for logging
-                raw_response_log_str = ""
-                if isinstance(models_info_response, dict) and 'models' in models_info_response:
-                    # Log the list of model representations
-                    models_repr_list = [repr(m) for m in models_info_response['models']]
-                    raw_response_log_str = f"{{'models': {models_repr_list}}}"
-                else:
-                    try: # Fallback to JSON dump if possible, or simple string
-                        raw_response_log_str = json.dumps(models_info_response, indent=2)
-                    except TypeError:
-                        raw_response_log_str = str(models_info_response)
-                logging.debug(f"OllamaProvider._ensure_model_available: RAW 'ollama.list()' RESPONSE (or its structure):\n{raw_response_log_str}")
-            
-            local_models_details_list = models_info_response.get('models', []) # This is a list of Model objects
-            if not isinstance(local_models_details_list, list):
-                logging.warning(f"OllamaProvider._ensure_model_available: 'models' key in 'ollama.list()' response is not a list or is missing. Response type: {type(models_info_response)}")
-                local_models_details_list = []
-
-            local_model_names_from_api = []
-            for idx, model_obj in enumerate(local_models_details_list):
-                # The items in the list are Model objects, access attribute directly
-                if hasattr(model_obj, 'name'): # The official ollama library Model object has a 'name' attribute
-                    model_name_found = model_obj.name
-                    local_model_names_from_api.append(str(model_name_found))
-                elif hasattr(model_obj, 'model'): # Fallback if 'name' isn't there but 'model' (as per your log) is
-                    model_name_found = model_obj.model
-                    local_model_names_from_api.append(str(model_name_found))
-                elif is_debug_mode:
-                    logging.debug(f"OllamaProvider._ensure_model_available: Model object [{idx}] "
-                                  f"lacks 'name' or 'model' attribute: {model_obj!r}")
-            
-            if is_debug_mode:
-                logging.debug(f"OllamaProvider._ensure_model_available: Extracted 'local_model_names_from_api' (count: {len(local_model_names_from_api)}): {local_model_names_from_api}")
-
-            # --- Comparison logic (should now work with correctly populated list) ---
-            found_locally = False
-            target_base_name, colon, target_tag_part = target_model_name_with_tag.rpartition(':')
-            if not colon: 
-                target_base_name = target_model_name_with_tag
-                target_tag = "latest"
-            else:
-                target_tag = target_tag_part
-
-            if is_debug_mode:
-                logging.debug(f"OllamaProvider._ensure_model_available: Target model parsed - Base: '{target_base_name}', Tag: '{target_tag}' (Original requested: '{target_model_name_with_tag}')")
-
-            for local_full_name in local_model_names_from_api:
-                if not isinstance(local_full_name, str):
-                    if is_debug_mode: logging.debug(f"OllamaProvider._ensure_model_available: Skipping non-string local name: {local_full_name}")
-                    continue
-
-                local_base, _, local_tag_part = local_full_name.rpartition(':')
-                if not _: 
-                    local_base = local_full_name
-                    local_tag = "latest"
-                else:
-                    local_tag = local_tag_part
-
-                if is_debug_mode:
-                    logging.debug(f"OllamaProvider._ensure_model_available: Comparing target ('{target_base_name}', tag: '{target_tag}') with local ('{local_base}', tag: '{local_tag}' from full '{local_full_name}')")
-
-                if local_full_name == target_model_name_with_tag:
-                    found_locally = True
-                    if is_debug_mode: logging.debug(f"OllamaProvider._ensure_model_available: -> FOUND (Exact Match with full target name)!")
-                    break
-                
-                if local_base == target_base_name and local_tag == target_tag:
-                    found_locally = True
-                    if is_debug_mode: logging.debug(f"OllamaProvider._ensure_model_available: -> FOUND (Base and Tag match after parsing both)!")
-                    break
-            
-            if is_debug_mode:
-                logging.debug(f"OllamaProvider._ensure_model_available: Check complete. Model found locally: {found_locally}")
-
-            if not found_locally:
-                logging.info(f"OllamaProvider: Model '{target_model_name_with_tag}' not found definitively in local list. Attempting to pull...")
-                if is_debug_mode: logging.debug(f"OllamaProvider: List that was compared against: {local_model_names_from_api}")
-                
-                pull_status_generator = ollama.pull(target_model_name_with_tag, stream=True, **self._client_kwargs)
-                final_pull_status_message = "Pull initiated, no detailed status updates received if stream is empty." 
-                last_log_time = time.time(); updates_received = False
-
-                for status_update in pull_status_generator:
-                    updates_received = True
-                    current_status = status_update.get('status', 'unknown status')
-                    final_pull_status_message = current_status 
-
-                    if is_debug_mode:
-                        log_now = False; progress_str = ""
-                        if 'total' in status_update and 'completed' in status_update and status_update.get('total', 0) > 0:
-                            progress = (status_update['completed'] / status_update['total']) * 100
-                            progress_str = f" - {progress:.1f}% ({status_update['completed']}/{status_update['total']})"
-                            log_now = True 
-                        
-                        current_time = time.time()
-                        if log_now or (current_time - last_log_time > 2.0): 
-                            logging.debug(f"OllamaProvider: Pulling '{target_model_name_with_tag}': {current_status}{progress_str}")
-                            last_log_time = current_time
-                
-                if not updates_received and final_pull_status_message.startswith("Pull initiated"):
-                     final_pull_status_message = "success (inferred from empty stream or pre-existing up-to-date model)"
-                     logging.info(f"OllamaProvider: Pull stream for '{target_model_name_with_tag}' was empty, assuming success or model already up-to-date.")
-
-                if "success" in final_pull_status_message.lower():
-                    logging.info(f"OllamaProvider: Model '{target_model_name_with_tag}' pull completed with final status: '{final_pull_status_message}'.")
-                else:
-                    logging.warning(f"OllamaProvider: Model '{target_model_name_with_tag}' pull may not have completed successfully or status ambiguous (last status: '{final_pull_status_message}'). Check Ollama server logs.")
-            elif is_debug_mode: 
-                logging.debug(f"OllamaProvider: Model '{target_model_name_with_tag}' confirmed available locally (found_locally=True).")
+        if self._debug:
+            tqdm.write("\n--- OLLAMA PROVIDER DIAGNOSTIC ---")
+            tqdm.write(f"STARTING MODEL CHECK FOR: '{self.original_model_name}'")
         
+        try:
+            # --- 1. Fetch and CORRECTLY Parse Local Models ---
+            models_info_response = ollama.list(**self._client_kwargs)
+            
+            valid_local_models = []
+            # THE FINAL FIX: Check for the 'models' attribute on the response object.
+            if hasattr(models_info_response, 'models') and isinstance(models_info_response.models, list):
+                for model_obj in models_info_response.models:
+                    # Access the 'model' attribute of the Model object.
+                    if hasattr(model_obj, 'model') and isinstance(model_obj.model, str):
+                        valid_local_models.append(model_obj.model)
+
+            if self._debug:
+                tqdm.write(f"PARSED MODEL NAMES ({len(valid_local_models)} found): {valid_local_models}\n")
+
+            # --- 2. Robust Model Matching ---
+            target_base, _, target_tag = self.original_model_name.rpartition(':')
+            if not target_base:
+                target_base, target_tag = self.original_model_name, 'latest'
+
+            for name in valid_local_models:
+                local_base, _, local_tag = name.rpartition(':')
+                if not local_base:
+                    local_base, local_tag = name, 'latest'
+                
+                if local_base == target_base and local_tag == target_tag:
+                    logging.info(f"Ollama: SUCCESS - Found matching local model '{name}'.")
+                    self.model_name = name
+                    return
+
+            logging.warning(f"Ollama: Desired model '{self.original_model_name}' not found locally.")
+
+            # --- 3. GUARANTEED Fallback Logic ---
+            if self.allow_fallback and valid_local_models:
+                logging.info("Ollama: Fallback enabled. Finding a substitute...")
+                fallback_found = next((p for p in self.fallback_order if p in valid_local_models), None) \
+                              or next((n for n in valid_local_models if any(k in n.lower() for k in ["instruct", "chat"])), None) \
+                              or valid_local_models[0]
+                
+                logging.warning(f"Ollama: Switching from '{self.original_model_name}' to fallback '{fallback_found}'.")
+                self.model_name = fallback_found
+                return
+
+            # --- 4. Pull Logic with Graceful Shutdown ---
+            logging.info(f"Ollama: No suitable local model. Proceeding to pull '{self.original_model_name}'.")
+            pull_stream = ollama.pull(self.original_model_name, stream=True, **self._client_kwargs)
+            self.model_name = self.original_model_name
+            
+            for _ in pull_stream:
+                if shutdown_flag.is_set():
+                    raise InterruptedError("Model pull cancelled by user.")
+            logging.info(f"Ollama: Model pull for '{self.original_model_name}' completed.")
+
+        except InterruptedError:
+            raise
         except Exception as e:
-            logging.warning(f"OllamaProvider: Exception during _ensure_model_available for '{target_model_name_with_tag}': {e}. "
-                            f"Ensure model name is correct and Ollama server (at '{self.host or 'Ollama default'}') is running and accessible.",
-                            exc_info=self._debug)
+            logging.error(f"Ollama: CRITICAL ERROR in _ensure_model_available: {e}", exc_info=self._debug)
+            raise
+        finally:
+            if self._debug:
+                tqdm.write(f"FINAL RESOLVED MODEL: {getattr(self, 'model_name', 'UNKNOWN')}")
+                tqdm.write("--- OLLAMA DIAGNOSTIC COMPLETE ---\n")
 
     def chat_completion(self, messages: List[Dict[str, str]], 
                         temperature: float = 0.7, 
@@ -609,38 +546,20 @@ class OllamaProvider(LLMProvider):
         if max_tokens is not None and max_tokens > 0:
             options["num_predict"] = max_tokens
         
-        client_params_for_call = {**self._client_kwargs}
-        # The ollama library uses timeout on the client instance, not per call easily
-        # If a specific timeout per call is needed, a new client instance would be better here.
-        # For now, this uses the host from self._client_kwargs. Timeout for `ollama.chat` is not a direct param.
-        # If you instantiate `client = ollama.Client(host=..., timeout=...)`, then it's set.
-        # This simple call relies on library defaults or global client config for timeout.
-
         with llm_semaphore:
-            try:
-                if self._debug: logging.debug(f"OllamaProvider: Sending chat request to model '{self.model_name}' with options {options}")
-                response = ollama.chat(
-                    model=self.model_name,
-                    messages=messages,
-                    stream=False,
-                    options=options,
-                    **client_params_for_call 
-                )
-                content = response.get('message', {}).get('content', '').strip()
-                finish_reason = "stop" if response.get('done') else "unknown"
-                if self._debug: logging.debug(f"OllamaProvider: Response received. Content length: {len(content)}, Done: {response.get('done')}")
-                return {
-                    "id": "ollama-" + response.get('created_at', str(time.time())),
-                    "content": content,
-                    "finish_reason": finish_reason,
-                    "model": response.get('model', self.model_name)
-                }
-            except ollama.ResponseError as e:
-                logging.error(f"OllamaProvider: ResponseError for model {self.model_name} (host: {self.host or 'default'}): Status {e.status_code} - {e.error}")
-                raise
-            except Exception as e:
-                logging.error(f"OllamaProvider: Generic error for model {self.model_name} (host: {self.host or 'default'}): {e}", exc_info=self._debug)
-                raise
+            if shutdown_flag.is_set():
+                raise InterruptedError("Chat completion cancelled by shutdown signal.")
+            
+            response = ollama.chat(
+                model=self.model_name, messages=messages, stream=False,
+                options=options, **self._client_kwargs
+            )
+            content = response.get('message', {}).get('content', '').strip()
+            return {
+                "id": f"ollama-{response.get('created_at', str(time.time()))}",
+                "content": content, "finish_reason": "stop",
+                "model": response.get('model', self.model_name)
+            }
 
 class LlamaCPPProvider(LLMProvider):
     """Provider for llama-cpp-python."""
@@ -808,7 +727,13 @@ def get_llm_provider(provider_type: str = "ollama",
         if debug: logging.debug(f"get_llm_provider: Initializing '{provider_type_lower}' with effective_model_name='{effective_model_name}' and debug={debug}")
         try:
             if provider_type_lower == "ollama":
-                 return ProviderClass(model_name=effective_model_name, host=kwargs.get('ollama_host'), debug=debug) 
+                 return ProviderClass(
+                     model_name=effective_model_name, 
+                     host=kwargs.get('ollama_host'), 
+                     debug=debug,
+                     allow_fallback=kwargs.get('ollama_allow_fallback', False),
+                     fallback_order=kwargs.get('ollama_fallback_order')
+                 )
             elif provider_type_lower == "local_openai":
                  return ProviderClass(model_name=effective_model_name, base_url=kwargs.get('local_openai_base_url'), debug=debug)
             elif provider_type_lower == "llama_cpp":
@@ -946,6 +871,19 @@ def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
             except Exception as e_log:
                 logging.debug(f"send_to_llm: Could not serialize messages payload for logging: {e_log}")
 
+        # Define the network-related exceptions to catch.
+        network_exceptions = []
+        if OpenAIAPIConnectionError:
+            network_exceptions.append(OpenAIAPIConnectionError)
+        if OpenAITimeout:
+            network_exceptions.append(OpenAITimeout)
+        if ollama and hasattr(ollama, 'ResponseError'):
+            network_exceptions.append(ollama.ResponseError)
+        
+        # Ensure the tuple is not empty before using it.
+        # Fallback to a base error if no specific libraries are installed.
+        exceptions_to_catch = tuple(network_exceptions) if network_exceptions else (RuntimeError,)
+
         try:
             response_data = provider_instance.chat_completion(
                 messages=messages, temperature=temperature_arg,
@@ -956,7 +894,7 @@ def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
             if provider_debug_flag or verbose: 
                 logging.debug(f"send_to_llm: Raw LLM response for '{filename}' (template index {prompt_template_index}, attempt {attempt}): '{output}'")
 
-            # FIXED: More robust XML tag detection
+            
             def has_valid_tag(output_text: str, tag_name: str) -> bool:
                 """Check if output contains a valid XML tag, handling malformed variations"""
                 import re
@@ -999,7 +937,8 @@ def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
                     logging.error(f"send_to_llm: Max attempts ({max_attempts}) reached for '{filename}' with prompt template index {prompt_template_index}. Returning last (malformed) output.")
                     return fix_malformed_xml_tags(output) # Still try to fix what we can
 
-        except (OpenAIAPIConnectionError, OpenAITimeout, ollama.ResponseError if ollama else RuntimeError) as e_net:
+        except exceptions_to_catch as e_net:
+            # This block is now valid and will catch the intended errors.
             log_msg = f"send_to_llm: LLM network/timeout error for '{filename}' with {provider_instance.__class__.__name__} (template index {prompt_template_index}, attempt {attempt}): {e_net}."
             if ollama and isinstance(e_net, ollama.ResponseError):
                 log_msg += f" Status: {e_net.status_code}, Error: {e_net.error}"
@@ -1010,7 +949,7 @@ def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
                 time.sleep(sleep_time)
             else:
                 logging.error(f"send_to_llm: Max LLM retries ({max_attempts}) for '{filename}' with prompt template index {prompt_template_index} due to network/timeout errors.")
-                return "" # Return empty if all retries for this template fail due to network issues
+                return ""
         except Exception as e:
             wait_time = base_retry_wait * (1.5 ** (attempt - 1))
             logging.warning(f"send_to_llm: LLM call error for '{filename}' with {provider_instance.__class__.__name__} "
