@@ -1141,7 +1141,37 @@ class DocumentProcessor:
             logging.warning("Sorting is enabled but no rename script path was effectively determined. Rename command generation will be skipped.")
 
 
+        # --- ROBUST PRE-INITIALIZATION BLOCK ---
+        # This block ensures that any heavy, non-thread-safe models are loaded
+        # once in the main thread before any parallel workers are created.
+        nanonets_config = kwargs.get('nanonets_config')
+        if nanonets_config and nanonets_config.get('use_gguf'):
+            logging.info("Pre-initializing Nanonets GGUF model to prevent race conditions...")
+            try:
+                # Get an instance of the extractor. The filename is a placeholder; the config is what matters.
+                extractor = self.manager._get_extractor(
+                    "pre_init.pdf", 
+                    use_nanonets_ocr2=True, 
+                    nanonets_config=nanonets_config
+                )
+                if extractor and hasattr(extractor, '_init_llama_cpp_model'):
+                    # Explicitly call the internal lazy-loading method.
+                    # This triggers the expensive model download and GPU initialization safely.
+                    init_success = extractor._init_llama_cpp_model()
+                    if init_success:
+                        logging.info("Nanonets GGUF model pre-initialized successfully.")
+                    else:
+                        logging.error("Failed to pre-initialize the Nanonets GGUF model. Processing may fail.")
+                else:
+                    logging.warning("Could not retrieve a valid Nanonets extractor for pre-initialization.")
+            except Exception as e:
+                logging.error(f"An error occurred during GGUF model pre-initialization: {e}", exc_info=self._debug)
+        # --- END OF PRE-INITIALIZATION BLOCK ---
+
         with ThreadPoolExecutor(max_workers=actual_max_workers) as executor:
+            
+            
+
             futures = {}
             for input_file_item in input_files:
                 if shutdown_flag.is_set():

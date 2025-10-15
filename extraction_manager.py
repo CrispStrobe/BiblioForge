@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Any, Union, Callable, Tuple
 from contextlib import contextmanager
 import traceback
 import pkg_resources # For version checking
+import threading
 
 from tqdm import tqdm
 
@@ -47,7 +48,8 @@ class ExtractionManager:
         self._binary_paths, self._binaries = self._check_system_dependencies()
         self._versions = self._check_python_package_versions()
         self._extractors_cache: Dict[str, Any] = {} 
-        self._import_cache = ImportCache() 
+        self._import_cache = ImportCache()
+        self._extractor_init_lock = threading.Lock()
 
     def _check_system_dependencies(self) -> Tuple[Dict[str, str], Dict[str, bool]]:
         # (This method should be fully implemented here as it was in the original script,
@@ -123,85 +125,66 @@ class ExtractionManager:
         return versions
 
 
-    def _get_extractor(self, file_path: str, 
-                    use_nanonets_ocr2: bool = False,
-                    nanonets_config: Optional[Dict] = None,
-                    use_docstrange: bool = False,
-                    docstrange_config: Optional[Dict] = None) -> Optional[Any]:
-        """Get appropriate extractor for file with improved caching"""
-        
+    def _get_extractor(self, file_path: str,
+                       use_nanonets_ocr2: bool = False,
+                       nanonets_config: Optional[Dict] = None,
+                       use_docstrange: bool = False,
+                       docstrange_config: Optional[Dict] = None) -> Optional[Any]:
+        """
+        Get appropriate extractor for the file with robust, thread-safe caching.
+        """
         file_ext = os.path.splitext(file_path)[1].lower()
-        
-        # Priority 1: DocStrange (if enabled)
+
+        # 1. Determine the unique cache key based on the configuration
+        cache_key = file_ext  # Default for standard extractors
         if use_docstrange and docstrange_config:
-            # FIXED: Better cache key that includes all relevant config
             mode = docstrange_config.get('mode', 'cloud')
-            api_key_hash = hash(docstrange_config.get('api_key', 'none'))  # Hash for privacy
+            api_key_hash = hash(docstrange_config.get('api_key', 'none'))
             cache_key = f"docstrange_{mode}_{api_key_hash}"
-            
-            if cache_key not in self._extractors_cache:
-                try:
+        elif use_nanonets_ocr2 and nanonets_config:
+            parts = ["nanonets"]
+            if nanonets_config.get('use_gguf'):
+                parts.extend(['gguf', nanonets_config.get('gguf_quantization', 'q4')])
+            elif nanonets_config.get('use_ollama'):
+                parts.extend(['ollama', nanonets_config.get('ollama_model', 'default')])
+            elif nanonets_config.get('use_vllm_server'):
+                parts.extend(['vllm', nanonets_config.get('vllm_base_url')])
+            else: # Transformers
+                parts.extend(['transformers', nanonets_config.get('model_name', '3b')])
+            cache_key = '_'.join(parts)
+
+        # 2. First check (fast path): Return immediately if already cached.
+        if cache_key in self._extractors_cache:
+            if self._debug:
+                logging.debug(f"Using cached extractor for key: {cache_key}")
+            return self._extractors_cache[cache_key]
+
+        # 3. Lock: Only one thread can proceed beyond this point to initialize.
+        with self._extractor_init_lock:
+            # 4. Second check (double-check): Another thread might have created it while we waited.
+            if cache_key in self._extractors_cache:
+                if self._debug:
+                    logging.debug(f"Using cached extractor (found after acquiring lock) for key: {cache_key}")
+                return self._extractors_cache[cache_key]
+
+            # 5. Initialization: This thread is now solely responsible for creating the extractor.
+            if self._debug:
+                logging.debug(f"No cached extractor for '{cache_key}'. Initializing...")
+
+            extractor_instance = None
+            try:
+                if use_docstrange and docstrange_config:
                     from extractors import DocStrangeExtractor
-                    
-                    if self._debug:
-                        logging.debug(f"Initializing DocStrange extractor (mode: {mode})")
-                    
-                    self._extractors_cache[cache_key] = DocStrangeExtractor(
+                    extractor_instance = DocStrangeExtractor(
                         import_cache=self._import_cache,
                         debug=self._debug,
-                        mode=mode,
+                        mode=docstrange_config.get('mode', 'cloud'),
                         api_key=docstrange_config.get('api_key'),
                         binary_paths=self._binary_paths
                     )
-                    
-                    if self._debug:
-                        logging.debug(f"DocStrange initialized successfully with cache key: {cache_key}")
-                        
-                except Exception as e:
-                    logging.error(f"Failed to initialize DocStrange: {e}", exc_info=self._debug)
-                    self._extractors_cache[cache_key] = None
-            
-            if self._extractors_cache.get(cache_key):
-                if self._debug:
-                    logging.debug(f"Using cached DocStrange extractor: {cache_key}")
-                return self._extractors_cache[cache_key]
-        
-        # Priority 2: Nanonets-OCR2 (if enabled)
-        if use_nanonets_ocr2 and nanonets_config:
-            # FIXED: Better cache key generation with all relevant config
-            cache_key_parts = ["nanonets"]
-            
-            if nanonets_config.get('use_ollama'):
-                ollama_model = nanonets_config.get('ollama_model', 'default')
-                ollama_host = nanonets_config.get('ollama_host', 'localhost')
-                cache_key_parts.extend(['ollama', ollama_model, ollama_host])
-                
-            elif nanonets_config.get('use_gguf'):
-                quant = nanonets_config.get('gguf_quantization', 'q4')
-                n_ctx = nanonets_config.get('n_ctx', 8192)  # Default to 8192
-                n_gpu = nanonets_config.get('n_gpu_layers', -1)
-                chat_format = nanonets_config.get('gguf_chat_format', 'llava-1.5')
-                cache_key_parts.extend(['gguf', quant, str(n_ctx), str(n_gpu), chat_format])
-                
-            elif nanonets_config.get('use_vllm_server'):
-                vllm_url = nanonets_config.get('vllm_base_url', 'localhost:8000')
-                cache_key_parts.extend(['vllm', vllm_url])
-                
-            else:
-                model_name = nanonets_config.get('model_name', '3b')
-                device = nanonets_config.get('device_map', 'auto')
-                cache_key_parts.extend(['transformers', model_name, device])
-            
-            cache_key = '_'.join(cache_key_parts)
-            
-            if cache_key not in self._extractors_cache:
-                try:
+                elif use_nanonets_ocr2 and nanonets_config:
                     from extractors import NanonetsOCR2Extractor
-                    
-                    if self._debug:
-                        logging.debug(f"Initializing Nanonets-OCR2 extractor with config: {nanonets_config}")
-                    
-                    self._extractors_cache[cache_key] = NanonetsOCR2Extractor(
+                    extractor_instance = NanonetsOCR2Extractor(
                         import_cache=self._import_cache,
                         debug=self._debug,
                         model_name=nanonets_config.get('model_name'),
@@ -219,70 +202,34 @@ class ExtractionManager:
                         n_gpu_layers=nanonets_config.get('n_gpu_layers', -1),
                         binary_paths=self._binary_paths
                     )
-                    
-                    if self._debug:
-                        logging.debug(f"Nanonets-OCR2 initialized successfully with cache key: {cache_key}")
-                        
-                except Exception as e:
-                    logging.error(f"Failed to initialize Nanonets-OCR2: {e}", exc_info=self._debug)
-                    self._extractors_cache[cache_key] = None
-            
-            if self._extractors_cache.get(cache_key):
-                if self._debug:
-                    logging.debug(f"Using cached Nanonets-OCR2 extractor: {cache_key}")
-                return self._extractors_cache[cache_key]
-        
-        # Priority 3: Standard extractors based on file extension
-        if file_ext not in self._extractors_cache:
-            extractor_type = self.SUPPORTED_EXTENSIONS.get(file_ext)
-            if not extractor_type:
-                logging.warning(f"Unsupported file type for extraction: {file_path} (ext: {file_ext})")
-                return None
-            
-            extractor_class = None
-            if extractor_type == 'PDF': 
-                from extractors import PDFExtractor
-                extractor_class = PDFExtractor
-            elif extractor_type == 'EPUB': 
-                from extractors import EPUBExtractor
-                extractor_class = EPUBExtractor
-            elif extractor_type == 'DJVU': 
-                from extractors import DJVUExtractor
-                extractor_class = DJVUExtractor
-            elif extractor_type == 'MOBI': 
-                from extractors import MOBIExtractor
-                extractor_class = MOBIExtractor
-            elif extractor_type == 'Text': 
-                from extractors import TextExtractor
-                extractor_class = TextExtractor
-            elif extractor_type == 'HTML': 
-                from extractors import HTMLExtractor
-                extractor_class = HTMLExtractor
-            elif extractor_type == 'PPTX': 
-                from extractors import PPTXExtractor
-                extractor_class = PPTXExtractor
-            
-            if extractor_class:
-                try:
-                    if self._debug:
-                        logging.debug(f"Initializing {extractor_type} extractor for {file_ext}")
-                    
-                    self._extractors_cache[file_ext] = extractor_class(
-                        import_cache=self._import_cache,
-                        debug=self._debug,
-                        binary_paths=self._binary_paths 
-                    )
-                    
-                    if self._debug:
-                        logging.debug(f"{extractor_type} extractor initialized successfully")
-                        
-                except Exception as e:
-                    logging.error(f"Failed to initialize extractor '{extractor_type}' for '{file_ext}': {e}", exc_info=self._debug)
-                    self._extractors_cache[file_ext] = None
-            else:
-                self._extractors_cache[file_ext] = None
-        
-        return self._extractors_cache.get(file_ext)
+                else: # Standard extractors
+                    extractor_type = self.SUPPORTED_EXTENSIONS.get(file_ext)
+                    if extractor_type:
+                        if extractor_type == 'PDF': from extractors import PDFExtractor; extractor_class = PDFExtractor
+                        elif extractor_type == 'EPUB': from extractors import EPUBExtractor; extractor_class = EPUBExtractor
+                        elif extractor_type == 'DJVU': from extractors import DJVUExtractor; extractor_class = DJVUExtractor
+                        elif extractor_type == 'MOBI': from extractors import MOBIExtractor; extractor_class = MOBIExtractor
+                        elif extractor_type == 'Text': from extractors import TextExtractor; extractor_class = TextExtractor
+                        elif extractor_type == 'HTML': from extractors import HTMLExtractor; extractor_class = HTMLExtractor
+                        elif extractor_type == 'PPTX': from extractors import PPTXExtractor; extractor_class = PPTXExtractor
+                        else: extractor_class = None
+
+                        if extractor_class:
+                            extractor_instance = extractor_class(
+                                import_cache=self._import_cache,
+                                debug=self._debug,
+                                binary_paths=self._binary_paths
+                            )
+            except Exception as e:
+                logging.error(f"Failed to initialize extractor for key '{cache_key}': {e}", exc_info=self._debug)
+                extractor_instance = None
+
+            # 6. Cache the result (even if it's None) and release the lock.
+            self._extractors_cache[cache_key] = extractor_instance
+            if self._debug and extractor_instance:
+                logging.debug(f"Extractor for key '{cache_key}' initialized and cached.")
+
+        return self._extractors_cache[cache_key]
 
     def extract(self, input_path: str, 
                 output_path: Optional[str] = None, 

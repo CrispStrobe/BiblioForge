@@ -3,6 +3,7 @@ import os
 import logging
 import tempfile
 import base64
+import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, Callable, List
 from tqdm import tqdm
@@ -21,6 +22,9 @@ class NanonetsOCR2Extractor:
     - llama.cpp GGUF (with mmproj)
     - Ollama
     """
+
+    _model_init_lock = threading.Lock()
+    _loaded_models: Dict[str, Any] = {}
     
     # Official HuggingFace models
     DEFAULT_MODEL = "nanonets/Nanonets-OCR2-3B"
@@ -103,6 +107,7 @@ class NanonetsOCR2Extractor:
         self._vllm_client = None
         self._llama_cpp_model = None
         self._ollama_client = None
+        self._model_init_lock = threading.Lock()
         
         self._available_methods: Optional[Dict[str, bool]] = None
         
@@ -215,85 +220,87 @@ class NanonetsOCR2Extractor:
             return False
     
     def _init_llama_cpp_model(self):
-        """Initialize llama.cpp model with vision support (mmproj)"""
-        if self._llama_cpp_model is not None:
+        """Initializes llama.cpp model with vision support (mmproj) in a thread-safe manner."""
+        # Create a unique key for this model configuration
+        model_key = f"gguf_{self._gguf_quantization}_{self._n_ctx}_{self._n_gpu_layers}"
+
+        # First check (no lock): if model is already loaded, return immediately. This is the fast path.
+        if model_key in NanonetsOCR2Extractor._loaded_models:
+            self._llama_cpp_model = NanonetsOCR2Extractor._loaded_models[model_key]
             return True
-        
-        if not self.available_methods['llama_cpp_gguf']:
-            logging.error("llama-cpp-python not available")
-            return False
-        
-        try:
-            from llama_cpp import Llama
-            from llama_cpp.llama_chat_format import Llava15ChatHandler
-            
-            # Download GGUF models if not provided
-            if not self._gguf_model_path:
-                self._gguf_model_path = self._download_gguf_model()
-            
-            if not self._gguf_mmproj_path:
-                self._gguf_mmproj_path = self._download_mmproj_model()
-            
-            if not self._gguf_model_path or not self._gguf_mmproj_path:
-                logging.error("Failed to obtain GGUF model files")
+
+        # Lock: Only one thread can proceed to initialize the model.
+        with NanonetsOCR2Extractor._model_init_lock:
+            # Second check (inside lock): Another thread might have loaded it while this one was waiting.
+            if model_key in NanonetsOCR2Extractor._loaded_models:
+                self._llama_cpp_model = NanonetsOCR2Extractor._loaded_models[model_key]
+                return True
+
+            if not self.available_methods['llama_cpp_gguf']:
+                logging.error("llama-cpp-python not available for GGUF mode.")
                 return False
             
-            logging.info(f"Loading Nanonets-OCR2 GGUF model ({self._gguf_quantization})...")
-            logging.info(f"  Model: {self._gguf_model_path}")
-            logging.info(f"  MMProj: {self._gguf_mmproj_path}")
-            
-            # Auto-detect GPU layers
-            n_gpu_layers = self._n_gpu_layers
-            if n_gpu_layers == -1:
-                try:
-                    import torch
-                    if torch.backends.mps.is_available():
-                        n_gpu_layers = 33  # All layers for 3B model
-                        logging.info("  Using Metal (MPS) acceleration")
-                    elif torch.cuda.is_available():
-                        # Check available VRAM
-                        try:
-                            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                            if vram_gb >= 8:
-                                n_gpu_layers = 33  # All layers
-                            elif vram_gb >= 4:
-                                n_gpu_layers = 20  # Partial offload
-                            else:
-                                n_gpu_layers = 10  # Minimal offload
-                            logging.info(f"  Using CUDA acceleration ({vram_gb:.1f}GB VRAM, {n_gpu_layers} layers)")
-                        except:
-                            n_gpu_layers = 33  # Default to all
+            try:
+                from llama_cpp import Llama
+                from llama_cpp.llama_chat_format import Llava15ChatHandler
+                
+                model_path = self._download_gguf_model()
+                # --- THIS IS THE CORRECTED LINE ---
+                mmproj_path = self._download_mmproj_model()
+                
+                if not model_path or not mmproj_path:
+                    logging.error("Failed to obtain necessary GGUF model files.")
+                    return False
+                
+                logging.info(f"Loading Nanonets-OCR2 GGUF model ({self._gguf_quantization}). This happens once.")
+                logging.info(f"  Model: {model_path}")
+                logging.info(f"  MMProj: {mmproj_path}")
+                
+                n_gpu_layers = self._n_gpu_layers
+                if n_gpu_layers == -1: # Auto-detect GPU layers for Metal/CUDA
+                    try:
+                        import torch
+                        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                            n_gpu_layers = 33  # All layers for 3B model on Apple Silicon
+                            logging.info("  Using Metal (MPS) acceleration")
+                        elif torch.cuda.is_available():
+                            n_gpu_layers = 33  # Assume sufficient VRAM for full offload on CUDA
                             logging.info("  Using CUDA acceleration")
-                    else:
+                        else:
+                            n_gpu_layers = 0
+                            logging.info("  No GPU detected by PyTorch, using CPU only.")
+                    except ImportError:
                         n_gpu_layers = 0
-                        logging.info("  Using CPU only (this will be slow)")
-                except ImportError:
-                    n_gpu_layers = 0
-                    logging.info("  PyTorch not available, using CPU only")
-            
-            # Initialize chat handler with mmproj (critical for vision)
-            chat_handler = Llava15ChatHandler(
-                clip_model_path=self._gguf_mmproj_path,
-                verbose=self._debug
-            )
-            
-            # Load model
-            self._llama_cpp_model = Llama(
-                model_path=self._gguf_model_path,
-                chat_handler=chat_handler,
-                n_ctx=self._n_ctx,
-                n_gpu_layers=n_gpu_layers,
-                verbose=self._debug,
-                logits_all=True,
-                n_threads=8
-            )
-            
-            logging.info("Nanonets-OCR2 GGUF model loaded successfully")
-            return True
-            
-        except Exception as e:
-            logging.error(f"Failed to load GGUF model: {e}", exc_info=self._debug)
-            return False
+                        logging.info("  PyTorch not found, using CPU only for GGUF model.")
+
+                chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path, verbose=self._debug)
+                
+                # The resource-intensive call is now protected and happens only once per model config.
+                llama_instance = Llama(
+                    model_path=model_path,
+                    chat_handler=chat_handler,
+                    n_ctx=self._n_ctx,
+                    n_gpu_layers=n_gpu_layers,
+                    n_batch=512,
+                    verbose=self._debug,
+                    logits_all=True,
+                    n_threads=os.cpu_count() or 4
+                )
+                
+                # Store the initialized model in the class-level cache
+                NanonetsOCR2Extractor._loaded_models[model_key] = llama_instance
+                self._llama_cpp_model = llama_instance
+                
+                logging.info("Nanonets-OCR2 GGUF model loaded successfully.")
+                return True
+                
+            except Exception as e:
+                logging.error(f"Failed to load GGUF model: {e}", exc_info=self._debug)
+                # Ensure we don't cache a failed attempt
+                if model_key in NanonetsOCR2Extractor._loaded_models:
+                    del NanonetsOCR2Extractor._loaded_models[model_key]
+                self._llama_cpp_model = None
+                return False
     
     def _download_gguf_model(self) -> Optional[str]:
         """Download GGUF model from HuggingFace"""
