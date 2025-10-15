@@ -11,7 +11,7 @@ import time
 import platform
 import traceback # For more detailed error logging if needed
 from concurrent.futures import TimeoutError as FutureTimeoutError
-
+import tempfile
 
 # --- Corrected Imports for sibling modules ---
 from extraction_manager import ExtractionManager
@@ -84,13 +84,14 @@ class DocumentProcessor:
         # If it looks like "Firstname Lastname", use LLM to sort
         if len(cleaned_name.split()) >= 2:
             try:
-                # This call now directly returns the best guess from the LLM
+                # We extract only the parameters that sort_author_names expects
                 sorted_name = sort_author_names(
                     author_names_input=cleaned_name,
                     provider_arg=llm_provider_instance,
                     verbose=self._debug,
                     filename_for_logging=input_file,
-                    **kwargs_from_main
+                    prompt_template_index=0  # Start with first template
+                    # Don't pass **kwargs_from_main - it contains incompatible params
                 )
                 if valid_author_name(sorted_name):
                     return sorted_name
@@ -210,6 +211,194 @@ class DocumentProcessor:
                         best_result = result
                         break
                 return best_result
+            
+    def _get_poppler_path(self) -> Optional[str]:
+        """Get poppler path from binary_paths if available"""
+        if hasattr(self.manager, '_binary_paths') and 'pdftoppm' in self.manager._binary_paths:
+            return os.path.dirname(self.manager._binary_paths['pdftoppm'])
+        return None
+            
+    def extract_metadata_with_nanonets_ocr2(self, file_path: str,
+                                            nanonets_extractor) -> Optional[Dict[str, str]]:
+        """Extract metadata using Nanonets-OCR2 VQA"""
+        try:
+            # For PDF, convert first page to image
+            if file_path.lower().endswith('.pdf'):
+                from pdf2image import convert_from_path
+                poppler_path = self._get_poppler_path()
+                
+                images = convert_from_path(
+                    file_path, dpi=300, first_page=1, last_page=1,
+                    poppler_path=poppler_path
+                )
+                
+                if not images:
+                    return None
+                
+                # Save first page as temp image
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                    temp_image_path = tmp.name
+                    images[0].save(temp_image_path, 'PNG')
+                
+                try:
+                    metadata = nanonets_extractor.extract_metadata_fields(
+                        temp_image_path,
+                        fields=['title', 'author', 'authors', 'year', 'language']
+                    )
+                finally:
+                    try:
+                        os.unlink(temp_image_path)
+                    except:
+                        pass
+            else:
+                # For image files
+                metadata = nanonets_extractor.extract_metadata_fields(
+                    file_path,
+                    fields=['title', 'author', 'authors', 'year', 'language']
+                )
+            
+            if not metadata:
+                return None
+            
+            # Parse and validate
+            title = metadata.get('title', '').strip()
+            author = metadata.get('author', '').strip()
+            
+            # Handle authors list
+            if not author and metadata.get('authors'):
+                authors_str = metadata['authors']
+                if ',' in authors_str:
+                    author = authors_str.split(',')[0].strip()
+                elif ';' in authors_str:
+                    author = authors_str.split(';')[0].strip()
+                else:
+                    author = authors_str.strip()
+            
+            # Validate and fix year
+            year = validate_and_fix_year(metadata.get('year', ''))
+            
+            # Get language
+            language = metadata.get('language', 'ul').strip().lower()
+            if len(language) > 2:
+                lang_map = {
+                    'english': 'en', 'german': 'de', 'french': 'fr',
+                    'spanish': 'es', 'italian': 'it', 'portuguese': 'pt'
+                }
+                language = lang_map.get(language.lower(), 'ul')[:2]
+            
+            if not title or not author:
+                return None
+            
+            return {
+                'title': title,
+                'author': author,
+                'year': year,
+                'language': language
+            }
+            
+        except Exception as e:
+            logging.error(f"Nanonets-OCR2 metadata extraction failed: {e}", 
+                        exc_info=self._debug)
+            return None
+            
+    def extract_metadata_with_docstrange(self, file_path: str,
+                                        docstrange_extractor,
+                                        metadata_fields: Optional[List[str]] = None,
+                                        metadata_schema: Optional[Dict] = None) -> Optional[Dict[str, str]]:
+        """
+        Extract metadata using DocStrange structured extraction.
+        
+        Returns metadata in BiblioForge format: {title, author, year, language}
+        """
+        try:
+            # Use provided fields/schema or default
+            if not metadata_fields and not metadata_schema:
+                metadata_fields = [
+                    'title', 'author', 'authors', 'year',
+                    'publication_date', 'publisher', 'language'
+                ]
+            
+            # FIXED: Use correct DocStrange API
+            # First extract the document
+            result = docstrange_extractor._extractor_instance.extract(file_path)
+            
+            # Then get structured data using extract_data()
+            if metadata_schema:
+                raw_metadata = result.extract_data(json_schema=metadata_schema)
+            elif metadata_fields:
+                raw_metadata = result.extract_data(specified_fields=metadata_fields)
+            else:
+                raw_metadata = result.extract_data()
+            
+            if not raw_metadata:
+                return None
+            
+            # Handle different response formats
+            if 'extracted_fields' in raw_metadata:
+                # Format: {"extracted_fields": {...}, "format": "..."}
+                fields_data = raw_metadata['extracted_fields']
+            elif 'structured_data' in raw_metadata:
+                # Format: {"structured_data": {...}, "schema": {...}}
+                fields_data = raw_metadata['structured_data']
+            else:
+                # Direct format
+                fields_data = raw_metadata
+            
+            # Parse and validate
+            title = fields_data.get('title', '').strip()
+            
+            # Get author - prefer 'author' field, fallback to first in 'authors'
+            author = fields_data.get('author', '').strip()
+            if not author and fields_data.get('authors'):
+                authors_list = fields_data['authors']
+                if isinstance(authors_list, list) and authors_list:
+                    author = authors_list[0]
+                elif isinstance(authors_list, str):
+                    # Parse author list string
+                    if ',' in authors_list:
+                        author = authors_list.split(',')[0].strip()
+                    elif ';' in authors_list:
+                        author = authors_list.split(';')[0].strip()
+                    else:
+                        author = authors_list.strip()
+            
+            # Get and validate year
+            year = fields_data.get('year', '').strip()
+            if not year:
+                pub_date = fields_data.get('publication_date', '')
+                year_match = re.search(r'\b(19|20)\d{2}\b', str(pub_date))
+                if year_match:
+                    year = year_match.group(0)
+            year = validate_and_fix_year(year)
+            
+            # Get language
+            language = fields_data.get('language', 'ul').strip().lower()
+            if len(language) > 2:
+                # Convert full language name to code
+                lang_map = {
+                    'english': 'en', 'german': 'de', 'french': 'fr',
+                    'spanish': 'es', 'italian': 'it', 'portuguese': 'pt',
+                    'chinese': 'zh', 'japanese': 'ja', 'korean': 'ko',
+                    'russian': 'ru', 'arabic': 'ar'
+                }
+                language = lang_map.get(language.lower(), language[:2])
+            language = language[:2] if len(language) >= 2 else 'ul'
+            
+            if not title or not author:
+                logging.warning(f"DocStrange metadata incomplete for {os.path.basename(file_path)}")
+                return None
+            
+            return {
+                'title': title,
+                'author': author,
+                'year': year,
+                'language': language
+            }
+            
+        except Exception as e:
+            logging.error(f"DocStrange metadata extraction failed: {e}",
+                        exc_info=self._debug)
+            return None
 
     def _extract_pdf_metadata(self, file_path: str) -> Dict[str, Any]:
         metadata = {}
@@ -714,16 +903,55 @@ class DocumentProcessor:
                         if not initialized_rename_script_paths and self._debug:
                             logging.warning(f"DS_Proc: Sort is True for '{input_file}', but rename scripts not initialized. Cannot generate rename commands.")
 
-                        final_parsed_llm_meta = self.process_llm_metadata_with_retries(
-                            text=result["text"],
-                            input_file=input_file,
-                            llm_provider_instance=llm_provider_instance,
-                            temperature_for_metadata=temperature_for_metadata,
-                            max_tokens_for_metadata=max_tokens_for_metadata,
-                            llm_timeout=180,  # 3 minute timeout
-                            **kwargs_from_main
-                        )
+                        # NEW: Try specialized extraction first if available
+                        final_parsed_llm_meta = None
+                        
+                        # Check if Nanonets-OCR2 metadata extraction is enabled
+                        nanonets_config = kwargs_from_main.get('nanonets_config')
+                        if nanonets_config and nanonets_config.get('use_for_metadata'):
+                            nanonets_extractor = self.manager._get_extractor(
+                                input_file,
+                                use_nanonets_ocr2=True,
+                                nanonets_config=nanonets_config
+                            )
+                            if nanonets_extractor:
+                                if self._debug:
+                                    logging.debug(f"DS_Proc: Trying Nanonets-OCR2 metadata extraction for '{input_file}'")
+                                final_parsed_llm_meta = self.extract_metadata_with_nanonets_ocr2(
+                                    input_file, nanonets_extractor
+                                )
+                        
+                        # Check if DocStrange metadata extraction is enabled
+                        if not final_parsed_llm_meta:
+                            docstrange_config = kwargs_from_main.get('docstrange_config')
+                            if docstrange_config and docstrange_config.get('use_for_metadata'):
+                                docstrange_extractor = self.manager._get_extractor(
+                                    input_file,
+                                    use_docstrange=True,
+                                    docstrange_config=docstrange_config
+                                )
+                                if docstrange_extractor:
+                                    if self._debug:
+                                        logging.debug(f"DS_Proc: Trying DocStrange metadata extraction for '{input_file}'")
+                                    final_parsed_llm_meta = self.extract_metadata_with_docstrange(
+                                        input_file,
+                                        docstrange_extractor,
+                                        metadata_fields=docstrange_config.get('metadata_fields'),
+                                        metadata_schema=docstrange_config.get('metadata_schema')
+                                    )
+                        
+                        # Fallback to standard LLM text-based extraction
+                        if not final_parsed_llm_meta:
+                            final_parsed_llm_meta = self.process_llm_metadata_with_retries(
+                                text=result["text"],
+                                input_file=input_file,
+                                llm_provider_instance=llm_provider_instance,
+                                temperature=temperature_for_metadata,
+                                max_tokens=max_tokens_for_metadata,
+                                **kwargs_from_main
+                            )
 
+                        # Continue with rename command generation...
                         if final_parsed_llm_meta:
                             result['metadata_llm'] = final_parsed_llm_meta
                             if initialized_rename_script_paths:

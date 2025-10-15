@@ -1,0 +1,10 @@
+{
+  "title": "string",
+  "author": "string",
+  "authors": ["string"],
+  "year": "string",
+  "publisher": "string",
+  "isbn": "string",
+  "doi": "string",
+  "abstract": "string"
+}

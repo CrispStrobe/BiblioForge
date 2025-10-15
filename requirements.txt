@@ -1,0 +1,16 @@
+# Nanonets-OCR2 integration (optional)
+transformers>=4.35.0
+torch>=2.0.0
+accelerate>=0.25.0
+pillow>=10.0.0
+pdf2image>=1.16.0
+
+# Optional: for better performance
+flash-attn>=2.5.0  # For flash attention
+
+# Optional: for vLLM server mode
+# vllm>=0.2.0  # If using vLLM server
+openai>=1.0.0  # For vLLM client
+
+# DocStrange integration (optional)
+docstrange>=1.0.0
