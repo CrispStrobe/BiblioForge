@@ -60,10 +60,11 @@ class NanonetsOCR2Extractor:
     # Official prompt template from documentation
     DEFAULT_PROMPT = """Extract the text from the above document as if you were reading it naturally. Return the tables in html format. Return the equations in LaTeX representation. If there is an image in the document and image caption is not present, add a small description of the image inside the <img></img> tag; otherwise, add the image caption inside <img></img>. Watermarks should be wrapped in brackets. Ex: <watermark>OFFICIAL COPY</watermark>. Page numbers should be wrapped in brackets. Ex: <page_number>14</page_number> or <page_number>9/22</page_number>. Prefer using ☐ and ☑ for check boxes."""
     
+    _loaded_clients: Dict[str, Any] = {}
+
     def __init__(self, import_cache: ImportCache, debug: bool = False,
                  model_name: Optional[str] = None,
                  use_gguf: bool = False,
-                 # gguf_model_path is intentionally removed; model_name is used for repo_id or local path
                  gguf_mmproj_path: Optional[str] = None,
                  gguf_quantization: str = "q4",
                  gguf_chat_format: str = "llava-1.5",
@@ -83,7 +84,7 @@ class NanonetsOCR2Extractor:
         
         # GGUF support
         self._use_gguf = use_gguf
-        self._gguf_model_path = None  # Resolved later in _init_llama_cpp_model to ensure consistency
+        self._gguf_model_path = None 
         self._gguf_mmproj_path = gguf_mmproj_path
         self._gguf_quantization = gguf_quantization
         self._gguf_chat_format = gguf_chat_format
@@ -106,7 +107,7 @@ class NanonetsOCR2Extractor:
         self._processor = None
         self._vllm_client = None
         self._llama_cpp_model = None
-        self._ollama_client = None
+        self._ollama_provider_instance = None # <-- ADDED
         self._model_init_lock = threading.Lock()
         
         self._available_methods: Optional[Dict[str, bool]] = None
@@ -118,15 +119,28 @@ class NanonetsOCR2Extractor:
             logging.debug(f"  Ollama mode: {self._use_ollama}")
             logging.debug(f"  vLLM server mode: {self._use_vllm_server}")
 
-            # Auto-detect Ollama model format
-            if not self._use_ollama and not self._use_gguf:
-                # Check if model name looks like an Ollama model
-                if model_name and ':' in model_name and '/' in model_name:
-                    # Format like "benhaotang/Nanonets-OCR-s:q4_k_m"
-                    self._use_ollama = True
-                    self._ollama_model = model_name
-                    if self._debug:
-                        logging.debug(f"  Auto-detected Ollama model format: {model_name}")
+        # Auto-detect Ollama model format
+        if not self._use_ollama and not self._use_gguf:
+            if model_name and ':' in model_name and '/' in model_name:
+                self._use_ollama = True
+                self._ollama_model = model_name
+                if self._debug:
+                    logging.debug(f"  Auto-detected Ollama model format: {model_name}")
+
+        # --- CORRECTED OLLAMA INITIALIZATION ---
+        if self._use_ollama:
+            try:
+                from llm_providers import OllamaProvider
+                # This call correctly handles model checking, pulling, and caching.
+                self._ollama_provider_instance = OllamaProvider(
+                    model_name=self._ollama_model,
+                    host=self._ollama_host,
+                    debug=self._debug
+                )
+                logging.info("Nanonets-OCR2: Successfully initialized centralized Ollama provider.")
+            except Exception as e:
+                logging.error(f"Failed to initialize OllamaProvider for Nanonets: {e}")
+                self._use_ollama = False # Disable Ollama if init fails
     
     @property
     def available_methods(self) -> Dict[str, bool]:
@@ -281,7 +295,7 @@ class NanonetsOCR2Extractor:
                     chat_handler=chat_handler,
                     n_ctx=self._n_ctx,
                     n_gpu_layers=n_gpu_layers,
-                    n_batch=512,
+                    n_batch=64,
                     verbose=self._debug,
                     logits_all=True,
                     n_threads=os.cpu_count() or 4
@@ -373,58 +387,65 @@ class NanonetsOCR2Extractor:
             return None
     
     def _init_ollama_client(self):
-        """Initialize Ollama client and ensure model is available"""
-        if self._ollama_client is not None:
+        """Initializes the Ollama client in a thread-safe, singleton manner."""
+        client_key = f"ollama_{self._ollama_host or 'default'}_{self._ollama_model}"
+
+        # Fast path: Return immediately if the client is already loaded and cached.
+        if client_key in NanonetsOCR2Extractor._loaded_clients:
+            self._ollama_client = NanonetsOCR2Extractor._loaded_clients[client_key]
             return True
-        
-        try:
-            import ollama
-            
-            client_kwargs = {'host': self._ollama_host} if self._ollama_host else {}
-            
-            # Check if model exists - simple approach that works with all formats
+
+        # Slow path: Use a lock to ensure only one thread initializes the client.
+        with NanonetsOCR2Extractor._model_init_lock:
+            # Double-check inside the lock in case another thread finished while this one was waiting.
+            if client_key in NanonetsOCR2Extractor._loaded_clients:
+                self._ollama_client = NanonetsOCR2Extractor._loaded_clients[client_key]
+                return True
+
             try:
-                # Try to show the model - if it exists, this succeeds
-                model_info = ollama.show(self._ollama_model, **client_kwargs)
-                logging.info(f"Ollama model '{self._ollama_model}' is available")
+                import ollama
+                client_kwargs = {'host': self._ollama_host} if self._ollama_host else {}
+
+                try:
+                    # Directly check if the specific model exists using ollama.show()
+                    ollama.show(self._ollama_model, **client_kwargs)
+                    logging.info(f"✓ Ollama model '{self._ollama_model}' is already available locally.")
+
+                except ollama.ResponseError as e:
+                    # If the model is not found (404), proceed to pull it.
+                    if e.status_code == 404:
+                        logging.info(f"Pulling Ollama model '{self._ollama_model}'...")
+                        try:
+                            pull_stream = ollama.pull(self._ollama_model, stream=True, **client_kwargs)
+                            
+                            # Display progress to the user
+                            last_status = None
+                            for chunk in pull_stream:
+                                if shutdown_flag.is_set():
+                                    raise InterruptedError("Model pull cancelled by user")
+                                
+                                status = chunk.get('status', '')
+                                if status and status != last_status:
+                                    logging.info(f"  {status}")
+                                    last_status = status
+                            
+                            logging.info(f"✓ Model '{self._ollama_model}' pulled successfully.")
+
+                        except Exception as pull_error:
+                            logging.error(f"Failed to pull model '{self._ollama_model}': {pull_error}", exc_info=self._debug)
+                            return False
+                    else:
+                        # Re-raise other API errors
+                        raise
+                
+                # Cache the initialized client at the class level and assign to the instance
+                NanonetsOCR2Extractor._loaded_clients[client_key] = ollama
                 self._ollama_client = ollama
                 return True
-            except Exception as show_error:
-                # Model doesn't exist, need to pull it
-                logging.info(f"Pulling Ollama model '{self._ollama_model}'...")
-                
-                # Pull with progress tracking
-                try:
-                    pull_stream = ollama.pull(self._ollama_model, stream=True, **client_kwargs)
-                    
-                    last_status = None
-                    for chunk in pull_stream:
-                        if shutdown_flag.is_set():
-                            raise InterruptedError("Model pull cancelled by user")
-                        
-                        # Log progress
-                        if isinstance(chunk, dict):
-                            status = chunk.get('status', '')
-                            if status != last_status:
-                                logging.info(f"  {status}")
-                                last_status = status
-                    
-                    logging.info(f"✓ Model '{self._ollama_model}' pulled successfully")
-                    self._ollama_client = ollama
-                    return True
-                    
-                except InterruptedError:
-                    logging.warning("Model pull interrupted by user")
-                    raise
-                except Exception as pull_error:
-                    logging.error(f"Failed to pull model '{self._ollama_model}': {pull_error}")
-                    return False
-        
-        except InterruptedError:
-            raise
-        except Exception as e:
-            logging.error(f"Failed to initialize Ollama: {e}", exc_info=self._debug)
-            return False
+
+            except Exception as e:
+                logging.error(f"Failed to initialize Ollama client: {e}", exc_info=self._debug)
+                return False
     
     def _init_vllm_client(self):
         """Initialize vLLM OpenAI-compatible client"""
@@ -551,48 +572,36 @@ class NanonetsOCR2Extractor:
             return ""
     
     def _extract_with_ollama(self, image_path: str, max_tokens: int,
-                            prompt_template: str) -> str:
-        """Extract using Ollama"""
+                             prompt_template: str) -> str:
+        """Extract using the centralized OllamaProvider from llm_providers.py."""
         
-        if not self._init_ollama_client():
+        if not self._ollama_provider_instance:
+            logging.error("Ollama provider was not initialized. Cannot perform extraction.")
             return ""
         
         try:
-            client_kwargs = {'host': self._ollama_host} if self._ollama_host else {}
-            
-            # Verify image exists
-            if not os.path.exists(image_path):
-                logging.error(f"Image file not found: {image_path}")
-                return ""
-            
-            if self._debug:
-                logging.debug(f"Ollama: Processing {os.path.basename(image_path)} with model {self._ollama_model}")
-            
-            # Generate response
-            response = self._ollama_client.generate(
-                model=self._ollama_model,
-                prompt=prompt_template,
-                images=[image_path],
-                options={
-                    'num_predict': max_tokens,
-                    'temperature': 0.0  # Deterministic for OCR
-                },
-                **client_kwargs
+            # The official ollama library, used by your OllamaProvider,
+            # supports the 'images' key directly in the message payload.
+            messages = [
+                {
+                    "role": "user",
+                    "content": prompt_template,
+                    "images": [image_path],
+                }
+            ]
+
+            # Call the chat_completion method of the already-initialized provider
+            response = self._ollama_provider_instance.chat_completion(
+                messages=messages,
+                temperature=0.0,  # Use low temperature for deterministic OCR
+                max_tokens=max_tokens
             )
             
-            # Extract text from response
-            if isinstance(response, dict) and 'response' in response:
-                result_text = response['response']
-                if self._debug:
-                    logging.debug(f"Ollama: Extracted {len(result_text)} characters")
-                return result_text
-            else:
-                logging.warning(f"Ollama: Unexpected response format: {type(response)}")
-                return str(response) if response else ""
-            
+            return response.get("content", "")
+
         except Exception as e:
-            logging.error(f"Ollama extraction failed for {os.path.basename(image_path)}: {e}", 
-                        exc_info=self._debug)
+            logging.error(f"Ollama extraction via provider failed for {os.path.basename(image_path)}: {e}", 
+                          exc_info=self._debug)
             return ""
     
     def _extract_with_transformers(self, image_path: str, max_tokens: int,
@@ -692,9 +701,9 @@ class NanonetsOCR2Extractor:
             return ""
     
     def _extract_from_pdf(self, pdf_path: str, method: str,
-                         progress_callback: Optional[Callable],
-                         max_tokens: int,
-                         prompt_template: str) -> str:
+                        progress_callback: Optional[Callable],
+                        max_tokens: int,
+                        prompt_template: str) -> str:
         """Extract text from PDF by converting pages to images"""
         
         if not self.available_methods['pdf2image']:
@@ -705,6 +714,7 @@ class NanonetsOCR2Extractor:
         
         try:
             from pdf2image import convert_from_path
+            from PIL import Image
             
             # Get poppler path if available
             poppler_path = None
@@ -713,42 +723,89 @@ class NanonetsOCR2Extractor:
             
             logging.info(f"Converting PDF to images: {pdf_path}")
             
+            # REDUCED DPI for memory efficiency (300 -> 200)
+            # Process one page at a time to avoid memory spike
             images = convert_from_path(
                 pdf_path,
-                dpi=300,
-                poppler_path=poppler_path
+                dpi=200,  # Reduced from 300
+                poppler_path=poppler_path,
+                first_page=1,
+                last_page=1  # Start with just first page to test
             )
             
-            total_pages = len(images)
+            # Get total page count
+            try:
+                import fitz  # PyMuPDF
+                doc = fitz.open(pdf_path)
+                total_pages = len(doc)
+                doc.close()
+            except:
+                # Fallback: convert all at low DPI to count
+                test_images = convert_from_path(pdf_path, dpi=72, poppler_path=poppler_path)
+                total_pages = len(test_images)
+                test_images = None  # Free memory
+            
             text_parts = []
             
             with tqdm(total=total_pages, desc="Nanonets-OCR2 Pages", 
-                     unit="page", leave=False, position=2) as pbar:
+                    unit="page", leave=False, position=2) as pbar:
                 
-                for page_num, image in enumerate(images, 1):
+                for page_num in range(1, total_pages + 1):
                     if shutdown_flag.is_set():
                         break
                     
                     pbar.set_description(f"Nanonets-OCR2 Page {page_num}/{total_pages}")
                     
-                    # Save image temporarily
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                        temp_image_path = tmp.name
-                        image.save(temp_image_path, 'PNG')
-                    
+                    # Convert ONE page at a time to avoid memory spike
                     try:
-                        page_text = self._extract_from_image(
-                            temp_image_path, method, None, max_tokens, prompt_template
+                        images = convert_from_path(
+                            pdf_path,
+                            dpi=200,  # Reduced DPI
+                            poppler_path=poppler_path,
+                            first_page=page_num,
+                            last_page=page_num
                         )
                         
-                        if page_text and page_text.strip():
-                            text_parts.append(f"## Page {page_num}\n\n{page_text}")
+                        if not images:
+                            continue
                         
-                    finally:
+                        image = images[0]
+                        
+                        # RESIZE if image is too large (>2000px on any side)
+                        max_dimension = 2000
+                        if image.width > max_dimension or image.height > max_dimension:
+                            ratio = min(max_dimension / image.width, max_dimension / image.height)
+                            new_size = (int(image.width * ratio), int(image.height * ratio))
+                            image = image.resize(new_size, Image.Resampling.LANCZOS)
+                            if self._debug:
+                                logging.debug(f"Resized page {page_num} to {new_size}")
+                        
+                        # Save image temporarily with JPEG compression to reduce size
+                        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                            temp_image_path = tmp.name
+                            image.save(temp_image_path, 'JPEG', quality=85, optimize=True)
+                        
+                        # Free memory immediately
+                        images = None
+                        image = None
+                        
                         try:
-                            os.unlink(temp_image_path)
-                        except:
-                            pass
+                            page_text = self._extract_from_image(
+                                temp_image_path, method, None, max_tokens, prompt_template
+                            )
+                            
+                            if page_text and page_text.strip():
+                                text_parts.append(f"## Page {page_num}\n\n{page_text}")
+                            
+                        finally:
+                            try:
+                                os.unlink(temp_image_path)
+                            except:
+                                pass
+                        
+                    except Exception as e:
+                        logging.error(f"Failed to process page {page_num}: {e}")
+                        continue
                     
                     pbar.update(1)
                     if progress_callback:

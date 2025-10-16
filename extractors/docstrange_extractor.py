@@ -213,19 +213,8 @@ class DocStrangeExtractor:
                     progress_callback: Optional[Callable] = None,
                     output_format: str = 'markdown',
                     **kwargs) -> str:
-        """
-        Extract text using DocStrange.
+        """Extract text using DocStrange."""
         
-        Args:
-            file_path: Path to document
-            preferred_method: Not used, kept for compatibility
-            progress_callback: Progress callback function
-            output_format: 'markdown', 'json', 'html', 'csv', 'text', 'markdown-financial-docs'
-            **kwargs: Additional arguments (e.g., specified_fields, json_schema)
-        
-        Returns:
-            Extracted text in specified format
-        """
         file_basename = os.path.basename(file_path)
         
         # Validate output format
@@ -248,6 +237,36 @@ class DocStrangeExtractor:
             # Extract document using DocStrange API
             result = self._extractor_instance.extract(file_path)
             
+            # DEBUG: Check what we got back
+            if self._debug:
+                logging.debug(f"DocStrange result type: {type(result)}")
+                logging.debug(f"DocStrange result has extract_markdown: {hasattr(result, 'extract_markdown')}")
+                logging.debug(f"DocStrange result has extract_data: {hasattr(result, 'extract_data')}")
+                logging.debug(f"DocStrange result dir: {[m for m in dir(result) if not m.startswith('_')]}")
+                
+                # Try to get ANY content to verify API worked
+                if hasattr(result, 'extract_markdown'):
+                    test_md = result.extract_markdown()
+                    logging.debug(f"Test extract_markdown() returned {len(test_md)} chars")
+                    # After the line: test_md = result.extract_markdown()
+                    if len(test_md) == 0:
+                        logging.error("DocStrange extract_markdown() returned empty string!")
+                        
+                        # ADD THIS: Inspect the raw response
+                        if hasattr(result, 'content'):
+                            logging.debug(f"Raw result.content type: {type(result.content)}")
+                            logging.debug(f"Raw result.content: {result.content}")
+                        
+                        if hasattr(result, 'metadata'):
+                            logging.debug(f"Result metadata: {result.metadata}")
+                        
+                        if hasattr(result, 'cloud_processor'):
+                            proc = result.cloud_processor
+                            if hasattr(proc, '_last_response'):
+                                logging.debug(f"Last API response: {proc._last_response}")
+                            if hasattr(proc, '_api_response'):
+                                logging.debug(f"API response: {proc._api_response}")
+            
             # Get output in requested format
             extracted_text = self._get_formatted_output(
                 result, output_format, **kwargs
@@ -263,46 +282,98 @@ class DocStrangeExtractor:
             
         except Exception as e:
             logging.error(f"DocStrange extraction failed for {file_basename}: {e}", 
-                         exc_info=self._debug)
+                        exc_info=self._debug)
             return ""
     
     def _get_formatted_output(self, result, output_format: str, **kwargs) -> str:
-        """Get output in the requested format - FIXED to handle response properly"""
+        """Get output in the requested format - FIXED for actual DocStrange API"""
         try:
+            # For CloudConversionResult, we need to handle potential API failures
+            if hasattr(result, '__class__') and result.__class__.__name__ == 'CloudConversionResult':
+                # Check if this is a lazy cloud result that hasn't made API calls yet
+                if hasattr(result, '_cached_outputs'):
+                    if self._debug:
+                        logging.debug(f"CloudConversionResult cached outputs: {list(result._cached_outputs.keys())}")
+            
             if output_format == 'markdown' or output_format == 'markdown-financial-docs':
-                # DocStrange handles financial docs automatically
-                return result.extract_markdown()
+                # Try extract_markdown() first
+                if hasattr(result, 'extract_markdown'):
+                    try:
+                        content = result.extract_markdown()
+                        if content:  # Only return if we got actual content
+                            return content
+                        else:
+                            # If empty, this might be an API failure
+                            if self._debug:
+                                logging.warning("extract_markdown() returned empty content")
+                                # Check for API errors
+                                if hasattr(result, 'cloud_processor'):
+                                    proc = result.cloud_processor
+                                    if hasattr(proc, 'api_key'):
+                                        logging.debug(f"API key present: {bool(proc.api_key)}")
+                                    if hasattr(proc, 'api_url'):
+                                        logging.debug(f"API URL: {proc.api_url}")
+                    except Exception as e:
+                        logging.error(f"extract_markdown() failed: {e}", exc_info=self._debug)
+                
+                # Fallback approaches if extract_markdown fails
+                if hasattr(result, 'content') and result.content:
+                    if self._debug:
+                        logging.debug("Using direct result.content")
+                    return result.content
+                elif isinstance(result, dict) and 'content' in result:
+                    return result['content']
+                elif isinstance(result, str):
+                    return result
+                
+                # Try to force content extraction for cloud results
+                if hasattr(result, '_get_cloud_output'):
+                    try:
+                        if self._debug:
+                            logging.debug("Attempting direct _get_cloud_output call")
+                        content = result._get_cloud_output('markdown')
+                        if content:
+                            return content
+                    except Exception as e:
+                        logging.error(f"Direct _get_cloud_output failed: {e}")
             
             elif output_format == 'json':
-                # Check if specific fields or schema requested
+                # Your existing JSON handling code is correct
                 specified_fields = kwargs.get('specified_fields')
                 json_schema = kwargs.get('json_schema')
                 
-                if specified_fields or json_schema:
-                    # FIXED: Handle structured extraction correctly
-                    extracted_data = result.extract_data(
-                        specified_fields=specified_fields,
-                        json_schema=json_schema
-                    )
-                else:
-                    # Get all available data
-                    extracted_data = result.extract_data()
+                if hasattr(result, 'extract_data'):
+                    try:
+                        extracted_data = result.extract_data(
+                            specified_fields=specified_fields,
+                            json_schema=json_schema
+                        )
+                        # Parse response format
+                        if isinstance(extracted_data, dict):
+                            if 'extracted_fields' in extracted_data:
+                                data_to_serialize = extracted_data['extracted_fields']
+                            elif 'structured_data' in extracted_data:
+                                data_to_serialize = extracted_data['structured_data']
+                            else:
+                                data_to_serialize = extracted_data
+                        else:
+                            data_to_serialize = extracted_data
+                        
+                        import json
+                        return json.dumps(data_to_serialize, indent=2, ensure_ascii=False)
+                    except Exception as e:
+                        logging.error(f"extract_data() failed: {e}", exc_info=self._debug)
+            
                 
-                # FIXED: Handle DocStrange response format
-                # DocStrange returns wrapped data like:
-                # {"extracted_fields": {...}, "format": "..."} or
-                # {"structured_data": {...}, "schema": {...}, "format": "..."}
-                
-                # For BiblioForge, we want the actual data, not the wrapper
+                # Parse response format per docs:
+                # Returns: {"extracted_fields": {...}, "format": "specified_fields"}
+                # Or: {"structured_data": {...}, "schema": {...}, "format": "structured_json"}
                 if isinstance(extracted_data, dict):
                     if 'extracted_fields' in extracted_data:
-                        # Specified fields format
                         data_to_serialize = extracted_data['extracted_fields']
                     elif 'structured_data' in extracted_data:
-                        # Schema-based format
                         data_to_serialize = extracted_data['structured_data']
                     else:
-                        # Unknown format or direct data
                         data_to_serialize = extracted_data
                 else:
                     data_to_serialize = extracted_data
@@ -311,26 +382,55 @@ class DocStrangeExtractor:
                 return json.dumps(data_to_serialize, indent=2, ensure_ascii=False)
             
             elif output_format == 'html':
-                return result.extract_html()
+                if hasattr(result, 'extract_html'):
+                    return result.extract_html()
+                elif isinstance(result, dict) and 'content' in result:
+                    return result['content']
             
             elif output_format == 'csv':
-                return result.extract_csv()
+                if hasattr(result, 'extract_csv'):
+                    return result.extract_csv()
+                elif isinstance(result, dict) and 'content' in result:
+                    return result['content']
             
             elif output_format == 'text':
-                return result.extract_text()
+                if hasattr(result, 'extract_text'):
+                    return result.extract_text()
+                elif isinstance(result, dict) and 'content' in result:
+                    return result['content']
             
-            else:
-                logging.warning(f"Unknown output format: {output_format}, using markdown")
+            # Emergency fallback: check if result has ANY extraction method
+            if hasattr(result, 'extract_markdown'):
+                if self._debug:
+                    logging.debug("Fallback: using extract_markdown()")
                 return result.extract_markdown()
+            
+            # If result is a dict, log its structure for debugging
+            if self._debug and isinstance(result, dict):
+                logging.debug(f"DocStrange result keys: {list(result.keys())}")
+                logging.debug(f"DocStrange result type: {type(result)}")
+            
+            # Final fallback: if we have a CloudConversionResult with no content, 
+            # it might be an authentication or rate limit issue
+            if hasattr(result, '__class__') and result.__class__.__name__ == 'CloudConversionResult':
+                logging.error("CloudConversionResult returned no content - possible causes:")
+                logging.error("1. Rate limit exceeded (use 'docstrange login' or API key)")
+                logging.error("2. Network/API connectivity issue")
+                logging.error("3. File format not supported by cloud API")
                 
+            return ""
+
         except Exception as e:
             logging.error(f"Format conversion failed: {e}", exc_info=self._debug)
             
-            # Fallback to markdown if format conversion fails
+            # Last resort: try extract_markdown
             try:
-                return result.extract_markdown()
+                if hasattr(result, 'extract_markdown'):
+                    return result.extract_markdown()
             except:
-                return ""
+                pass
+            
+            return ""
     
     def extract_metadata(self, file_path: str,
                         schema: Optional[Dict] = None,
