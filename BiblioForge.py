@@ -236,6 +236,37 @@ def main():
     docstrange_group.add_argument('--docstrange-metadata-schema', default=None, help='JSON schema file for metadata extraction')
     docstrange_group.add_argument('--docstrange-local-only', action='store_true', help='Force local processing only (privacy mode)')
 
+    # llama-mtmd-cli VL arguments
+    parser.add_argument('--use-llama-mtmd-vl', action='store_true',
+                        help="Use llama-mtmd-cli Vision Language model for OCR and extraction")
+    parser.add_argument('--llama-mtmd-model', default='LiquidAI/LFM2-VL-3B-GGUF:Q4_0', 
+                        help="HuggingFace model ID for llama-mtmd-cli. "
+                            "For GGUF: 'repo:quant' (e.g., LiquidAI/LFM2-VL-3B-GGUF:Q4_0). "
+                            "For regular: 'repo' (e.g., LiquidAI/LFM2-VL-3B). "
+                            "(default: LiquidAI/LFM2-VL-3B-GGUF:Q4_0)")
+    parser.add_argument('--llama-mtmd-for-metadata', action='store_true',
+                        help="Use VL model for direct metadata extraction from document images")
+    parser.add_argument('--llama-mtmd-max-tokens', type=int, default=4096,
+                        help="Max tokens for llama-mtmd-cli (default: 4096)")
+    parser.add_argument('--llama-mtmd-temp', type=float, default=0.1,
+                        help="Temperature for llama-mtmd-cli (default: 0.1 for OCR accuracy)")
+    parser.add_argument('--llama-mtmd-min-p', type=float, default=0.15, 
+                        help="Min-p sampling for llama-mtmd-cli (default: 0.15)")
+    parser.add_argument('--llama-mtmd-repeat-penalty', type=float, default=1.05, 
+                        help="Repetition penalty for llama-mtmd-cli (default: 1.05)")
+    
+    # MLX-VLM arguments (Apple Silicon optimized)
+    parser.add_argument('--use-mlx-vlm', action='store_true',
+                        help="Use mlx-vlm Vision Language model (optimized for Apple Silicon)")
+    parser.add_argument('--mlx-vlm-model', default='mlx-community/LFM2-VL-3B-8bit',
+                        help="MLX-VLM model ID (default: mlx-community/LFM2-VL-3B-8bit)")
+    parser.add_argument('--mlx-vlm-for-metadata', action='store_true',
+                        help="Use MLX-VLM for direct metadata extraction")
+    parser.add_argument('--mlx-vlm-max-tokens', type=int, default=512,
+                        help="Max tokens for MLX-VLM (default: 512)")
+    parser.add_argument('--mlx-vlm-temp', type=float, default=0.0,
+                        help="Temperature for MLX-VLM (default: 0.0 for OCR)")
+    
     # Parse arguments ONCE
     args = parser.parse_args()
     
@@ -365,6 +396,32 @@ def main():
             logging.info(f"Nanonets-OCR2: vLLM server ({args.nanonets_vllm_url})")
         else:
             logging.info(f"Nanonets-OCR2: Transformers mode (model: {args.nanonets_model})")
+
+    # llama-mtmd-cli VL configuration
+    llama_mtmd_config = None
+    if args.use_llama_mtmd_vl:
+        llama_mtmd_config = {
+            'model_id': args.llama_mtmd_model,
+            'max_tokens': args.llama_mtmd_max_tokens,
+            'temperature': args.llama_mtmd_temp,
+            'min_p': args.llama_mtmd_min_p,
+            'repetition_penalty': args.llama_mtmd_repeat_penalty,
+            'extract_metadata': args.llama_mtmd_for_metadata
+        }
+        if args.verbose > 0:
+            logging.info(f"Using llama-mtmd-cli VL with model: {args.llama_mtmd_model}")
+
+    # MLX-VLM configuration
+    mlx_vlm_config = None
+    if args.use_mlx_vlm:
+        mlx_vlm_config = {
+            'model_id': args.mlx_vlm_model,
+            'max_tokens': args.mlx_vlm_max_tokens,
+            'temperature': args.mlx_vlm_temp,
+            'extract_metadata': args.mlx_vlm_for_metadata
+        }
+        if args.verbose > 0:
+            logging.info(f"Using mlx-vlm with model: {args.mlx_vlm_model}")
     
     # Periodic logging check
     def check_and_restore_logging():
@@ -496,6 +553,8 @@ def main():
             max_tokens=args.max_tokens,
             nanonets_config=nanonets_config,
             docstrange_config=docstrange_config,
+            llama_mtmd_config=llama_mtmd_config,
+            mlx_vlm_config=mlx_vlm_config, 
             **llm_config_kwargs_to_pass
         )
         

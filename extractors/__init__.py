@@ -8,3 +8,20 @@ from .html_extractor import HTMLExtractor
 from .pptx_extractor import PPTXExtractor
 from .docstrange_extractor import DocStrangeExtractor
 from .nanonets_ocr2_extractor import NanonetsOCR2Extractor
+from .llama_mtmd_vl_extractor import LlamaMtmdVLExtractor
+from .mlx_vlm_extractor import MLXVLMExtractor
+
+__all__ = [
+    'PDFExtractor',
+    'TableExtractor',
+    'EPUBExtractor',
+    'DJVUExtractor',
+    'MOBIExtractor',
+    'TextExtractor',
+    'HTMLExtractor',
+    'PPTXExtractor',
+    'DocStrangeExtractor',
+    'NanonetsOCR2Extractor',
+    'LlamaMtmdVLExtractor',
+    'MLXVLMExtractor', 
+]
