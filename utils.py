@@ -616,14 +616,140 @@ def is_file_in_rename_script(rename_script_path: str, input_file: str, text_file
     
     return False
 
+def get_unparseables_list_path(rename_script_path: str) -> Path:
+    """Get the path to unparseables.lst based on rename script location."""
+    return Path(rename_script_path).parent / "unparseables.lst"
+
+
+def is_file_unparseable(input_file: str, unparseables_list_path: str) -> bool:
+    """
+    Check if a file is in the unparseables list.
+    
+    Args:
+        input_file: Path to the file to check
+        unparseables_list_path: Path to unparseables.lst
+    
+    Returns:
+        True if file is in unparseables list
+    """
+    if not os.path.exists(unparseables_list_path):
+        return False
+    
+    normalized_input = os.path.normpath(os.path.abspath(input_file))
+    
+    try:
+        with open(unparseables_list_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Each line is just a file path
+                if line == normalized_input or line == input_file:
+                    return True
+                
+                # Also check basename for robustness
+                if os.path.basename(line) == os.path.basename(input_file):
+                    return True
+        
+        return False
+        
+    except Exception as e:
+        logging.warning(f"Error reading unparseables list: {e}")
+        return False
+
+
+def add_to_unparseables_list(input_file: str, unparseables_list_path: str, reason: str = "metadata extraction failed"):
+    """
+    Add a file to the unparseables list.
+    
+    Args:
+        input_file: Path to the file
+        unparseables_list_path: Path to unparseables.lst
+        reason: Optional reason string
+    """
+    normalized_input = os.path.normpath(os.path.abspath(input_file))
+    
+    # Check if already in list
+    if is_file_unparseable(input_file, unparseables_list_path):
+        return
+    
+    try:
+        with file_lock:
+            # Ensure parent directory exists
+            Path(unparseables_list_path).parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(unparseables_list_path, 'a', encoding='utf-8') as f:
+                # Write just the normalized path, one per line
+                f.write(f"{normalized_input}\n")
+        
+        logging.warning(f"⚠️ Added to unparseables.lst (will skip on next run): {os.path.basename(input_file)}")
+        
+    except Exception as e:
+        logging.error(f"Failed to write to unparseables list: {e}")
+
+
+def clean_unparseables_list(unparseables_list_path: str, debug: bool = False) -> Dict[str, int]:
+    """
+    Remove entries for files that no longer exist.
+    
+    Args:
+        unparseables_list_path: Path to unparseables.lst
+        debug: Enable debug logging
+    
+    Returns:
+        Dict with 'removed' and 'kept' counts
+    """
+    stats = {'removed': 0, 'kept': 0}
+    
+    if not os.path.exists(unparseables_list_path):
+        return stats
+    
+    try:
+        # Read all lines
+        with open(unparseables_list_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # Filter to keep only existing files
+        kept_lines = []
+        for line in lines:
+            line_stripped = line.strip()
+            
+            # Keep comments and empty lines
+            if not line_stripped or line_stripped.startswith('#'):
+                kept_lines.append(line)
+                continue
+            
+            # Check if file exists
+            if os.path.exists(line_stripped):
+                kept_lines.append(line)
+                stats['kept'] += 1
+            else:
+                stats['removed'] += 1
+                if debug:
+                    logging.debug(f"Removing non-existent file from unparseables: {line_stripped}")
+        
+        # Write back if changes were made
+        if stats['removed'] > 0:
+            with file_lock:
+                with open(unparseables_list_path, 'w', encoding='utf-8') as f:
+                    f.writelines(kept_lines)
+        
+        return stats
+        
+    except Exception as e:
+        logging.error(f"Error cleaning unparseables list: {e}")
+        return stats
+
 def should_process_file(
     input_file: str,
     output_txt_path: str,
     rename_script_path: Optional[str],
     sort_enabled: bool,
     noskip: bool = False,
-    debug: bool = False  # ADD THIS
-) -> Dict[str, Any]:  # Change from Dict[str, bool] to Dict[str, Any]
+    debug: bool = False,
+    unparseables_list_path: Optional[str] = None  
+) -> Dict[str, Any]:
     """
     Determine what processing steps should be performed for a file.
     
@@ -634,6 +760,7 @@ def should_process_file(
         sort_enabled: Whether sorting/renaming is enabled
         noskip: If True, always reprocess even if outputs exist
         debug: If True, enable detailed logging
+        unparseables_list_path: Path to unparseables.lst file
     
     Returns:
         Dict with:
@@ -651,16 +778,35 @@ def should_process_file(
     
     if debug:
         logging.debug(f"should_process_file: Evaluating '{os.path.basename(input_file)}'")
-        logging.debug(f"  noskip={noskip}, sort_enabled={sort_enabled}")
     
-    # Check if noskip is enabled - if so, never skip anything
+    # Check if noskip is enabled
     if noskip:
-        result['reason'] = 'noskip flag is set - forcing full reprocess'
-        if debug:
-            logging.debug(f"  => DECISION: FULL PROCESS (noskip=True)")
+        result['reason'] = 'noskip flag is set'
         return result
     
-    # Check if .txt file exists and is not empty
+    # === CHECK UNPARSEABLES LIST FIRST ===
+    if sort_enabled and rename_script_path:
+        unparseables_path = str(get_unparseables_list_path(rename_script_path))
+        
+        if is_file_unparseable(input_file, unparseables_path):
+            txt_exists = os.path.exists(output_txt_path)
+            
+            if txt_exists:
+                result['skip_entirely'] = True
+                result['reason'] = 'previously failed metadata extraction (in unparseables.lst)'
+                if debug:
+                    logging.debug(f"  => SKIP ENTIRELY: File in unparseables.lst and txt exists")
+                return result
+            else:
+                # Extract text but skip LLM
+                result['skip_llm_and_rename'] = True
+                result['reason'] = 'in unparseables.lst, extracting text only'
+                if debug:
+                    logging.debug(f"  => EXTRACT ONLY: File in unparseables.lst, no txt yet")
+                return result
+    # === END UNPARSEABLES CHECK ===
+    
+    # Check if .txt file exists
     txt_exists = os.path.exists(output_txt_path)
     txt_has_content = False
     
@@ -668,67 +814,41 @@ def should_process_file(
         try:
             txt_size = os.path.getsize(output_txt_path)
             txt_has_content = txt_size > 0
-            if debug:
-                logging.debug(f"  Output txt: EXISTS ({txt_size} bytes)")
         except OSError:
             txt_has_content = False
-            if debug:
-                logging.debug(f"  Output txt: EXISTS but couldn't get size")
-    else:
-        if debug:
-            logging.debug(f"  Output txt: DOES NOT EXIST")
     
     # If sorting is not enabled, simple logic
     if not sort_enabled:
         if txt_exists and txt_has_content:
             result['skip_entirely'] = True
-            result['reason'] = 'text file exists and sorting not enabled'
-            if debug:
-                logging.debug(f"  => DECISION: SKIP ENTIRELY (txt exists, no sorting needed)")
-        else:
-            if debug:
-                logging.debug(f"  => DECISION: FULL PROCESS (no txt or sorting disabled)")
+            result['reason'] = 'text file exists, no sorting needed'
         return result
     
     # Sorting is enabled - check rename script
     in_rename_script = False
     if rename_script_path and os.path.exists(rename_script_path):
-        if debug:
-            logging.debug(f"  Checking rename script: {rename_script_path}")
-        
         in_rename_script = is_file_in_rename_script(
             rename_script_path,
             input_file,
             output_txt_path,
-            debug=debug  # Pass debug flag
+            debug=debug
         )
-    elif debug:
-        if rename_script_path:
-            logging.debug(f"  Rename script doesn't exist yet: {rename_script_path}")
-        else:
-            logging.debug(f"  No rename script path provided")
     
     # Determine skip logic
     if txt_exists and txt_has_content:
         result['skip_extraction'] = True
         
         if in_rename_script:
-            # Both txt exists AND in rename script - skip everything
             result['skip_entirely'] = True
             result['skip_llm_and_rename'] = True
-            result['reason'] = 'already in rename script (processed & sorted)'
+            result['reason'] = 'already in rename script (successfully sorted)'
             if debug:
-                logging.debug(f"  => DECISION: SKIP ENTIRELY (txt exists + found in script)")
+                logging.debug(f"  => SKIP ENTIRELY: In rename script")
         else:
-            # Txt exists but NOT in rename script - load txt, do LLM, add to script
             result['skip_llm_and_rename'] = False
-            result['reason'] = 'text exists but needs sorting'
+            result['reason'] = 'text exists, needs sorting'
             if debug:
-                logging.debug(f"  => DECISION: SKIP EXTRACTION, DO LLM+SORT (txt exists but not in script)")
-    else:
-        result['reason'] = 'needs full processing (no txt file)'
-        if debug:
-            logging.debug(f"  => DECISION: FULL PROCESS (no txt file)")
+                logging.debug(f"  => DO SORTING: Txt exists but not sorted yet")
     
     return result
 

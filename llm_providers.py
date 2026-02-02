@@ -78,6 +78,8 @@ DEFAULT_COHERE_MODEL = "command-r"
 DEFAULT_HUGGINGFACE_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
 DEFAULT_GLHF_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
 
+LLM_TIMEOUT = 60 # 1 Minute
+
 # Cache directory for LlamaCPP models
 LLAMACPP_MODELS_CACHE_DIR = Path.home() / ".cache" / "biblioforge_llamacpp_models" # Changed from "gguf"
 LLAMACPP_MODELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1142,7 +1144,7 @@ def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
             response_data = provider_instance.chat_completion(
                 messages=messages, temperature=temperature_arg,
                 max_tokens=max_tokens_arg,
-                timeout_seconds=120 # Default overall timeout for the call
+                timeout_seconds=LLM_TIMEOUT # Default overall timeout for the call
             )
             output = response_data.get("content", "").strip()
             if provider_debug_flag or verbose: 

@@ -12,6 +12,24 @@ import platform
 import traceback # For more detailed error logging if needed
 from concurrent.futures import TimeoutError as FutureTimeoutError
 import tempfile
+import signal
+from contextlib import contextmanager
+
+@contextmanager
+def timeout_context(seconds):
+    """Context manager for timeouts."""
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Operation timed out after {seconds} seconds")
+    
+    # Set the signal handler
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(seconds)
+    
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 # --- Corrected Imports for sibling modules ---
 from extraction_manager import ExtractionManager
@@ -551,13 +569,19 @@ class DocumentProcessor:
             rename_script_to_check = (initialized_rename_script_paths.get('bash_script') or 
                                         initialized_rename_script_paths.get('batch_script')) if initialized_rename_script_paths else None
             
+            # Determine unparseables list path
+            unparseables_list_path = None
+            if rename_script_base_path_for_unparseables:
+                unparseables_list_path = Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst"
+
             skip_info = should_process_file(
                 input_file=input_file,
                 output_txt_path=determined_extraction_output_path,
                 rename_script_path=rename_script_to_check,
                 sort_enabled=effective_sort_flag,
                 noskip=noskip,
-                debug=debug 
+                debug=debug,
+                unparseables_list_path=str(unparseables_list_path) if unparseables_list_path else None  # ADD THIS
             )
 
             if debug:
@@ -571,6 +595,8 @@ class DocumentProcessor:
             # --- 3. METADATA EXTRACTION (PRIORITIZED) ---
             final_parsed_llm_meta = None
             if effective_sort_flag and not skip_info.get('skip_llm_and_rename', False):
+                logging.info(f"🔍 Extracting metadata from '{os.path.basename(input_file)}'...")
+    
                 docstrange_config = kwargs_from_main.get('docstrange_config')
                 nanonets_config = kwargs_from_main.get('nanonets_config')
 
@@ -605,17 +631,26 @@ class DocumentProcessor:
                     if debug: logging.warning(f"DS_Proc: Failed to load existing text file: {e_load}, will re-extract.")
 
             if not text_loaded_from_file:
-                extraction_result = self.manager.extract(
-                    input_path=input_file, output_path=actual_text_content_path_for_llm_and_rename,
-                    method=method, ocr_method=ocr_method, password=password, extract_tables=extract_tables,
-                    force_ocr=force_ocr, **kwargs_from_main
-                )
-                result.update({
-                    'text': extraction_result.get('text', ''),
-                    'success': extraction_result.get('success', False),
-                    'tables': extraction_result.get('tables', []),
-                    'error': extraction_result.get('error')
-                })
+                try:
+                    # Add timeout for extraction (5 minutes max)
+                    with timeout_context(300):  # 5 minutes
+                        extraction_result = self.manager.extract(
+                            input_path=input_file, 
+                            output_path=actual_text_content_path_for_llm_and_rename,
+                            method=method, ocr_method=ocr_method, password=password, 
+                            extract_tables=extract_tables,
+                            force_ocr=force_ocr, **kwargs_from_main
+                        )
+                        result.update({
+                            'text': extraction_result.get('text', ''),
+                            'success': extraction_result.get('success', False),
+                            'tables': extraction_result.get('tables', []),
+                            'error': extraction_result.get('error')
+                        })
+                except TimeoutError as e_timeout:
+                    result['error'] = f"Extraction timed out after 5 minutes (file may be too large or complex)"
+                    logging.error(f"DS_Proc: {result['error']} for '{input_file}'")
+                    result['success'] = False
 
             # --- 5. GENERIC LLM METADATA (FALLBACK) ---
             if effective_sort_flag and not final_parsed_llm_meta and result['success'] and result['text']:
@@ -647,10 +682,9 @@ class DocumentProcessor:
             elif effective_sort_flag and result['success']:
                 logging.warning(f"DS_Proc: All metadata attempts failed for '{input_file}'")
                 if rename_script_base_path_for_unparseables:
-                    unparseables_path = Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst"
-                    with file_lock:
-                        with open(unparseables_path, "a", encoding='utf-8') as f_unp:
-                            f_unp.write(f"{input_file} - All LLM attempts failed to yield sortable metadata.\n")
+                    from utils import add_to_unparseables_list, get_unparseables_list_path
+                    unparseables_path = get_unparseables_list_path(rename_script_base_path_for_unparseables)
+                    add_to_unparseables_list(input_file, str(unparseables_path), "metadata extraction failed")
 
         except OSError as e_os:
             result['error'] = f"Could not access file '{input_file}': {e_os}"
@@ -662,12 +696,11 @@ class DocumentProcessor:
             result['success'] = False
             if effective_sort_flag and rename_script_base_path_for_unparseables:
                 try:
-                    with file_lock:
-                        unparseables_path = Path(rename_script_base_path_for_unparseables).parent / "unparseables.lst"
-                        with open(unparseables_path, "a", encoding='utf-8') as f_unp:
-                            f_unp.write(f"{input_file} - Overall Error in _process_single_file: {str(e)}\n")
+                    from utils import add_to_unparseables_list, get_unparseables_list_path
+                    unparseables_path = get_unparseables_list_path(rename_script_base_path_for_unparseables)
+                    add_to_unparseables_list(input_file, str(unparseables_path), f"processing error: {str(e)}")
                 except Exception as e_unp:
-                    logging.error(f"Failed to write to unparseables.lst for {input_file}: {e_unp}")
+                    logging.error(f"Failed to write to unparseables.lst: {e_unp}")
 
         finally:
             if not result.get('skipped'):
@@ -788,6 +821,15 @@ class DocumentProcessor:
                     if purge_stats['removed_blocks'] > 0:
                         logging.info(f"Removed {purge_stats['removed_blocks']} command blocks for deleted files")
                 
+                if effective_sort_flag and actual_rename_script_base_path_str:
+                    from utils import get_unparseables_list_path, clean_unparseables_list
+                    unparseables_path = get_unparseables_list_path(actual_rename_script_base_path_str)
+                    
+                    if os.path.exists(unparseables_path):
+                        cleanup_stats = clean_unparseables_list(str(unparseables_path), debug=self._debug)
+                        if cleanup_stats['removed'] > 0:
+                            logging.info(f"Cleaned unparseables.lst: removed {cleanup_stats['removed']} entries for deleted files")
+
                 if platform.system() == 'Windows':
                     batch_version = os.path.splitext(actual_rename_script_base_path_str)[0] + '.bat'
                     if os.path.exists(batch_version):
