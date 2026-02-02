@@ -619,10 +619,7 @@ class PDFExtractor:
         return True # Default to true if unsure
 
     def _cleanup(self):
-        if self._current_doc:
-            try: self._current_doc.close()
-            except: pass
-            self._current_doc = None
+        
         import gc
         gc.collect()
         self._clear_gpu_memory()
@@ -752,7 +749,7 @@ class PDFExtractor:
         doc = None
         try:
             doc = fitz.open(pdf_path)
-            self._current_doc = doc # For potential cleanup
+            # REMOVED: self._current_doc = doc
             if doc.needs_pass:
                 if not self._password or not doc.authenticate(self._password):
                     raise ValueError("PyMuPDF: Invalid PDF password or no password provided.")
@@ -760,9 +757,9 @@ class PDFExtractor:
             total_pages = len(doc)
             for page_num in range(total_pages):
                 if shutdown_flag.is_set(): break
-                page = doc.load_page(page_num) # Use load_page
+                page = doc.load_page(page_num)
                 page_text = page.get_text("text", sort=True)
-                if not page_text.strip(): # Fallback for complex layouts
+                if not page_text.strip():
                     page_text_dict = page.get_text("dict", sort=True)
                     page_text = self._process_text_dict(page_text_dict)
 
@@ -773,8 +770,9 @@ class PDFExtractor:
             if self._debug: logging.error(f"PyMuPDF extraction failed for {pdf_path}: {e}")
             return ""
         finally:
-            if doc: doc.close()
-            self._current_doc = None
+            if doc: 
+                try: doc.close()
+                except: pass
 
     def _process_text_dict(self, text_dict: Dict) -> str:
         # (Copied from main script, ensure it's robust)
@@ -794,17 +792,20 @@ class PDFExtractor:
         pdfplumber_module = self._safe_import('pdfplumber')
         if not pdfplumber_module: return ""
         text_parts = []
-        pdf = None
+        
         try:
             if self._debug: logging.debug(f"PdfPlumber: >>> BEFORE pdfplumber.open for {pdf_path}")
             with pdfplumber_module.open(pdf_path, password=self._password) as pdf:
+                # REMOVED: self._current_doc = pdf
                 if self._debug: logging.debug(f"PdfPlumber: <<< AFTER pdfplumber.open, processing pages for {pdf_path}")
-                self._current_doc = pdf
+                
                 total_pages = len(pdf.pages)
                 for i, page in enumerate(pdf.pages):
                     if shutdown_flag.is_set(): break
                     if self._debug: logging.debug(f"PdfPlumber: >>> BEFORE page.extract_text for page {i+1} of {pdf_path}")
+                    
                     page_text = page.extract_text(x_tolerance=3, y_tolerance=3, layout=True, keep_blank_chars=False)
+                    
                     if self._debug: logging.debug(f"PdfPlumber: <<< AFTER page.extract_text (layout=True) for page {i+1} of {pdf_path}")
                     if not page_text or not page_text.strip():
                         if self._debug: logging.debug(f"PdfPlumber: >>> BEFORE page.extract_text (fallback) for page {i+1} of {pdf_path}")
@@ -813,13 +814,13 @@ class PDFExtractor:
 
                     if page_text and page_text.strip(): text_parts.append(page_text.strip())
                     if progress_callback: progress_callback(1)
+            
             if self._debug: logging.debug(f"PdfPlumber: Finished processing pages for {pdf_path}")
             return "\n\n".join(text_parts)
         except Exception as e:
-            if self._debug: logging.error(f"pdfplumber extraction failed for {pdf_path}: {e}", exc_info=True) # Add exc_info
+            if self._debug: logging.error(f"pdfplumber extraction failed for {pdf_path}: {e}", exc_info=True)
             return ""
         finally:
-            self._current_doc = None
             if self._debug: logging.debug(f"PdfPlumber: Cleanup complete for {pdf_path}")
 
     def extract_with_pypdf(self, pdf_path: str, progress_callback=None) -> str:

@@ -12,26 +12,9 @@ import platform
 import traceback # For more detailed error logging if needed
 from concurrent.futures import TimeoutError as FutureTimeoutError
 import tempfile
-import signal
-from contextlib import contextmanager
 
-@contextmanager
-def timeout_context(seconds):
-    """Context manager for timeouts."""
-    def timeout_handler(signum, frame):
-        raise TimeoutError(f"Operation timed out after {seconds} seconds")
-    
-    # Set the signal handler
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(seconds)
-    
-    try:
-        yield
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
 
-# --- Corrected Imports for sibling modules ---
+# --- Imports for sibling modules ---
 from extraction_manager import ExtractionManager
 from utils import (
     file_lock, parse_metadata, sanitize_filename, 
@@ -632,24 +615,38 @@ class DocumentProcessor:
 
             if not text_loaded_from_file:
                 try:
-                    # Add timeout for extraction (5 minutes max)
-                    with timeout_context(300):  # 5 minutes
-                        extraction_result = self.manager.extract(
+                    # We use ThreadPoolExecutor for timeout
+                    # This creates a nested thread to run the blocking extraction, allowing us to time it out
+                    with ThreadPoolExecutor(max_workers=1) as extraction_executor:
+                        future = extraction_executor.submit(
+                            self.manager.extract,
                             input_path=input_file, 
                             output_path=actual_text_content_path_for_llm_and_rename,
-                            method=method, ocr_method=ocr_method, password=password, 
+                            method=method, 
+                            ocr_method=ocr_method, 
+                            password=password, 
                             extract_tables=extract_tables,
-                            force_ocr=force_ocr, **kwargs_from_main
+                            force_ocr=force_ocr, 
+                            **kwargs_from_main
                         )
+                        
+                        # Wait for result with a 300 second (5 minute) timeout
+                        extraction_result = future.result(timeout=300)
+                        
                         result.update({
                             'text': extraction_result.get('text', ''),
                             'success': extraction_result.get('success', False),
                             'tables': extraction_result.get('tables', []),
                             'error': extraction_result.get('error')
                         })
-                except TimeoutError as e_timeout:
+
+                except FutureTimeoutError:
                     result['error'] = f"Extraction timed out after 5 minutes (file may be too large or complex)"
                     logging.error(f"DS_Proc: {result['error']} for '{input_file}'")
+                    result['success'] = False
+                except Exception as e_extract:
+                    result['error'] = f"Extraction failed: {str(e_extract)}"
+                    logging.error(f"DS_Proc: {result['error']}", exc_info=debug)
                     result['success'] = False
 
             # --- 5. GENERIC LLM METADATA (FALLBACK) ---
