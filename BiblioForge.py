@@ -11,6 +11,26 @@ warnings.filterwarnings('ignore', category=DeprecationWarning, module='pkg_resou
 import os
 os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'
 
+# === LOAD .ENV FILE FOR API KEYS ===
+try:
+    from dotenv import load_dotenv
+    # Load from current directory or parent
+    env_loaded = load_dotenv(verbose=True)
+    if env_loaded:
+        print("✓ Loaded .env file for API keys")
+    else:
+        # Try parent directory
+        parent_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
+        if os.path.exists(parent_env):
+            load_dotenv(parent_env, verbose=True)
+            print(f"✓ Loaded .env from parent: {parent_env}")
+        else:
+            print("⚠ No .env file found (API keys will use system environment)")
+except ImportError:
+    print("⚠ python-dotenv not installed. Install with: pip install python-dotenv")
+    print("⚠ API keys will only be read from system environment variables")
+# ===================================
+
 import sys
 import logging
 import argparse
@@ -183,7 +203,11 @@ def main():
     parser.add_argument('--noremove', action='store_true', help="Skip cleanup of rename script entries for non-existent files.")
     
     # LLM provider arguments
-    parser.add_argument('--llm-provider', choices=['ollama', 'groq', 'cohere', 'openai', 'glhf', 'huggingface', 'poe', 'local_openai', 'llama_cpp'], default='ollama', help="LLM provider for --sort.")
+    parser.add_argument('--llm-provider', 
+        choices=['ollama', 'groq', 'cohere', 'openai', 'glhf', 'huggingface', 'poe', 
+                'local_openai', 'llama_cpp', 'mistral', 'nebius', 'scaleway', 'openrouter'], 
+        default='ollama', 
+        help="LLM provider for --sort.")
     parser.add_argument('--llm-model', default=None, help="Specific model name for the chosen LLM provider.")
     parser.add_argument('--api-key', default=None, help="API key for cloud-based LLM providers.")
     parser.add_argument('--temperature', type=float, default=0.3, help="LLM temperature (0.0-2.0).")
@@ -479,15 +503,23 @@ def main():
                         if item.is_file() and item.suffix.lower() in active_supported_extensions:
                             input_files_discovered.append(str(item))
             else:
-                expanded_items = glob.glob(pattern_item, recursive=args.recursive)
-                for item_str_path in expanded_items:
-                    item_path_obj = Path(item_str_path)
-                    if item_path_obj.is_file() and item_path_obj.suffix.lower() in active_supported_extensions:
-                        input_files_discovered.append(str(item_path_obj))
-                    elif args.recursive and item_path_obj.is_dir():
-                        for sub_item in item_path_obj.rglob('*'):
-                            if sub_item.is_file() and sub_item.suffix.lower() in active_supported_extensions:
-                                input_files_discovered.append(str(sub_item))
+                # Check if pattern_item is an existing file (shell already expanded it)
+                potential_file = Path(pattern_item)
+                if potential_file.is_file():
+                    # Shell-expanded file - use directly
+                    if potential_file.suffix.lower() in active_supported_extensions:
+                        input_files_discovered.append(str(potential_file))
+                else:
+                    # It's a pattern - use glob
+                    expanded_items = glob.glob(pattern_item, recursive=args.recursive)
+                    for item_str_path in expanded_items:
+                        item_path_obj = Path(item_str_path)
+                        if item_path_obj.is_file() and item_path_obj.suffix.lower() in active_supported_extensions:
+                            input_files_discovered.append(str(item_path_obj))
+                        elif args.recursive and item_path_obj.is_dir():
+                            for sub_item in item_path_obj.rglob('*'):
+                                if sub_item.is_file() and sub_item.suffix.lower() in active_supported_extensions:
+                                    input_files_discovered.append(str(sub_item))
     
     final_input_files = sorted(list(set(str(Path(p).resolve()) for p in input_files_discovered)))
     
@@ -559,6 +591,22 @@ def main():
         )
         
         check_and_restore_logging()
+
+        # Initialize rename scripts
+        rename_script_path, existing_script_entries = initialize_rename_scripts(
+            args.output_dir, 
+            args.rename_script, 
+            args.reset,
+            args.noremove
+        )
+        
+        # === ADD THIS LOGGING ===
+        if args.sort:
+            logging.info(f"📝 Rename script path: {rename_script_path}")
+            logging.info(f"📊 Existing entries in rename script: {len(existing_script_entries)}")
+            if args.verbose >= 1:
+                logging.debug(f"Existing script entries: {list(existing_script_entries)[:10]}...")  # Show first 10
+        # ========================
         
         # Save JSON if requested
         if args.json:

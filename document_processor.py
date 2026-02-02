@@ -556,7 +556,8 @@ class DocumentProcessor:
                 output_txt_path=determined_extraction_output_path,
                 rename_script_path=rename_script_to_check,
                 sort_enabled=effective_sort_flag,
-                noskip=noskip
+                noskip=noskip,
+                debug=debug 
             )
 
             if debug:
@@ -799,6 +800,11 @@ class DocumentProcessor:
                 append_mode=True,
                 reset_mode=reset_rename_script
             )
+
+            if initialized_script_paths_map:
+                from utils import log_rename_script_status
+                log_rename_script_status(initialized_script_paths_map, verbose=self._debug)
+
             if self._debug: 
                 logging.debug(f"process_files: Rename scripts initialized. Paths map: {initialized_script_paths_map}")
         elif effective_sort_flag and not rename_script_path:

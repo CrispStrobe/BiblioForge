@@ -534,15 +534,14 @@ def run_process(cmd: List[str], timeout_sec: Optional[int] = None, **kwargs) -> 
     return subprocess.CompletedProcess(args=cmd_str, returncode=returncode, stdout=stdout or "", stderr=stderr or "")
 
 # --- File Operations & Renaming Script Logic ---
-def is_file_in_rename_script(rename_script_path: str, input_file: str, text_file: Optional[str] = None) -> bool:
+def is_file_in_rename_script(rename_script_path: str, input_file: str, text_file: Optional[str] = None, debug: bool = False) -> bool:
     """
     Check if a file (and optionally its associated .txt file) already has rename commands in the script.
-    
     Args:
         rename_script_path: Path to the rename script to check
         input_file: Path to the original input file
         text_file: Optional path to the associated .txt file
-    
+        debug: If True, enable detailed logging
     Returns:
         True if commands for this file exist in the script
     """
@@ -555,12 +554,24 @@ def is_file_in_rename_script(rename_script_path: str, input_file: str, text_file
         if os.path.exists(batch_script_path):
             scripts_to_check.append(batch_script_path)
     
+    if debug:
+        logging.debug(f"is_file_in_rename_script: Checking {len(scripts_to_check)} script(s) for '{os.path.basename(input_file)}'")
+        for script in scripts_to_check:
+            if os.path.exists(script):
+                logging.debug(f"  Will check: {script}")
+            else:
+                logging.debug(f"  Skipping (doesn't exist): {script}")
+    
     abs_input_file = os.path.abspath(input_file)
     files_to_check = [abs_input_file]
-    
     if text_file:
         abs_text_file = os.path.abspath(text_file)
         files_to_check.append(abs_text_file)
+    
+    if debug:
+        logging.debug(f"  Files to search for: {len(files_to_check)}")
+        for f in files_to_check:
+            logging.debug(f"    - {f}")
     
     for script_path_check in scripts_to_check:
         if not os.path.exists(script_path_check):
@@ -570,11 +581,13 @@ def is_file_in_rename_script(rename_script_path: str, input_file: str, text_file
             with open(script_path_check, 'r', encoding='utf-8') as f:
                 content = f.read()
             
+            if debug:
+                logging.debug(f"  Searching in {os.path.basename(script_path_check)} ({len(content)} bytes)")
+            
             # Check each file we're looking for
             for file_to_find in files_to_check:
                 # Construct various forms of the path that might appear in the script
                 win_path_doubly_escaped = file_to_find.replace("/", "\\\\")
-                
                 paths_to_check_in_script = [
                     file_to_find,
                     file_to_find.replace('/', '\\'),
@@ -585,12 +598,21 @@ def is_file_in_rename_script(rename_script_path: str, input_file: str, text_file
                 ]
                 
                 # If any form of the file path is found, return True
-                if any(p in content for p in paths_to_check_in_script):
-                    return True
-                    
+                for path_variant in paths_to_check_in_script:
+                    if path_variant in content:
+                        if debug:
+                            logging.debug(f"  ✓ FOUND: '{path_variant}' in {os.path.basename(script_path_check)}")
+                        return True
+            
+            if debug:
+                logging.debug(f"  ✗ Not found in {os.path.basename(script_path_check)}")
+                
         except Exception as e:
             logging.error(f"Error checking rename script {script_path_check}: {e}")
             continue
+    
+    if debug:
+        logging.debug(f"  ✗ File NOT found in any script")
     
     return False
 
@@ -599,8 +621,9 @@ def should_process_file(
     output_txt_path: str,
     rename_script_path: Optional[str],
     sort_enabled: bool,
-    noskip: bool = False
-) -> Dict[str, bool]:
+    noskip: bool = False,
+    debug: bool = False  # ADD THIS
+) -> Dict[str, Any]:  # Change from Dict[str, bool] to Dict[str, Any]
     """
     Determine what processing steps should be performed for a file.
     
@@ -610,21 +633,31 @@ def should_process_file(
         rename_script_path: Path to the rename script (if sorting is enabled)
         sort_enabled: Whether sorting/renaming is enabled
         noskip: If True, always reprocess even if outputs exist
+        debug: If True, enable detailed logging
     
     Returns:
         Dict with:
         - 'skip_entirely': True if file should be completely skipped
         - 'skip_extraction': True if extraction can be skipped (txt exists)
         - 'skip_llm_and_rename': True if LLM and rename command generation should be skipped
+        - 'reason': String explaining the decision
     """
     result = {
         'skip_entirely': False,
         'skip_extraction': False,
-        'skip_llm_and_rename': False
+        'skip_llm_and_rename': False,
+        'reason': 'needs full processing'
     }
+    
+    if debug:
+        logging.debug(f"should_process_file: Evaluating '{os.path.basename(input_file)}'")
+        logging.debug(f"  noskip={noskip}, sort_enabled={sort_enabled}")
     
     # Check if noskip is enabled - if so, never skip anything
     if noskip:
+        result['reason'] = 'noskip flag is set - forcing full reprocess'
+        if debug:
+            logging.debug(f"  => DECISION: FULL PROCESS (noskip=True)")
         return result
     
     # Check if .txt file exists and is not empty
@@ -635,23 +668,45 @@ def should_process_file(
         try:
             txt_size = os.path.getsize(output_txt_path)
             txt_has_content = txt_size > 0
+            if debug:
+                logging.debug(f"  Output txt: EXISTS ({txt_size} bytes)")
         except OSError:
             txt_has_content = False
+            if debug:
+                logging.debug(f"  Output txt: EXISTS but couldn't get size")
+    else:
+        if debug:
+            logging.debug(f"  Output txt: DOES NOT EXIST")
     
     # If sorting is not enabled, simple logic
     if not sort_enabled:
         if txt_exists and txt_has_content:
             result['skip_entirely'] = True
+            result['reason'] = 'text file exists and sorting not enabled'
+            if debug:
+                logging.debug(f"  => DECISION: SKIP ENTIRELY (txt exists, no sorting needed)")
+        else:
+            if debug:
+                logging.debug(f"  => DECISION: FULL PROCESS (no txt or sorting disabled)")
         return result
     
     # Sorting is enabled - check rename script
     in_rename_script = False
     if rename_script_path and os.path.exists(rename_script_path):
+        if debug:
+            logging.debug(f"  Checking rename script: {rename_script_path}")
+        
         in_rename_script = is_file_in_rename_script(
             rename_script_path,
             input_file,
-            output_txt_path
+            output_txt_path,
+            debug=debug  # Pass debug flag
         )
+    elif debug:
+        if rename_script_path:
+            logging.debug(f"  Rename script doesn't exist yet: {rename_script_path}")
+        else:
+            logging.debug(f"  No rename script path provided")
     
     # Determine skip logic
     if txt_exists and txt_has_content:
@@ -661,11 +716,146 @@ def should_process_file(
             # Both txt exists AND in rename script - skip everything
             result['skip_entirely'] = True
             result['skip_llm_and_rename'] = True
+            result['reason'] = 'already in rename script (processed & sorted)'
+            if debug:
+                logging.debug(f"  => DECISION: SKIP ENTIRELY (txt exists + found in script)")
         else:
             # Txt exists but NOT in rename script - load txt, do LLM, add to script
             result['skip_llm_and_rename'] = False
+            result['reason'] = 'text exists but needs sorting'
+            if debug:
+                logging.debug(f"  => DECISION: SKIP EXTRACTION, DO LLM+SORT (txt exists but not in script)")
+    else:
+        result['reason'] = 'needs full processing (no txt file)'
+        if debug:
+            logging.debug(f"  => DECISION: FULL PROCESS (no txt file)")
     
     return result
+
+def log_rename_script_status(rename_script_paths: Dict[str, Optional[str]], verbose: bool = False):
+    """
+    Log detailed information about rename scripts.
+    
+    Args:
+        rename_script_paths: Dict with 'bash_script' and 'batch_script' paths
+        verbose: If True, show more details
+    """
+    logging.info(f"📝 Rename Script Configuration:")
+    
+    bash_script = rename_script_paths.get('bash_script')
+    batch_script = rename_script_paths.get('batch_script')
+    
+    if bash_script:
+        logging.info(f"   Bash script: {bash_script}")
+        if os.path.exists(bash_script):
+            try:
+                with open(bash_script, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                    # Count non-comment, non-empty lines that look like commands
+                    command_count = sum(1 for line in lines 
+                                      if line.strip() 
+                                      and not line.strip().startswith('#')
+                                      and ('mv' in line or 'mkdir' in line))
+                    total_lines = len(lines)
+                logging.info(f"   Status: Exists ({total_lines} lines, ~{command_count} commands)")
+                
+                if verbose:
+                    # Show first few entries
+                    command_lines = [line.strip() for line in lines 
+                                   if line.strip() 
+                                   and not line.strip().startswith('#')
+                                   and 'mv' in line][:3]
+                    if command_lines:
+                        logging.debug("   Sample entries:")
+                        for cmd in command_lines:
+                            logging.debug(f"     {cmd[:80]}...")
+            except Exception as e:
+                logging.warning(f"   Could not read script: {e}")
+        else:
+            logging.info(f"   Status: Will be created")
+    
+    if batch_script:
+        logging.info(f"   Batch script: {batch_script}")
+        if os.path.exists(batch_script):
+            try:
+                with open(batch_script, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                    command_count = sum(1 for line in lines 
+                                      if line.strip() 
+                                      and not line.strip().startswith('REM')
+                                      and ('move' in line.lower() or 'mkdir' in line.lower()))
+                    total_lines = len(lines)
+                logging.info(f"   Status: Exists ({total_lines} lines, ~{command_count} commands)")
+            except Exception as e:
+                logging.warning(f"   Could not read script: {e}")
+        else:
+            logging.info(f"   Status: Will be created")
+
+def initialize_rename_scripts(
+    output_dir: str, 
+    rename_script_filename: str, 
+    reset: bool = False,
+    noremove: bool = False
+) -> tuple[str, set]:
+    """
+    Initialize rename scripts and return the path and existing entries.
+    This is a wrapper for backwards compatibility with BiblioForge.py's main() function.
+    
+    Args:
+        output_dir: Base output directory
+        rename_script_filename: Name of the rename script file
+        reset: If True, create fresh scripts (overwrite existing)
+        noremove: If True, don't clean up entries for non-existent files
+    
+    Returns:
+        Tuple of (script_path, existing_entries_set)
+    """
+    # Determine full path to rename script
+    if os.path.isabs(rename_script_filename) or os.path.dirname(rename_script_filename):
+        rename_script_path = str(Path(rename_script_filename).resolve())
+    else:
+        rename_script_path = str(Path(output_dir) / rename_script_filename)
+    
+    # Get existing entries before initialization (if not resetting)
+    existing_entries = set()
+    if not reset:
+        # Check if script exists and read existing entries
+        if os.path.exists(rename_script_path):
+            try:
+                with open(rename_script_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        # Skip comments and empty lines
+                        if not line or line.startswith('#') or line.startswith('REM'):
+                            continue
+                        # Extract source file path from mv/move commands
+                        if 'mv' in line or 'move' in line.lower():
+                            # Try to extract the first quoted path
+                            import shlex
+                            try:
+                                parts = shlex.split(line)
+                                if len(parts) >= 2:
+                                    # First argument after mv/move is typically the source
+                                    source_path = parts[1] if parts[0] in ['mv', 'move'] else parts[0]
+                                    if os.path.exists(source_path):
+                                        existing_entries.add(os.path.normpath(os.path.abspath(source_path)))
+                            except:
+                                pass
+            except Exception as e:
+                logging.warning(f"Could not read existing rename script: {e}")
+    
+    # Initialize the scripts using the safe function
+    script_paths = safe_initialize_rename_scripts(
+        rename_script_path,
+        append_mode=(not reset),
+        reset_mode=reset
+    )
+    
+    # Return the primary script path and existing entries
+    primary_script = script_paths.get('bash_script') or script_paths.get('batch_script')
+    
+    return primary_script, existing_entries
+
 
 def safe_initialize_rename_scripts(rename_script_path_base: str, append_mode: bool = True, reset_mode: bool = False) -> Dict[str, Optional[str]]:
     """
@@ -737,38 +927,6 @@ def safe_initialize_rename_scripts(rename_script_path_base: str, append_mode: bo
                     batch_file.write("@echo off\nchcp 65001 > nul\nsetlocal enabledelayedexpansion\n\nrem Rename script for Windows\n\n")
                 logging.debug(f"Created fresh batch script: {actual_batch_path}")
     
-    return {
-        'bash_script': actual_bash_path if (not is_windows or actual_bash_path == rename_script_path_base or main_ext.lower() != '.bat') else None,
-        'batch_script': actual_batch_path if is_windows else None
-    }
-
-def initialize_rename_scripts(rename_script_path_base: str) -> Dict[str, Optional[str]]:
-    # (Implementation from before)
-    is_windows = platform.system() == 'Windows'
-    base_name, main_ext = os.path.splitext(rename_script_path_base)
-    actual_bash_path, actual_batch_path = rename_script_path_base, rename_script_path_base
-    if main_ext.lower() == '.bat': actual_bash_path = base_name + '.sh'
-    elif main_ext.lower() == '.sh':
-        if is_windows: actual_batch_path = base_name + '.bat'
-    else:
-        actual_bash_path = rename_script_path_base 
-        if is_windows: actual_batch_path = base_name + '.bat'
-    
-    # Create bash script if it's the main path or if not on windows (even if main path is .bat)
-    if not is_windows or actual_bash_path == rename_script_path_base or main_ext.lower() != '.bat':
-        with file_lock:
-            with open(actual_bash_path, "w", encoding='utf-8') as bash_file:
-                bash_file.write("#!/bin/bash\n# Encoding: UTF-8\n\n") # set -e\n
-        try: os.chmod(actual_bash_path, 0o755)
-        except Exception as e: logging.warning(f"Could not chmod {actual_bash_path}: {e}")
-        logging.debug(f"Initialized bash script: {actual_bash_path}")
-    
-    if is_windows: # Always create/overwrite .bat on Windows
-        with file_lock:
-            with open(actual_batch_path, "w", encoding='utf-8') as batch_file:
-                batch_file.write("@echo off\nchcp 65001 > nul\nsetlocal enabledelayedexpansion\n\nrem Rename script for Windows\n\n")
-        logging.debug(f"Initialized batch script: {actual_batch_path}")
-        
     return {
         'bash_script': actual_bash_path if (not is_windows or actual_bash_path == rename_script_path_base or main_ext.lower() != '.bat') else None,
         'batch_script': actual_batch_path if is_windows else None

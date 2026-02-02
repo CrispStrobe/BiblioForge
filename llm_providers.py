@@ -61,10 +61,17 @@ thread_local = threading.local()
 llm_semaphore = threading.Semaphore(4) 
 
 # Default model names
-DEFAULT_OLLAMA_MODEL_NAME = "cas/llama-3.2-3b-instruct:latest"
+# DEFAULT_OLLAMA_MODEL_NAME = "cas/llama-3.2-3b-instruct:latest"
+DEFAULT_OLLAMA_MODEL_NAME = "ministral-3:3b"
 DEFAULT_LLAMACPP_REPO_ID = "TheBloke/phi-2-GGUF"
 DEFAULT_LLAMACPP_FILENAME = "phi-2.Q4_K_M.gguf" 
 DEFAULT_LOCAL_OPENAI_MODEL = "local-model" # Often model is selected in the local server UI
+DEFAULT_MISTRAL_MODEL = "mistral-small-latest"
+#DEFAULT_NEBIUS_MODEL = "meta-llama/Meta-Llama-3.1-70B-Instruct"
+DEFAULT_NEBIUS_MODEL = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1" 
+DEFAULT_SCALEWAY_MODEL = "llama-3.3-70b-instruct"
+#DEFAULT_OPENROUTER_MODEL = "anthropic/claude-3.5-sonnet"
+DEFAULT_OPENROUTER_MODEL = "arcee-ai/trinity-large-preview:free"
 
 # Cache directory for LlamaCPP models
 LLAMACPP_MODELS_CACHE_DIR = Path.home() / ".cache" / "biblioforge_llamacpp_models" # Changed from "gguf"
@@ -85,6 +92,225 @@ class LLMProvider:
                         timeout_seconds: int = 120) -> Dict[str, Any]:
         raise NotImplementedError("Subclasses must implement this method.")
 
+class MistralProvider(LLMProvider):
+    """Mistral AI API provider."""
+    def __init__(self, model_name: str = DEFAULT_MISTRAL_MODEL, api_key: Optional[str] = None, debug: bool = False):
+        super().__init__(model_name, api_key, debug=debug)
+        self.api_key = api_key or os.environ.get("MISTRAL_API_KEY")
+        if not self.api_key:
+            raise ValueError("Mistral API key required. Set MISTRAL_API_KEY env var or pass api_key.")
+        if OpenAI is None or httpx is None:
+            raise ImportError("OpenAI client library required. pip install openai httpx.")
+        self._init_client()
+    
+    def _init_client(self):
+        client_attr_name = f"mistral_client_{self.model_name.replace('/', '_').replace(':', '_')}"
+        if not hasattr(thread_local, client_attr_name):
+            if self._debug: 
+                logging.debug(f"MistralProvider: Initializing client for thread {threading.get_ident()}")
+            custom_timeouts = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+            setattr(thread_local, client_attr_name, OpenAI(
+                api_key=self.api_key,
+                base_url="https://api.mistral.ai/v1",
+                timeout=custom_timeouts
+            ))
+        return getattr(thread_local, client_attr_name)
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                        temperature: float = 0.7, 
+                        max_tokens: Optional[int] = 500,
+                        timeout_seconds: int = 120) -> Dict[str, Any]:
+        client = self._init_client()
+        with llm_semaphore:
+            try:
+                if self._debug: 
+                    logging.debug(f"MistralProvider: Sending request to {self.model_name}")
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=float(timeout_seconds)
+                )
+                return {
+                    "id": getattr(response, "id", "mistral-unknown-id"),
+                    "content": response.choices[0].message.content.strip() if response.choices else "",
+                    "finish_reason": response.choices[0].finish_reason if response.choices else "unknown",
+                    "model": getattr(response, 'model', self.model_name)
+                }
+            except Exception as e:
+                logging.error(f"MistralProvider ({self.model_name}) failed: {e}", exc_info=self._debug)
+                raise
+
+class NebiusProvider(LLMProvider):
+    """Nebius AI API provider (OpenAI-compatible)."""
+    def __init__(self, model_name: str = DEFAULT_NEBIUS_MODEL, api_key: Optional[str] = None, debug: bool = False):
+        super().__init__(model_name, api_key, debug=debug)
+        self.api_key = api_key or os.environ.get("NEBIUS_API_KEY")
+        if not self.api_key:
+            raise ValueError("Nebius API key required. Set NEBIUS_API_KEY env var or pass api_key.")
+        if OpenAI is None or httpx is None:
+            raise ImportError("OpenAI client library required. pip install openai httpx.")
+        self._init_client()
+    
+    def _init_client(self):
+        client_attr_name = f"nebius_client_{self.model_name.replace('/', '_').replace(':', '_')}"
+        if not hasattr(thread_local, client_attr_name):
+            if self._debug: 
+                logging.debug(f"NebiusProvider: Initializing client for thread {threading.get_ident()}")
+            custom_timeouts = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+            setattr(thread_local, client_attr_name, OpenAI(
+                api_key=self.api_key,
+                base_url="https://api.tokenfactory.nebius.com/v1",  # CORRECTED from examples
+                timeout=custom_timeouts
+            ))
+        return getattr(thread_local, client_attr_name)
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                        temperature: float = 0.7, 
+                        max_tokens: Optional[int] = 500,
+                        timeout_seconds: int = 120) -> Dict[str, Any]:
+        client = self._init_client()
+        with llm_semaphore:
+            try:
+                if self._debug: 
+                    logging.debug(f"NebiusProvider: Sending request to {self.model_name}")
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=float(timeout_seconds)
+                )
+                return {
+                    "id": getattr(response, "id", "nebius-unknown-id"),
+                    "content": response.choices[0].message.content.strip() if response.choices else "",
+                    "finish_reason": response.choices[0].finish_reason if response.choices else "unknown",
+                    "model": getattr(response, 'model', self.model_name)
+                }
+            except Exception as e:
+                logging.error(f"NebiusProvider ({self.model_name}) failed: {e}", exc_info=self._debug)
+                raise
+
+class ScalewayProvider(LLMProvider):
+    """Scaleway AI API provider (OpenAI-compatible) - DSGVO-compliant."""
+    def __init__(self, model_name: str = DEFAULT_SCALEWAY_MODEL, api_key: Optional[str] = None, debug: bool = False):
+        super().__init__(model_name, api_key, debug=debug)
+        self.api_key = api_key or os.environ.get("SCALEWAY_API_KEY")
+        if not self.api_key:
+            raise ValueError("Scaleway API key required. Set SCALEWAY_API_KEY env var or pass api_key.")
+        if OpenAI is None or httpx is None:
+            raise ImportError("OpenAI client library required. pip install openai httpx.")
+        self._init_client()
+    
+    def _init_client(self):
+        client_attr_name = f"scaleway_client_{self.model_name.replace('/', '_').replace(':', '_')}"
+        if not hasattr(thread_local, client_attr_name):
+            if self._debug: 
+                logging.debug(f"ScalewayProvider: Initializing client for thread {threading.get_ident()}")
+            custom_timeouts = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+            setattr(thread_local, client_attr_name, OpenAI(
+                api_key=self.api_key,
+                base_url="https://api.scaleway.ai/v1",
+                timeout=custom_timeouts
+            ))
+        return getattr(thread_local, client_attr_name)
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                        temperature: float = 0.7, 
+                        max_tokens: Optional[int] = 500,
+                        timeout_seconds: int = 120) -> Dict[str, Any]:
+        client = self._init_client()
+        with llm_semaphore:
+            try:
+                if self._debug: 
+                    logging.debug(f"ScalewayProvider: Sending request to {self.model_name}")
+                
+                # Scaleway prefers max_completion_tokens for newer models
+                params = {
+                    "model": self.model_name,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "timeout": float(timeout_seconds)
+                }
+                
+                # Use max_completion_tokens if max_tokens is specified
+                if max_tokens and max_tokens > 0:
+                    params["max_completion_tokens"] = max_tokens
+                else:
+                    # Let Scaleway use its defaults
+                    pass
+                
+                response = client.chat.completions.create(**params)
+                
+                return {
+                    "id": getattr(response, "id", "scaleway-unknown-id"),
+                    "content": response.choices[0].message.content.strip() if response.choices else "",
+                    "finish_reason": response.choices[0].finish_reason if response.choices else "unknown",
+                    "model": getattr(response, 'model', self.model_name)
+                }
+            except Exception as e:
+                logging.error(f"ScalewayProvider ({self.model_name}) failed: {e}", exc_info=self._debug)
+                raise
+
+class OpenRouterProvider(LLMProvider):
+    """OpenRouter API provider - aggregates multiple LLM providers."""
+    def __init__(self, model_name: str = DEFAULT_OPENROUTER_MODEL, api_key: Optional[str] = None, debug: bool = False):
+        super().__init__(model_name, api_key, debug=debug)
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        if not self.api_key:
+            raise ValueError("OpenRouter API key required. Set OPENROUTER_API_KEY env var or pass api_key.")
+        if OpenAI is None or httpx is None:
+            raise ImportError("OpenAI client library required. pip install openai httpx.")
+        
+        # OpenRouter-specific headers
+        self.app_name = os.environ.get("OPENROUTER_APP_NAME", "BiblioForge")
+        self.site_url = os.environ.get("OPENROUTER_SITE_URL", "https://github.com/biblioforge/biblioforge")
+        self._init_client()
+    
+    def _init_client(self):
+        client_attr_name = f"openrouter_client_{self.model_name.replace('/', '_').replace(':', '_')}"
+        if not hasattr(thread_local, client_attr_name):
+            if self._debug: 
+                logging.debug(f"OpenRouterProvider: Initializing client for thread {threading.get_ident()}")
+            custom_timeouts = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+            setattr(thread_local, client_attr_name, OpenAI(
+                api_key=self.api_key,
+                base_url="https://openrouter.ai/api/v1",
+                default_headers={
+                    "HTTP-Referer": self.site_url,  # Required by OpenRouter
+                    "X-Title": self.app_name        # Optional but recommended
+                },
+                timeout=custom_timeouts
+            ))
+        return getattr(thread_local, client_attr_name)
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                        temperature: float = 0.7, 
+                        max_tokens: Optional[int] = 500,
+                        timeout_seconds: int = 120) -> Dict[str, Any]:
+        client = self._init_client()
+        with llm_semaphore:
+            try:
+                if self._debug: 
+                    logging.debug(f"OpenRouterProvider: Sending request to {self.model_name}")
+                
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=float(timeout_seconds)
+                )
+                return {
+                    "id": getattr(response, "id", "openrouter-unknown-id"),
+                    "content": response.choices[0].message.content.strip() if response.choices else "",
+                    "finish_reason": response.choices[0].finish_reason if response.choices else "unknown",
+                    "model": getattr(response, 'model', self.model_name)
+                }
+            except Exception as e:
+                logging.error(f"OpenRouterProvider ({self.model_name}) failed: {e}", exc_info=self._debug)
+                raise
 class OpenAIProvider(LLMProvider):
     """OpenAI API provider."""
     def __init__(self, model_name: str = "gpt-3.5-turbo", api_key: Optional[str] = None, debug: bool = False):
@@ -333,62 +559,71 @@ class GroqProvider(LLMProvider):
                 raise
 
 class PoeProvider(LLMProvider):
-    """Poe.com LLM provider."""
-    def __init__(self, model_name: str = "claude-3-opus", api_key: Optional[str] = None):
-        super().__init__(model_name, api_key)
+    """Poe.com LLM provider - OpenAI-compatible API."""
+    def __init__(self, model_name: str = "claude-3.5-sonnet", api_key: Optional[str] = None, debug: bool = False):
+        super().__init__(model_name, api_key, debug=debug)
         self.api_key = api_key or os.environ.get("POE_API_KEY")
-        if not self.api_key: raise ValueError("Poe API key required.")
-        if requests is None: raise ImportError("requests library not installed (for PoeProvider).")
-        self.api_url = os.environ.get("POE_API_URL", "https://api.poe.com/v1/chat/completions") # Example endpoint
-
+        if not self.api_key:
+            raise ValueError("Poe API key required. Set POE_API_KEY env var or pass api_key.")
+        if OpenAI is None or httpx is None:
+            raise ImportError("OpenAI client library required. pip install openai httpx.")
+        self._init_client()
+    
+    def _init_client(self):
+        client_attr_name = f"poe_client_{self.model_name.replace('/', '_').replace(':', '_')}"
+        if not hasattr(thread_local, client_attr_name):
+            if self._debug: 
+                logging.debug(f"PoeProvider: Initializing client for thread {threading.get_ident()}")
+            custom_timeouts = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+            setattr(thread_local, client_attr_name, OpenAI(
+                api_key=self.api_key,
+                base_url="https://api.poe.com/v1",
+                timeout=custom_timeouts
+            ))
+        return getattr(thread_local, client_attr_name)
+    
     def chat_completion(self, messages: List[Dict[str, str]], 
                         temperature: float = 0.7, 
-                        max_tokens: int = 500,
+                        max_tokens: Optional[int] = 500,
                         timeout_seconds: int = 120) -> Dict[str, Any]:
-        system_prompt = next((msg["content"] for msg in messages if msg["role"] == "system"), None)
-        user_assistant_msgs = [{"role": msg["role"], "content": msg["content"]} for msg in messages if msg["role"] in ("user", "assistant")]
+        client = self._init_client()
         
-        payload = {"model": self.model_name, "messages": user_assistant_msgs, 
-                   "temperature": temperature, "max_tokens": max_tokens}
-        if system_prompt: 
-            # How Poe handles system prompts needs to be confirmed.
-            # Common patterns: "system_prompt" field, or prepending to user messages.
-            # Assuming a "system_prompt" field for now.
-            payload["system_prompt"] = system_prompt 
-
-        headers = {"Authorization": f"Poe-Extra-Long-Term-Token {self.api_key}", # Common Poe auth header
-                   "Content-Type": "application/json", "Accept": "application/json"}
+        # Poe doesn't support system messages in the standard way
+        # Filter them out or prepend to first user message
+        filtered_messages = []
+        system_content = ""
+        
+        for msg in messages:
+            if msg["role"] == "system":
+                system_content += msg["content"] + "\n\n"
+            else:
+                filtered_messages.append(msg)
+        
+        # Prepend system content to first user message if exists
+        if system_content and filtered_messages and filtered_messages[0]["role"] == "user":
+            if isinstance(filtered_messages[0]["content"], str):
+                filtered_messages[0]["content"] = system_content + filtered_messages[0]["content"]
         
         with llm_semaphore:
             try:
-                response = requests.post(self.api_url, headers=headers, json=payload, timeout=timeout_seconds)
-                response.raise_for_status()
-                response_data = response.json()
+                if self._debug: 
+                    logging.debug(f"PoeProvider: Sending request to {self.model_name}")
                 
-                content, finish_reason, response_id = "", "unknown", response_data.get("id", "poe-unknown-id")
-
-                # Poe's API response structure can vary. This is a guess.
-                if "choices" in response_data and response_data["choices"]:
-                    choice = response_data["choices"][0]
-                    if "message" in choice and "content" in choice["message"]:
-                        content = choice["message"]["content"].strip()
-                    finish_reason = choice.get("finish_reason", "unknown")
-                elif "data" in response_data and isinstance(response_data["data"], dict) and "text" in response_data["data"]:
-                    content = response_data["data"]["text"].strip() # Another possible structure
-                elif "text" in response_data: content = response_data["text"].strip()
-                elif "completion" in response_data: content = response_data["completion"].strip()
-
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=filtered_messages if filtered_messages else messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=float(timeout_seconds)
+                )
                 return {
-                    "id": response_id, "content": content, 
-                    "finish_reason": str(finish_reason).upper() if isinstance(finish_reason, str) else "UNKNOWN", 
-                    "model": self.model_name
+                    "id": getattr(response, "id", "poe-unknown-id"),
+                    "content": response.choices[0].message.content.strip() if response.choices else "",
+                    "finish_reason": response.choices[0].finish_reason if response.choices else "unknown",
+                    "model": getattr(response, 'model', self.model_name)
                 }
-            except requests.RequestException as e:
-                err_content = e.response.text if e.response is not None else "No response content"
-                logging.error(f"PoeProvider request for {self.model_name} failed: {e}. Response: {err_content[:200]}")
-                raise
             except Exception as e:
-                logging.error(f"PoeProvider processing error for {self.model_name}: {e}")
+                logging.error(f"PoeProvider ({self.model_name}) failed: {e}", exc_info=self._debug)
                 raise
 
 class LocalOpenAIProvider(LLMProvider):
@@ -699,7 +934,11 @@ def get_llm_provider(provider_type: str = "ollama",
         # ... (ensure other defaults are here)
         "local_openai": DEFAULT_LOCAL_OPENAI_MODEL,
         "llama_cpp": f"{kwargs.get('llamacpp_repo_id', DEFAULT_LLAMACPP_REPO_ID)}/"
-                     f"{kwargs.get('llamacpp_gguf_filename', DEFAULT_LLAMACPP_FILENAME)}"
+                     f"{kwargs.get('llamacpp_gguf_filename', DEFAULT_LLAMACPP_FILENAME)}",
+        "mistral": DEFAULT_MISTRAL_MODEL,
+        "nebius": DEFAULT_NEBIUS_MODEL,
+        "scaleway": DEFAULT_SCALEWAY_MODEL,
+        "openrouter": DEFAULT_OPENROUTER_MODEL,
     }
     
     effective_model_name = model_name or default_models.get(provider_type_lower, "default_model_not_in_map")
@@ -714,12 +953,15 @@ def get_llm_provider(provider_type: str = "ollama",
         "openai": OpenAIProvider,
         "local_openai": LocalOpenAIProvider,
         "llama_cpp": LlamaCPPProvider,
-        # Add other providers here: GroqProvider, CohereProvider, etc.
         "groq": GroqProvider, 
         "cohere": CohereProvider, 
         "huggingface": HuggingFaceProvider,
         "glhf": GLHFProvider, 
         "poe": PoeProvider,
+        "mistral": MistralProvider,
+        "nebius": NebiusProvider,
+        "scaleway": ScalewayProvider,
+        "openrouter": OpenRouterProvider,
     }
 
     if provider_type_lower in provider_map:
@@ -873,16 +1115,20 @@ def send_to_llm(text: str, filename: str, provider_instance: LLMProvider,
 
         # Define the network-related exceptions to catch.
         network_exceptions = []
-        if OpenAIAPIConnectionError:
+
+        # Check if the exception class is actually a valid Exception type
+        if OpenAIAPIConnectionError is not None and isinstance(OpenAIAPIConnectionError, type) and issubclass(OpenAIAPIConnectionError, BaseException):
             network_exceptions.append(OpenAIAPIConnectionError)
-        if OpenAITimeout:
+        if OpenAITimeout is not None and isinstance(OpenAITimeout, type) and issubclass(OpenAITimeout, BaseException):
             network_exceptions.append(OpenAITimeout)
-        if ollama and hasattr(ollama, 'ResponseError'):
-            network_exceptions.append(ollama.ResponseError)
-        
+        if ollama is not None and hasattr(ollama, 'ResponseError'):
+            response_error = getattr(ollama, 'ResponseError')
+            if isinstance(response_error, type) and issubclass(response_error, BaseException):
+                network_exceptions.append(response_error)
+
         # Ensure the tuple is not empty before using it.
         # Fallback to a base error if no specific libraries are installed.
-        exceptions_to_catch = tuple(network_exceptions) if network_exceptions else (RuntimeError,)
+        exceptions_to_catch = tuple(network_exceptions) if network_exceptions else (Exception,)  # Changed RuntimeError to Exception
 
         try:
             response_data = provider_instance.chat_completion(

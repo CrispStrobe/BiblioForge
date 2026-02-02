@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 from ebooklib import epub
 from bs4 import BeautifulSoup
+import glob
+import shutil
 
 # Additional imports for extractors
 try:
@@ -72,7 +74,74 @@ def detect_drm(pdf_path):
         pass
     return False
 
-# --- ENHANCED HTML POST-PROCESSING ---
+# --- HTML POST-PROCESSING ---
+
+def find_calibre_binary_dir():
+    """
+    Robustly searches for the Calibre binary directory on macOS, Windows, and Linux.
+    It looks for 'ebook-meta' as a representative file.
+    """
+    # 1. First, check the system PATH
+    path = shutil.which('ebook-meta')
+    if path:
+        return os.path.dirname(path)
+
+    # 2. Check platform-specific paths
+    if sys.platform == 'darwin':  # macOS
+        # User path: /Applications/calibre8.app/Contents/MacOS/
+        # We'll search for any /Applications/calibre*.app
+        try:
+            apps = glob.glob('/Applications/calibre*.app')
+            for app_path in apps:
+                binary_dir = os.path.join(app_path, 'Contents/MacOS')
+                if os.path.isfile(os.path.join(binary_dir, 'ebook-meta')):
+                    print(f"[Info] Found Calibre binaries at: {binary_dir}")
+                    return binary_dir
+        except Exception:
+            pass  # glob can fail
+    
+    elif sys.platform == 'win32':  # Windows
+        # Default paths
+        paths_to_check = [
+            r'C:\Program Files\Calibre',
+            r'C:\Program Files\Calibre2'
+        ]
+        for path in paths_to_check:
+            if os.path.isfile(os.path.join(path, 'ebook-meta.exe')):
+                print(f"[Info] Found Calibre binaries at: {path}")
+                return path
+
+    elif sys.platform.startswith('linux'):  # Linux
+        # Common alternative install path
+        path = '/opt/calibre'
+        if os.path.isfile(os.path.join(path, 'ebook-meta')):
+            print(f"[Info] Found Calibre binaries at: {path}")
+            return path
+            
+    print("[Warning] Could not find Calibre binary directory.")
+    return None
+
+def get_tool_path(tool_name, calibre_dir):
+    """
+    Gets the full path for a tool, checking the Calibre dir first.
+    Returns None if not found.
+    """
+    # 1. Check Calibre directory first (if found)
+    if calibre_dir:
+        # Add .exe for Windows
+        exe_name = f"{tool_name}.exe" if sys.platform == 'win32' else tool_name
+        tool_path = os.path.join(calibre_dir, exe_name)
+        if os.path.isfile(tool_path):
+            return tool_path
+            
+    # 2. Fallback to system PATH
+    path = shutil.which(tool_name)
+    if path:
+        return path
+        
+    # 3. Not found
+    print(f"    [Warning] Tool '{tool_name}' not found in Calibre dir or system PATH.")
+    return None
 
 def clean_html_for_ebook(html_path, preserve_structure=False):
     """
@@ -400,7 +469,10 @@ def extract_text_with_pdftohtml(pdf_path, html_path, include_images=False, no_ht
     """
     print(f"[*] Attempting (pdftohtml) extraction...")
     
-    command = ["pdftohtml", "-s", "-noframes"]
+    if not PDFTOHTML_PATH:
+        print("[Failed] 'pdftohtml' executable not found.")
+        return None, None
+    command = [PDFTOHTML_PATH, "-s", "-noframes"]
     
     if include_images:
         print("    [Info] --include-imgs: Including images.")
@@ -581,7 +653,10 @@ def extract_with_calibre_ebook_convert(pdf_path, html_path, **kwargs):
     """Use Calibre's ebook-convert directly for extraction"""
     print(f"[*] Attempting (calibre ebook-convert) extraction...")
     
-    command = ["ebook-convert", pdf_path, html_path]
+    if not CALIBRE_EBOOK_CONVERT:
+        print("[Failed] 'ebook-convert' executable not found.")
+        return None, None
+    command = [CALIBRE_EBOOK_CONVERT, pdf_path, html_path]
     
     try:
         print(f"    [Exec] {' '.join(shlex.quote(arg) for arg in command)}")
@@ -611,7 +686,11 @@ def extract_with_ocr(pdf_path, html_path, **kwargs):
     
     # First try ocrmypdf to create a searchable PDF
     temp_pdf = pdf_path + "_ocr.pdf"
-    command = ["ocrmypdf", "--force-ocr", pdf_path, temp_pdf]
+    
+    if not OCRMYPDF_PATH:
+        print(f"[Failed] 'ocrmypdf' executable not found.")
+        return None, None
+    command = [OCRMYPDF_PATH, "--force-ocr", pdf_path, temp_pdf]
     
     try:
         print(f"    [Exec] Running OCR...")
@@ -641,8 +720,11 @@ def generate_mobi_with_ebook_converter(input_path, output_path, **kwargs):
     """
     print(f"[*] Attempting (ebook-converter) MOBI generation...")
     
+    if not EBOOK_CONVERTER_PATH:
+        print(f"[Failed] 'ebook-converter' (custom fork) executable not found.")
+        return None, None
     command = [
-        "ebook-converter", 
+        EBOOK_CONVERTER_PATH, 
         input_path,
         output_path,
     ]
@@ -685,7 +767,9 @@ def generate_epub_with_ebooklib(input_path, input_type, output_path, **kwargs):
     print(f"[*] Attempting (ebooklib) EPUB generation...")
     try:
         book = epub.EpubBook()
-        book.set_title(os.path.basename(output_path).replace(".epub", ""))
+        book.set_title(kwargs.get('title', os.path.basename(output_path).replace(".epub", "")))
+        if kwargs.get('author'):
+            book.add_author(kwargs.get('author'))
         book.set_language("en")
 
         with open(input_path, "r", encoding="utf-8") as f:
@@ -718,11 +802,16 @@ def generate_with_pandoc(input_path, output_path, output_format="epub", **kwargs
     """Use pandoc for conversion - very versatile"""
     print(f"[*] Attempting (pandoc) {output_format.upper()} generation...")
     
-    command = ["pandoc", "-f", "html", "-t", output_format, "-o", output_path, input_path]
+    if not PANDOC_PATH:
+        print("[Failed] 'pandoc' executable not found.")
+        return None, None
+    command = [PANDOC_PATH, "-f", "html", "-t", output_format, "-o", output_path, input_path]
     
     # Add metadata if available
     if kwargs.get('title'):
         command.extend(["--metadata", f"title={kwargs['title']}"])
+    if kwargs.get('author'):
+        command.extend(["--metadata", f"author={kwargs['author']}"])
     
     try:
         print(f"    [Exec] {' '.join(shlex.quote(arg) for arg in command)}")
@@ -750,11 +839,13 @@ def generate_with_calibre_original(input_path, output_path, **kwargs):
     """Use original Calibre ebook-convert"""
     print(f"[*] Attempting (calibre ebook-convert) generation...")
     
-    command = ["ebook-convert", input_path, output_path]
+    if not CALIBRE_EBOOK_CONVERT:
+        print("[Failed] 'ebook-convert' executable not found.")
+        return None, None
+    command = [CALIBRE_EBOOK_CONVERT, input_path, output_path]
     
-    # Add useful Calibre options
-    if output_path.endswith('.mobi'):
-        command.extend(["--output-profile", "kindle"])
+    # if output_path.endswith('.mobi'):
+    #    command.extend(["--output-profile", "kindle"])
     
     try:
         print(f"    [Exec] {' '.join(shlex.quote(arg) for arg in command)}")
@@ -771,6 +862,54 @@ def generate_with_calibre_original(input_path, output_path, **kwargs):
         print(f"[Failed] calibre error: {e}")
         return None
 
+
+def set_ebook_metadata(ebook_path, title, author):
+    """
+    Uses Calibre's 'ebook-meta' tool to set metadata on the final file.
+    This is the most reliable method for MOBI files.
+    """
+    print(f"[*] Attempting (ebook-meta) to set final metadata...")
+    
+    if not CALIBRE_EBOOK_META:
+        print(f"[Warning] 'ebook-meta' executable not found. Skipping metadata set.")
+        return False # Return False instead of True
+    command = [CALIBRE_EBOOK_META]
+
+    if title:
+        command.extend(["--title", title])
+    if author:
+        command.extend(["--authors", author])
+        
+    # We only run if there's metadata to set
+    if not title and not author:
+        print("    [Info] No metadata to set.")
+        return False
+
+    # Ebook-meta modifies the file in-place
+    command.append(ebook_path)
+    
+    try:
+        print(f"    [Exec] {' '.join(shlex.quote(arg) for arg in command)}")
+        # Note: ebook-meta modifies the file in-place and doesn't write to stdout on success
+        result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8')
+        
+        if result.returncode == 0:
+            print("[Success] Metadata set with 'ebook-meta'.")
+            return True
+        else:
+            print(f"[Warning] 'ebook-meta' failed. Metadata may not be set.")
+            print("    --- ebook-meta stdout ---", result.stdout, "    --- end stdout ---", sep="\n")
+            print("    --- ebook-meta stderr ---", result.stderr, "    --- end stderr ---", sep="\n")
+            return False
+            
+    except FileNotFoundError:
+        print(f"[Warning] Calibre 'ebook-meta' tool not found. Skipping metadata set.")
+        print(f"    (This is part of the main Calibre installation)")
+        return False
+    except Exception as e:
+        print(f"[Warning] 'ebook-meta' error: {e}")
+        return False
+    
 # --- ENHANCED REGISTRIES ---
 
 EXTRACTORS = {
@@ -920,6 +1059,24 @@ def main():
 
     # Process PDF file
     pdf_file = os.path.abspath(args.pdf_file)
+
+    # --- Find all external tools robustly ---
+    global CALIBRE_PATH
+    CALIBRE_PATH = find_calibre_binary_dir()
+    
+    global PDFTOHTML_PATH, EBOOK_CONVERTER_PATH, OCRMYPDF_PATH
+    global CALIBRE_EBOOK_META, CALIBRE_EBOOK_CONVERT, PANDOC_PATH
+    
+    # Non-Calibre tools
+    PDFTOHTML_PATH = get_tool_path('pdftohtml', None)
+    EBOOK_CONVERTER_PATH = get_tool_path('ebook-converter', None) # User's fork
+    OCRMYPDF_PATH = get_tool_path('ocrmypdf', None)
+    PANDOC_PATH = get_tool_path('pandoc', None)
+    
+    # Calibre tools
+    CALIBRE_EBOOK_META = get_tool_path('ebook-meta', CALIBRE_PATH)
+    CALIBRE_EBOOK_CONVERT = get_tool_path('ebook-convert', CALIBRE_PATH)
+    # --- END TOOL FINDING ---
     
     if not os.path.exists(pdf_file) or not pdf_file.lower().endswith(".pdf"):
         print(f"Error: File not found or is not a PDF: '{pdf_file}'")
@@ -944,6 +1101,28 @@ def main():
     # Setup filenames
     base_name = os.path.splitext(pdf_file)[0]
     html_file = base_name + "_intermediate.html"
+
+    # METADATA PARSING
+    print("[Info] Parsing metadata from filename...")
+    title_to_parse = os.path.basename(base_name)
+    
+    ebook_title = title_to_parse # Default
+    ebook_author = None # Default
+    
+    if " - " in title_to_parse:
+        try:
+            parts = title_to_parse.split(" - ", 1)
+            ebook_author = parts[0].strip()
+            ebook_title = parts[1].strip()
+            print(f"    [Info] Found Author: {ebook_author}")
+            print(f"    [Info] Found Title:  {ebook_title}")
+        except Exception as e:
+            print(f"    [Warning] Failed to parse author/title: {e}")
+            ebook_author = None # Reset on failure
+            ebook_title = title_to_parse 
+    else:
+        print(f"    [Info] No ' - ' separator found. Using full name as title.")
+        print(f"    [Info] Found Title:  {ebook_title}")
     
     # Determine output file based on format
     output_extensions = {
@@ -999,9 +1178,23 @@ def main():
         generator_order = [args.generator]
     else:
         if args.output_format == "mobi":
+            # For MOBI, we really need ebook-meta.
+            # ebook_converter is first, calibre is fallback.
             generator_order = ["ebook_converter", "calibre"]
-        else:
+        
+        elif args.output_format == "epub":
+            # For EPUB, we can embed metadata natively
             generator_order = ["pandoc", "ebooklib", "calibre"]
+            
+            # *** NATIVE FALLBACK LOGIC ***
+            # If we can't set metadata externally (no pandoc/calibre-meta),
+            # then prioritize our "native" python 'ebooklib' generator.
+            if not PANDOC_PATH and not CALIBRE_EBOOK_META:
+                print("[Info] No external metadata tools found. Prioritizing native 'ebooklib'.")
+                generator_order = ["ebooklib", "pandoc", "calibre"]
+        else:
+            # For AZW3, etc.
+            generator_order = ["calibre", "pandoc"]
     
     print(f"[Info] Trying generators in order: {', '.join(generator_order)}")
     
@@ -1022,7 +1215,8 @@ def main():
                 input_path=extracted_file,
                 input_type=extracted_type,
                 output_path=output_file,
-                title=os.path.basename(base_name)
+                title=ebook_title,
+                author=ebook_author
             )
             
             if final_file:
@@ -1033,6 +1227,17 @@ def main():
         print("\n[FATAL] All ebook generation methods failed.")
         print(f"Intermediate HTML file kept at: '{extracted_file}'")
         sys.exit(1)
+
+    # --- Stage 2.5: Set Metadata ---
+    # We run this *after* generation, as it's the most reliable way
+    # to set metadata for MOBI/AZW3 files.
+    # The pandoc/ebooklib generators will have already *tried* for EPUB.
+
+    print(f"Found metadata: {ebook_author}, {ebook_title}")
+    
+    if final_file and (ebook_author or ebook_title):
+        print(f"Setting metadata: {ebook_author}, {ebook_title}")
+        set_ebook_metadata(final_file, ebook_title, ebook_author)
 
     # Stage 3: Cleanup
     if args.keep_intermediate:
