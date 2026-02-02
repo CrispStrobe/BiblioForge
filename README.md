@@ -46,7 +46,7 @@ pip install pymupdf pdfplumber pypdf pdfminer.six pytesseract pdf2image tqdm \
             python-pptx
 
 # LLM providers
-pip install ollama openai httpx groq cohere huggingface_hub
+pip install ollama openai httpx groq cohere huggingface_hub python-dotenv
 
 # Table extraction (optional but recommended)
 pip install "camelot-py[cv]"
@@ -140,7 +140,33 @@ python BiblioForge.py --sort --llm-provider=local_openai \
 
 #### Option D: Cloud LLM Providers
 
-Set the appropriate environment variable for your chosen provider:
+BiblioForge supports `.env` file for API key management. Create a `.env` file in your working directory:
+```bash
+# === EU-COMPLIANT PROVIDERS (GDPR) ===
+SCALEWAY_API_KEY=scw-xxxxx
+MISTRAL_API_KEY=xxxxx
+NEBIUS_API_KEY=xxxxx
+
+# === US PROVIDERS ===
+OPENROUTER_API_KEY=sk-or-v1-xxxxx
+POE_API_KEY=xxxxx
+GROQ_API_KEY=gsk_xxxxx
+OPENAI_API_KEY=sk-xxxxx
+COHERE_API_KEY=xxxxx
+HF_API_KEY=hf_xxxxx
+GLHF_API_KEY=xxxxx
+
+# === LOCAL SERVERS ===
+OLLAMA_HOST=http://localhost:11434
+LOCAL_OPENAI_BASE_URL=http://localhost:1234/v1
+```
+
+For this to work, you must have install **python-dotenv**:
+```bash
+pip install python-dotenv
+```
+
+Or you can set the appropriate environment variable for your chosen provider, e.g.:
 
 ```bash
 # For OpenAI (e.g., GPT-4, GPT-3.5-turbo)
@@ -270,7 +296,7 @@ python BiblioForge.py --debug --method=pdfminer --ocr-method=tesseract problemat
 | `--sort` | Enable LLM-based metadata extraction and sorting. | (False) |
 | `--rename-script` | Filename for the generated rename script (relative to `--output-dir`). | `rename_commands.sh` |
 | `--execute-rename` | Automatically execute the generated rename script after processing. | (False) |
-| `--llm-provider` | LLM provider: `ollama`, `groq`, `cohere`, `openai`, `glhf`, `huggingface`, `poe`, `local_openai`, `llama_cpp`. | `ollama` |
+| `--llm-provider` | LLM provider: `ollama`, `local_openai`, `llama_cpp`, `scaleway` 🇪🇺, `mistral` 🇪🇺, `nebius` 🇪🇺, `openrouter`, `poe`, `openai`, `groq`, `cohere`, `glhf`, `huggingface`. | `ollama` |
 | `--llm-model` | Specific model name for the chosen provider. | (Provider default) |
 | `--api-key` | API key for cloud-based providers (if not set as environment variable). | (None) |
 | `--temperature` | LLM temperature for metadata extraction (0.0-2.0). | `0.7` |

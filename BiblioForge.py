@@ -13,23 +13,40 @@ os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'
 
 # === LOAD .ENV FILE FOR API KEYS ===
 try:
-    from dotenv import load_dotenv
-    # Load from current directory or parent
-    env_loaded = load_dotenv(verbose=True)
-    if env_loaded:
+    from dotenv import load_dotenv, dotenv_values
+    import os
+    from pathlib import Path
+    
+    # Get current working directory (where user ran the command)
+    cwd_env = Path.cwd() / '.env'
+    
+    print(f"Loading .env from: {cwd_env}")
+    
+    if cwd_env.exists():
+        # First, read the file directly to see what's in it
+        env_vars = dotenv_values(cwd_env)
+        print(f"Found {len(env_vars)} variables in .env file:")
+        for key in env_vars.keys():
+            print(f"  - {key}")
+        
+        # Now actually load it with override=True
+        load_dotenv(cwd_env, override=True, verbose=True)
         print("✓ Loaded .env file for API keys")
+        
+        # Verify each key
+        print(f"\n=== DEBUG: Environment Variables ===")
+        for key in ['POE_API_KEY', 'OPENROUTER_API_KEY', 'MISTRAL_API_KEY', 'SCALEWAY_API_KEY']:
+            val = os.environ.get(key)
+            if val:
+                print(f"✓ {key}: {val[:10]}...{val[-4:] if len(val) > 14 else ''} (len={len(val)})")
+            else:
+                print(f"✗ {key}: NOT SET")
+        print(f"===================================\n")
     else:
-        # Try parent directory
-        parent_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
-        if os.path.exists(parent_env):
-            load_dotenv(parent_env, verbose=True)
-            print(f"✓ Loaded .env from parent: {parent_env}")
-        else:
-            print("⚠ No .env file found (API keys will use system environment)")
+        print(f"⚠ No .env file found at {cwd_env}")
+    
 except ImportError:
     print("⚠ python-dotenv not installed. Install with: pip install python-dotenv")
-    print("⚠ API keys will only be read from system environment variables")
-# ===================================
 
 import sys
 import logging

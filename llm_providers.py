@@ -72,6 +72,11 @@ DEFAULT_NEBIUS_MODEL = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"
 DEFAULT_SCALEWAY_MODEL = "llama-3.3-70b-instruct"
 #DEFAULT_OPENROUTER_MODEL = "anthropic/claude-3.5-sonnet"
 DEFAULT_OPENROUTER_MODEL = "arcee-ai/trinity-large-preview:free"
+DEFAULT_POE_MODEL = "claude-3.5-sonnet"
+DEFAULT_GROQ_MODEL = "llama3-70b-8192"
+DEFAULT_COHERE_MODEL = "command-r"
+DEFAULT_HUGGINGFACE_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
+DEFAULT_GLHF_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
 
 # Cache directory for LlamaCPP models
 LLAMACPP_MODELS_CACHE_DIR = Path.home() / ".cache" / "biblioforge_llamacpp_models" # Changed from "gguf"
@@ -929,16 +934,19 @@ def get_llm_provider(provider_type: str = "ollama",
     # Default model names for each provider type if not specified by user
     default_models = {
         "ollama": DEFAULT_OLLAMA_MODEL_NAME, 
-        "groq": "llama3-8b-8192", 
-        "openai": "gpt-3.5-turbo", 
-        # ... (ensure other defaults are here)
+        "groq": DEFAULT_GROQ_MODEL,
+        "openai": "gpt-3.5-turbo",
+        "cohere": DEFAULT_COHERE_MODEL,
+        "huggingface": DEFAULT_HUGGINGFACE_MODEL,
+        "glhf": DEFAULT_GLHF_MODEL,
         "local_openai": DEFAULT_LOCAL_OPENAI_MODEL,
         "llama_cpp": f"{kwargs.get('llamacpp_repo_id', DEFAULT_LLAMACPP_REPO_ID)}/"
-                     f"{kwargs.get('llamacpp_gguf_filename', DEFAULT_LLAMACPP_FILENAME)}",
+                    f"{kwargs.get('llamacpp_gguf_filename', DEFAULT_LLAMACPP_FILENAME)}",
         "mistral": DEFAULT_MISTRAL_MODEL,
         "nebius": DEFAULT_NEBIUS_MODEL,
         "scaleway": DEFAULT_SCALEWAY_MODEL,
         "openrouter": DEFAULT_OPENROUTER_MODEL,
+        "poe": DEFAULT_POE_MODEL
     }
     
     effective_model_name = model_name or default_models.get(provider_type_lower, "default_model_not_in_map")
