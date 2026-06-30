@@ -81,8 +81,8 @@ class DocumentProcessor:
                 formatted = f"{parts[0]} {parts[1]}"
                 return formatted if valid_author_name(formatted) else "UnknownAuthor"
 
-        # If it looks like "Firstname Lastname", use LLM to sort
-        if len(cleaned_name.split()) >= 2:
+        # If it looks like "Firstname Lastname" and we have an LLM, use it to sort.
+        if len(cleaned_name.split()) >= 2 and llm_provider_instance is not None:
             try:
                 # We extract only the parameters that sort_author_names expects
                 sorted_name = sort_author_names(
@@ -97,7 +97,20 @@ class DocumentProcessor:
             except Exception as e:
                 if self._debug:
                     logging.warning(f"LLM sort failed for '{cleaned_name}': {e}")
-        
+
+        # Heuristic fallback (no/failed LLM, e.g. the crispembed-ner backend):
+        # treat the trailing token as the surname and move it to the front
+        # ("MICHAEL BERTRAM CROWE" -> "Crowe Michael Bertram"), matching the
+        # "Lastname Firstname" folder convention. Title-case only fully upper/
+        # lower OCR tokens; leave mixed-case (McDonald, von) untouched.
+        parts = cleaned_name.split()
+        if len(parts) >= 2:
+            reordered = [parts[-1]] + parts[:-1]
+            normalized = ' '.join(w.title() if (w.isupper() or w.islower()) else w
+                                  for w in reordered)
+            if valid_author_name(normalized):
+                return normalized
+
         # If all else fails, return the cleaned name if it's valid, otherwise UnknownAuthor
         return cleaned_name if valid_author_name(cleaned_name) else "UnknownAuthor"
     

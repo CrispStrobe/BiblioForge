@@ -166,9 +166,11 @@ Cheaper, offline alternative (or pre-pass) to the LLM metadata step.
       **`cld3`** for LID, both of which download cleanly.
 - [x] Fixed gating: `crispembed-ner` skips LLM-provider init so a missing Ollama
       no longer disables sorting; `hybrid` tolerates LLM-init failure (NER-only).
+- [x] Author-name sorting without an LLM: heuristic last-name-first reorder +
+      case normalization in `sort_author_with_retries` (verified: folder
+      `Crowe Michael Bertram`).
 - [ ] (Later) `CrispKIE`/`CrispLiLT` for layout-aware structured fields; true
-      hybrid that seeds the LLM prompt with NER spans; author-name sorting without
-      an LLM (currently kept as-is when no provider).
+      hybrid that seeds the LLM prompt with NER spans.
 
 ## Phase 6 — Polish  (todo)
 
