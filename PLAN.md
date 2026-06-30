@@ -133,13 +133,18 @@ using a **single-pass** `CrispOcrModel.recognize(page)` — one forward pass per
 - [x] **Plumbing verified** end-to-end: `--ocr-method crispembed
       --crispembed-ocr-model parseq-tiny` ran CLI→config→`_init_ocr` (auto-download)
       →`extract_with_crispembed`→`recognize()` returning a `str`, exit 0, no crash.
-- [ ] **Full-model quality pending:** validate accuracy vs tesseract once a real
-      full-page model is local. Model notes: the smallest VLM `h2ovl-mississippi-800m`
-      is **auth-gated** (HF 401 — needs a token); non-gated options are `got-ocr2`
-      (apache, 750 MB) and `internvl2-1b` (600 MB), both too slow to complete on
-      the current ~20 MB/min link within a single download window (use SSD / faster
-      net, or resume across runs). `parseq-tiny` is line-level so its full-page
-      output is poor — a model-choice limitation, not an integration bug.
+- [ ] **Full-model quality: BLOCKED upstream (CrispEmbed issue #25).** Tried with
+      a real model now that `got-ocr2` (572 MB) finished downloading — but its
+      `recognize()` aborts: `GGML_ASSERT(ggml_can_repeat(b,a))` in
+      `got_ocr_recognize_raw` (a graph/shape bug, not Metal-specific). DBNet+TrOCR
+      aborts on Metal (`unsupported op 'CPY'`). `h2ovl-mississippi-800m` is
+      auth-gated (HF 401). So the BiblioForge integration is correct and
+      plumbing-verified, but the CrispEmbed OCR engines themselves crash in this
+      build — not a BiblioForge bug.
+- [ ] **Next:** once #25 is fixed (or a Metal-safe full-page model is identified —
+      e.g. try `internvl2-1b` with `--crispembed-ocr-cpu`, which has an explicit
+      FORCE_CPU path), validate accuracy vs tesseract. BiblioForge already has
+      working OCR, and this backend is opt-in, so nothing is regressed meanwhile.
 - [ ] **Architecture note (learned):** the small DBNet+TrOCR pipeline
       (`CrispOcrPipeline`) is a poor fit — it aborts on Metal (`unsupported op
       'CPY'` in DBNet) and is too slow per-region on CPU. Hence single-pass VLM
