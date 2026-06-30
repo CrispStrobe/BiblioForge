@@ -117,7 +117,7 @@ existing OCR engine. Improves every OCR method, adds no heavy deps.
   symlink with local fallback) before any download. *Upstream follow-up:* mkdir
   in `crispembed_mgr` before download.
 
-## Phase 4 — CrispEmbed as an OCR backend  🟡 CODE COMPLETE, validation pending
+## Phase 4 — CrispEmbed as an OCR backend  🟡 PLUMBING VERIFIED, full-model quality pending
 
 Torch-free alternative to the nanonets/docstrange VLM backends. Implemented as a
 new OCR method inside `PDFExtractor` (reuses rasterization + `_preprocess_ocr_image`),
@@ -130,9 +130,14 @@ using a **single-pass** `CrispOcrModel.recognize(page)` — one forward pass per
       `_init_ocr('crispembed')` (lazy load + download), opt-in availability
       (`_is_method_available` only True when configured + CrispEmbed present so it
       never joins the auto-fallback chain unasked).
-- [ ] **Validation pending:** blocked on slow download of a full-page OCR model
-      (`got-ocr2`, 750 MB + vision projector). Test recognize() on real pages and
-      compare vs tesseract once the model is local.
+- [x] **Plumbing verified** end-to-end: `--ocr-method crispembed
+      --crispembed-ocr-model parseq-tiny` ran CLI→config→`_init_ocr` (auto-download)
+      →`extract_with_crispembed`→`recognize()` returning a `str`, exit 0, no crash.
+- [ ] **Full-model quality pending:** a real single-pass full-page model
+      (`got-ocr2` 750 MB / `internvl2-1b` 600 MB) is too slow to fetch on the
+      current connection; validate accuracy vs tesseract once it's local (SSD /
+      faster net). `parseq-tiny` is line-level, so its full-page output is poor —
+      a model-choice limitation, not an integration bug.
 - [ ] **Architecture note (learned):** the small DBNet+TrOCR pipeline
       (`CrispOcrPipeline`) is a poor fit — it aborts on Metal (`unsupported op
       'CPY'` in DBNet) and is too slow per-region on CPU. Hence single-pass VLM
