@@ -203,12 +203,14 @@ def main():
     parser.add_argument('-o', '--output-dir', default='.', help="Base directory for outputs.")
     parser.add_argument('-m', '--method', default=None, help="Preferred primary extraction method.")
     parser.add_argument('--ocr-method', choices=['auto', 'tesseract', 'paddleocr', 'doctr', 'easyocr', 'kraken', 'kraken_cli', 'crispembed'], default='auto', help="Preferred OCR method.")
-    parser.add_argument('--crispembed-ocr-model', default='got-ocr2',
-                        help="CrispEmbed OCR model (registry name) when --ocr-method crispembed (default got-ocr2).")
+    parser.add_argument('--crispembed-ocr-model', default='internvl2-1b',
+                        help="CrispEmbed OCR model (registry name) when --ocr-method crispembed. "
+                             "EXPERIMENTAL: current models vary in quality (got-ocr2 aborts, internvl2-1b "
+                             "may repeat). Default internvl2-1b is the most stable. See CrispEmbed issue #25.")
     parser.add_argument('--crispembed-ocr-dpi', type=int, default=150,
                         help="Render DPI for CrispEmbed OCR (default 150).")
     parser.add_argument('--crispembed-ocr-cpu', action='store_true',
-                        help="Force CPU for CrispEmbed OCR (avoids ggml Metal unsupported-op aborts).")
+                        help="Force CPU for CrispEmbed OCR (recommended; avoids ggml Metal unsupported-op aborts).")
     parser.add_argument('--force-ocr', action='store_true', help="Force OCR processing.")
     parser.add_argument('--scan-cleanup', choices=['off', 'auto', 'on'], default='auto',
                         help="Pre-OCR scan cleanup (deskew/crop/whiten) via CrispEmbed, if available. "

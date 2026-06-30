@@ -191,7 +191,7 @@ _OCR_FORCE_CPU_ENVS = (
 )
 
 
-def get_ocr_model(model_name: str = "got-ocr2", force_cpu: bool = False):
+def get_ocr_model(model_name: str = "internvl2-1b", force_cpu: bool = False):
     """Resolve+load a single-pass OCR model. Returns a CrispOcrModel with a
     .recognize(image) -> str method (image may be a PIL Image / path / ndarray)."""
     if force_cpu:

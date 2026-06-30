@@ -141,10 +141,18 @@ using a **single-pass** `CrispOcrModel.recognize(page)` — one forward pass per
       auth-gated (HF 401). So the BiblioForge integration is correct and
       plumbing-verified, but the CrispEmbed OCR engines themselves crash in this
       build — not a BiblioForge bug.
-- [ ] **Next:** once #25 is fixed (or a Metal-safe full-page model is identified —
-      e.g. try `internvl2-1b` with `--crispembed-ocr-cpu`, which has an explicit
-      FORCE_CPU path), validate accuracy vs tesseract. BiblioForge already has
-      working OCR, and this backend is opt-in, so nothing is regressed meanwhile.
+- [x] Tried `internvl2-1b` + `--crispembed-ocr-cpu`: **runs without crashing**
+      (12.9 s/page) but the output degenerates into repetition loops (greedy
+      decode w/o repetition penalty — reported on #25). Quality is worse than
+      tesseract on the test page.
+- [x] **Safety fix:** default `--crispembed-ocr-model` changed `got-ocr2` →
+      `internvl2-1b` because got-ocr2's abort is a SIGABRT that kills the whole
+      BiblioForge process mid-run (uncatchable in Python); internvl2-1b degrades
+      gracefully instead. Backend marked **experimental** in README/help.
+- [ ] **Conclusion:** integration is correct and plumbing-verified, but no
+      currently-available CrispEmbed OCR model gives production-quality full-page
+      results in this build. Revisit when #25 is fixed. BiblioForge's built-in OCR
+      remains the reliable path; this backend is opt-in, so nothing is regressed.
 - [ ] **Architecture note (learned):** the small DBNet+TrOCR pipeline
       (`CrispOcrPipeline`) is a poor fit — it aborts on Metal (`unsupported op
       'CPY'` in DBNet) and is too slow per-region on CPU. Hence single-pass VLM

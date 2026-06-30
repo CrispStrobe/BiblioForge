@@ -222,7 +222,7 @@ BiblioForge behaves exactly as before.
 |------|--------------|
 | `--scan-cleanup {off,auto,on}` | Deskew / crop / whiten each page image before OCR (default `auto`; classical, no model). `--scan-cleanup-binarize {off,otsu,sauvola}` adds binarization. |
 | `--sr {off,auto,on}` | Super-resolve low-resolution pages before OCR. `--sr-engine` (pan/swinir/…), `--sr-min-width`. Default `off`. |
-| `--ocr-method crispembed` | Use a single-pass CrispEmbed VLM as the OCR engine. `--crispembed-ocr-model` (default `got-ocr2`), `--crispembed-ocr-dpi`, `--crispembed-ocr-cpu`. |
+| `--ocr-method crispembed` | **Experimental.** Single-pass CrispEmbed VLM OCR. `--crispembed-ocr-model` (default `internvl2-1b`), `--crispembed-ocr-dpi`, `--crispembed-ocr-cpu` (recommended). Current models vary in quality (see CrispEmbed issue #25); BiblioForge's built-in OCR (tesseract/…) is the reliable default. |
 | `--metadata-backend {llm,crispembed-ner,hybrid}` | Metadata source for `--sort`. `crispembed-ner` extracts author/title/year/language **locally** (GLiNER + language ID — no LLM, no network); `hybrid` tries NER first then falls back to the LLM. |
 
 ```bash
