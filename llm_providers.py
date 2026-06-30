@@ -80,9 +80,49 @@ DEFAULT_GLHF_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
 
 LLM_TIMEOUT = 60 # 1 Minute
 
-# Cache directory for LlamaCPP models
-LLAMACPP_MODELS_CACHE_DIR = Path.home() / ".cache" / "biblioforge_llamacpp_models" # Changed from "gguf"
-LLAMACPP_MODELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# Cache directory for LlamaCPP models.
+# The preferred location may be a symlink to an external/backup volume
+# (e.g. /Volumes/backups/ai/...). That works when the SSD is plugged in,
+# but is a *broken* symlink when it isn't — and plain mkdir(exist_ok=True)
+# raises FileExistsError on a broken symlink. We try a list of candidates in
+# priority order and use the first one we can actually create/write into, so
+# the external volume is used when available and we fall back gracefully when not.
+def _ensure_cache_dir(candidates):
+    """Return the first usable cache dir from `candidates`, creating it if needed."""
+    for cand in candidates:
+        cand = Path(cand)
+        try:
+            if cand.is_symlink():
+                # Resolve the link manually: os.mkdir won't create *through* a
+                # symlink whose target doesn't exist yet, even if the volume is
+                # mounted. Only usable if the target's parent (mount point) exists.
+                link_target = Path(os.readlink(cand))
+                if not link_target.is_absolute():
+                    link_target = (cand.parent / link_target).resolve()
+                if not link_target.parent.exists():
+                    raise FileNotFoundError(
+                        f"symlink target unavailable (volume not mounted?): {link_target}")
+                link_target.mkdir(parents=True, exist_ok=True)
+            else:
+                cand.mkdir(parents=True, exist_ok=True)
+            # Verify we can actually write into it.
+            probe = cand / ".biblioforge_write_test"
+            probe.touch()
+            probe.unlink()
+            return cand
+        except (FileExistsError, OSError) as e:
+            print(f"⚠ Model cache dir unavailable: {cand} ({e})")
+            continue
+    # Last-resort: a temp dir (should essentially never be reached).
+    import tempfile
+    fallback = Path(tempfile.gettempdir()) / "biblioforge_llamacpp_models"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+LLAMACPP_MODELS_CACHE_DIR = _ensure_cache_dir([
+    Path.home() / ".cache" / "biblioforge_llamacpp_models",        # preferred (may be a symlink to external SSD)
+    Path.home() / ".cache" / "biblioforge_llamacpp_models_local",  # local fallback when external volume is absent
+])
 
 class LLMProvider:
     """Base class for LLM providers."""

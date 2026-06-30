@@ -202,8 +202,27 @@ def main():
     parser.add_argument('files', nargs='*', help="Input files or patterns to process.")
     parser.add_argument('-o', '--output-dir', default='.', help="Base directory for outputs.")
     parser.add_argument('-m', '--method', default=None, help="Preferred primary extraction method.")
-    parser.add_argument('--ocr-method', choices=['auto', 'tesseract', 'paddleocr', 'doctr', 'easyocr', 'kraken', 'kraken_cli'], default='auto', help="Preferred OCR method.")
+    parser.add_argument('--ocr-method', choices=['auto', 'tesseract', 'paddleocr', 'doctr', 'easyocr', 'kraken', 'kraken_cli', 'crispembed'], default='auto', help="Preferred OCR method.")
+    parser.add_argument('--crispembed-ocr-model', default='got-ocr2',
+                        help="CrispEmbed OCR model (registry name) when --ocr-method crispembed (default got-ocr2).")
+    parser.add_argument('--crispembed-ocr-dpi', type=int, default=150,
+                        help="Render DPI for CrispEmbed OCR (default 150).")
+    parser.add_argument('--crispembed-ocr-cpu', action='store_true',
+                        help="Force CPU for CrispEmbed OCR (avoids ggml Metal unsupported-op aborts).")
     parser.add_argument('--force-ocr', action='store_true', help="Force OCR processing.")
+    parser.add_argument('--scan-cleanup', choices=['off', 'auto', 'on'], default='auto',
+                        help="Pre-OCR scan cleanup (deskew/crop/whiten) via CrispEmbed, if available. "
+                             "'auto'/'on' clean page images before OCR; 'off' disables. No-op without CrispEmbed.")
+    parser.add_argument('--scan-cleanup-binarize', choices=['off', 'otsu', 'sauvola'], default='off',
+                        help="Adaptive binarization during scan cleanup (default off).")
+    parser.add_argument('--sr', choices=['off', 'auto', 'on'], default='off',
+                        help="Pre-OCR super-resolution for low-resolution pages via CrispEmbed. "
+                             "'auto' upscales only pages narrower than --sr-min-width; 'on' upscales "
+                             "any page below the safety cap. No-op without CrispEmbed. Default off.")
+    parser.add_argument('--sr-engine', choices=['pan', 'swinir', 'hat', 'esrgan', 'safmn'], default='swinir',
+                        help="Super-resolution engine (default swinir).")
+    parser.add_argument('--sr-min-width', type=int, default=1500,
+                        help="In --sr auto mode, upscale pages narrower than this many pixels (default 1500).")
     parser.add_argument('-r', '--recursive', action='store_true', help="Process files recursively.")
     parser.add_argument('-p', '--password', default=None, help="Password for encrypted documents.")
     parser.add_argument('-t', '--tables', action='store_true', help="Attempt to extract tables.")
@@ -214,6 +233,9 @@ def main():
     
     # Sorting arguments
     parser.add_argument('--sort', action='store_true', help="Enable LLM-based metadata extraction and sorting.")
+    parser.add_argument('--metadata-backend', choices=['llm', 'crispembed-ner', 'hybrid'], default='llm',
+                        help="Metadata source when sorting: 'llm' (default), 'crispembed-ner' (local "
+                             "GLiNER + language ID, no LLM/network), or 'hybrid' (NER first, LLM fallback).")
     parser.add_argument('--rename-script', default="rename_commands.sh", help="Filename for the generated rename script.")
     parser.add_argument('--execute-rename', action='store_true', help="Automatically execute the rename script.")
     parser.add_argument('--reset', action='store_true', help="Force creation of fresh rename script.")
@@ -576,7 +598,42 @@ def main():
     }
     llm_config_kwargs_to_pass = {k: v for k, v in llm_config_kwargs.items() if v is not None}
     llm_config_kwargs_to_pass['sort_arg_from_main'] = args.sort
-    
+
+    # Pre-OCR scan cleanup (CrispEmbed). None = disabled; otherwise a dict the
+    # PDF extractor uses to clean each page image before OCR. No-op if CrispEmbed
+    # isn't installed (see crispembed_adapter / PLAN.md Phase 2).
+    scan_cleanup_config = None
+    if args.scan_cleanup != 'off':
+        _binarize_method = {'off': None, 'otsu': 0, 'sauvola': 1}[args.scan_cleanup_binarize]
+        scan_cleanup_config = {
+            'mode': args.scan_cleanup,
+            'params': {
+                'deskew': True,
+                'crop_borders': True,
+                'whiten_background': True,
+                'binarize': _binarize_method is not None,
+                'binarize_method': _binarize_method or 0,
+            },
+        }
+
+    # Optional pre-OCR super-resolution (CrispEmbed). None = disabled.
+    super_resolution_config = None
+    if args.sr != 'off':
+        super_resolution_config = {
+            'mode': args.sr,
+            'engine': args.sr_engine,
+            'min_width': args.sr_min_width,
+        }
+
+    # Optional CrispEmbed single-pass OCR backend (only when explicitly selected).
+    crispembed_ocr_config = None
+    if args.ocr_method == 'crispembed':
+        crispembed_ocr_config = {
+            'model': args.crispembed_ocr_model,
+            'dpi': args.crispembed_ocr_dpi,
+            'force_cpu': args.crispembed_ocr_cpu,
+        }
+
     if args.verbose > 1:
         logging.debug(f"LLM config kwargs: {llm_config_kwargs_to_pass}")
     
@@ -603,7 +660,11 @@ def main():
             nanonets_config=nanonets_config,
             docstrange_config=docstrange_config,
             llama_mtmd_config=llama_mtmd_config,
-            mlx_vlm_config=mlx_vlm_config, 
+            mlx_vlm_config=mlx_vlm_config,
+            scan_cleanup_config=scan_cleanup_config,
+            super_resolution_config=super_resolution_config,
+            crispembed_ocr_config=crispembed_ocr_config,
+            metadata_backend=args.metadata_backend,
             **llm_config_kwargs_to_pass
         )
         
@@ -698,4 +759,19 @@ def main():
         logging.info("BiblioForge processing finished")
 
 if __name__ == '__main__':
-    sys.exit(main())
+    _exit_code = main()
+    # If a CrispEmbed native engine was loaded, bypass C++ static-destructor
+    # teardown with os._exit: ggml's Metal backend can abort at exit (a known
+    # torch-MPS + ggml-Metal interaction) even though all work succeeded. Output
+    # files, JSON, and rename scripts are already written by the time main()
+    # returns, so this is safe; we just flush first.
+    try:
+        import crispembed_adapter as _ca
+        if _ca.native_engine_loaded():
+            logging.shutdown()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(_exit_code if isinstance(_exit_code, int) else 0)
+    except Exception:
+        pass
+    sys.exit(_exit_code)

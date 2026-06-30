@@ -134,10 +134,11 @@ class PDFExtractor:
         'paddleocr',    # multilingual
         'doctr',        # Deep learning OCR 
         'kraken_cli',   # Kraken CLI method
-        'kraken'        # Kraken API method (lower priority)
+        'kraken',       # Kraken API method (lower priority)
+        'crispembed'    # CrispEmbed single-pass VLM OCR (opt-in; needs a model)
     ]
     CORE_METHODS = ['pymupdf', 'calibre', 'pdfplumber', 'pypdf', 'pdfminer']
-    OCR_METHODS = ['tesseract', 'easyocr', 'paddleocr', 'doctr', 'kraken', 'kraken_cli']
+    OCR_METHODS = ['tesseract', 'easyocr', 'paddleocr', 'doctr', 'kraken', 'kraken_cli', 'crispembed']
     
     # TABLE_METHODS = ['camelot'] # TableExtractor handles this
 
@@ -149,7 +150,23 @@ class PDFExtractor:
         self._current_doc = None 
         self._ocr_initialized: Dict[str, bool] = {} 
         self._available_methods: Optional[Dict[str, bool]] = None
-        self._ocr_failed_methods = set() 
+        self._ocr_failed_methods = set()
+
+        # Optional pre-OCR scan cleanup (CrispEmbed). Configured via set_scan_cleanup().
+        self._scan_cleanup_config = None
+        self._scan_cleaner = None          # cached CrispScanCleanup instance
+        self._scan_cleaner_failed = False  # True once we've given up loading it
+        self._scan_cleanup_logged = False  # log activation only once
+
+        # Optional pre-OCR super-resolution (CrispEmbed). Configured via set_super_resolution().
+        self._sr_config = None
+        self._super_resolver = None
+        self._sr_failed = False
+        self._sr_logged = False
+
+        # Optional CrispEmbed single-pass OCR backend. Configured via set_crispembed_ocr().
+        self._crispembed_ocr_config = None
+        self._crispembed_ocr = None
 
         self._setup_windows_paths() 
 
@@ -337,6 +354,17 @@ class PDFExtractor:
         # OCR methods (need _init_ocr to fully check/load models)
         if method in self.OCR_METHODS:
             # Basic check for now, _init_ocr will do the full initialization
+            if method == 'crispembed':
+                # Opt-in only: available when explicitly configured AND CrispEmbed loads.
+                is_avail = False
+                if self._crispembed_ocr_config:
+                    try:
+                        import crispembed_adapter as ca
+                        is_avail = ca.is_available()
+                    except Exception:
+                        is_avail = False
+                if is_avail: self._initialized_methods.add('crispembed')
+                return is_avail
             if method == 'tesseract':
                 is_avail = (self.get_binary_path('tesseract') is not None and
                             self._import_cache.is_available('pytesseract') and
@@ -701,6 +729,17 @@ class PDFExtractor:
                     success = True # Assume success if imports work, model loading is deferred
             elif method == 'kraken_cli':
                 success = shutil.which('kraken') is not None
+            elif method == 'crispembed':
+                if self._crispembed_ocr is not None:
+                    success = True
+                else:
+                    cfg = self._crispembed_ocr_config or {}
+                    import crispembed_adapter as ca
+                    if ca.is_available():
+                        model_name = cfg.get('model', 'got-ocr2')
+                        logging.info(f"Loading CrispEmbed OCR model '{model_name}' (first use may download)...")
+                        self._crispembed_ocr = ca.get_ocr_model(model_name, force_cpu=cfg.get('force_cpu', False))
+                        success = self._crispembed_ocr is not None
 
             if success:
                 self._ocr_initialized[method] = True
@@ -910,6 +949,176 @@ class PDFExtractor:
     # These will be similar to their existing implementations but using self._safe_import, etc.
     # For brevity, I'll show Tesseract and a placeholder for others.
 
+    # --- Optional pre-OCR scan cleanup (CrispEmbed) ---
+
+    def set_scan_cleanup(self, config: Optional[Dict]) -> None:
+        """Configure pre-OCR scan cleanup. `config` is None (disabled) or a dict
+        with 'mode' ('off'/'auto'/'on') and 'params' for CrispScanCleanup.process."""
+        if config and config.get('mode', 'off') != 'off':
+            self._scan_cleanup_config = config
+        else:
+            self._scan_cleanup_config = None
+
+    def _get_scan_cleaner(self):
+        """Lazily create and cache the CrispEmbed scan-cleanup engine.
+        Returns None (once, quietly) if CrispEmbed isn't available."""
+        if self._scan_cleaner is not None:
+            return self._scan_cleaner
+        if self._scan_cleaner_failed:
+            return None
+        try:
+            import crispembed_adapter as ca
+            if not ca.is_available():
+                if self._debug:
+                    logging.debug(f"Scan cleanup unavailable: {ca.unavailable_reason()}")
+                self._scan_cleaner_failed = True
+                return None
+            self._scan_cleaner = ca.get_scan_cleanup()
+            return self._scan_cleaner
+        except Exception as e:
+            if self._debug:
+                logging.debug(f"Scan cleanup init failed: {e}")
+            self._scan_cleaner_failed = True
+            return None
+
+    def _apply_scan_cleanup(self, pil_image):
+        """Return a cleaned copy of `pil_image` when scan cleanup is enabled and
+        CrispEmbed is available; otherwise return the original image unchanged.
+        Never raises — OCR must proceed even if cleanup fails."""
+        cfg = self._scan_cleanup_config
+        if not cfg:
+            return pil_image
+        cleaner = self._get_scan_cleaner()
+        if cleaner is None:
+            return pil_image
+        try:
+            from PIL import Image
+            out = cleaner.process(pil_image, **cfg.get('params', {}))  # numpy HxWx3 uint8
+            cleaned = Image.fromarray(out)
+            if not self._scan_cleanup_logged:
+                logging.info(f"Pre-OCR scan cleanup active (mode={cfg.get('mode')}).")
+                self._scan_cleanup_logged = True
+            return cleaned
+        except Exception as e:
+            if self._debug:
+                logging.debug(f"Scan cleanup skipped for a page (error): {e}")
+            return pil_image
+
+    def set_super_resolution(self, config: Optional[Dict]) -> None:
+        """Configure optional pre-OCR super-resolution. `config` is None (disabled)
+        or a dict with 'mode' ('off'/'auto'/'on'), 'engine', 'min_width' (auto
+        trigger), 'max_input_width' (safety cap to avoid upscaling huge pages)."""
+        if config and config.get('mode', 'off') != 'off':
+            self._sr_config = config
+        else:
+            self._sr_config = None
+
+    def _get_super_resolver(self):
+        if self._super_resolver is not None:
+            return self._super_resolver
+        if self._sr_failed:
+            return None
+        try:
+            import crispembed_adapter as ca
+            if not ca.is_available():
+                self._sr_failed = True
+                return None
+            engine = (self._sr_config or {}).get('engine', 'swinir')
+            self._super_resolver = ca.get_super_resolver(engine)
+            return self._super_resolver
+        except Exception as e:
+            if self._debug:
+                logging.debug(f"Super-resolution init failed: {e}")
+            self._sr_failed = True
+            return None
+
+    def _apply_super_resolution(self, pil_image):
+        """Upscale low-resolution pages before OCR when enabled. Returns the
+        original image when disabled, not triggered, or on any error."""
+        cfg = self._sr_config
+        if not cfg:
+            return pil_image
+        w = pil_image.size[0]
+        mode = cfg.get('mode', 'off')
+        min_width = cfg.get('min_width', 1500)
+        max_input_width = cfg.get('max_input_width', 2500)
+        # 'on' upscales any page below the safety cap; 'auto' only small pages.
+        if mode == 'auto' and w >= min_width:
+            return pil_image
+        if w > max_input_width:
+            # Page already large; upscaling would be slow/huge and pointless.
+            return pil_image
+        sr = self._get_super_resolver()
+        if sr is None:
+            return pil_image
+        try:
+            out = sr.upscale(pil_image)
+            if not self._sr_logged:
+                logging.info(f"Pre-OCR super-resolution active (engine={cfg.get('engine','swinir')}).")
+                self._sr_logged = True
+            return out
+        except Exception as e:
+            if self._debug:
+                logging.debug(f"Super-resolution skipped for a page (error): {e}")
+            return pil_image
+
+    def _preprocess_ocr_image(self, pil_image):
+        """Optional pre-OCR pipeline: super-resolution (low-res pages) then scan
+        cleanup (deskew/crop/whiten). Both are no-ops unless configured + available."""
+        pil_image = self._apply_super_resolution(pil_image)
+        pil_image = self._apply_scan_cleanup(pil_image)
+        return pil_image
+
+    def set_crispembed_ocr(self, config: Optional[Dict]) -> None:
+        """Configure the CrispEmbed OCR backend. `config` is None (disabled) or a
+        dict with 'model' (registry name, default 'got-ocr2'), 'dpi' (render DPI,
+        default 150), 'force_cpu' (avoid Metal unsupported-op aborts)."""
+        self._crispembed_ocr_config = config or None
+        # Force re-evaluation of method availability now that config changed.
+        self._available_methods = None
+
+    def extract_with_crispembed(self, pdf_path: str, progress_callback=None) -> str:
+        """OCR each page with a single-pass CrispEmbed model (e.g. got-ocr2).
+        Reuses the optional pre-OCR preprocessing pipeline."""
+        if not self._init_ocr('crispembed') or self._crispembed_ocr is None:
+            return ""
+        pdf2image_module = self._safe_import('pdf2image')
+        if not pdf2image_module:
+            return ""
+        cfg = self._crispembed_ocr_config or {}
+        dpi = int(cfg.get('dpi', 150))
+        text_parts = []
+        images = None
+        poppler_path_dir = self._get_poppler_path()
+        try:
+            conversion_args = {'dpi': dpi, 'thread_count': 1, 'userpw': self._password,
+                               'poppler_path': poppler_path_dir}
+            conversion_args = {k: v for k, v in conversion_args.items() if v is not None}
+            images = pdf2image_module.convert_from_path(pdf_path, timeout=120, **conversion_args)
+            for i, image in enumerate(images):
+                if shutdown_flag.is_set(): break
+                try:
+                    image = self._preprocess_ocr_image(image)
+                    page_text = self._crispembed_ocr.recognize(image)
+                    if page_text and page_text.strip():
+                        text_parts.append(page_text.strip())
+                except Exception as page_e:
+                    if self._debug: logging.debug(f"CrispEmbed OCR page {i+1} failed: {page_e}")
+                finally:
+                    try: image.close()
+                    except Exception: pass
+                if progress_callback: progress_callback(1)
+            return "\n\n".join(text_parts)
+        except Exception as e:
+            if self._debug: logging.error(f"CrispEmbed OCR extraction for {pdf_path} failed: {e}")
+            self._ocr_failed_methods.add('crispembed')
+            return ""
+        finally:
+            if images:
+                for img in images:
+                    try: img.close()
+                    except Exception: pass
+
     def extract_with_tesseract(self, pdf_path: str, progress_callback=None) -> str:
         if not self._init_ocr('tesseract'): return "" # Ensures self._pytesseract and self._pdf2image are set
         
@@ -931,8 +1140,8 @@ class PDFExtractor:
             for i, image in enumerate(images):
                 if shutdown_flag.is_set(): break
                 try:
-                    # Preprocess image for better OCR
-                    # processed_image = self._preprocess_image(image) # Optional: Implement robust preprocessing
+                    # Optional pre-OCR scan cleanup (deskew/crop/whiten) via CrispEmbed.
+                    image = self._preprocess_ocr_image(image)
                     text = pytesseract.image_to_string(image, lang='eng') # Add more langs if needed
                     if text.strip(): text_parts.append(text.strip())
                 except Exception as page_e:
@@ -1004,6 +1213,7 @@ class PDFExtractor:
             for image in images:
                 if shutdown_flag.is_set(): break
                 try:
+                    image = self._preprocess_ocr_image(image)
                     img_array = np_module.array(image)
                     results = self._easyocr_reader.readtext(img_array, detail=0, paragraph=True)
                     if results: text_parts.append("\n".join(results))
@@ -1048,6 +1258,7 @@ class PDFExtractor:
             for i, image in enumerate(images):
                 if shutdown_flag.is_set(): break
                 try:
+                    image = self._preprocess_ocr_image(image)
                     img_buffer = io_module.BytesIO()
                     image.save(img_buffer, format="JPEG")
                     img_buffer.seek(0)
@@ -1103,6 +1314,7 @@ class PDFExtractor:
             for i, image in enumerate(images):
                 if shutdown_flag.is_set(): break
                 try:
+                    image = self._preprocess_ocr_image(image)
                     img_array = np_module.array(image)
                     result_doc = self._doctr_predictor([img_array]) # Pass as a list
                     page_text = result_doc.render() # render() gives a single string
@@ -1236,6 +1448,7 @@ class PDFExtractor:
             for i, pil_image in enumerate(images):
                 if shutdown_flag.is_set(): break
                 try:
+                    pil_image = self._preprocess_ocr_image(pil_image)
                     bw_im = kraken_binarization.nlbin(pil_image)
                     seg = kraken_pageseg.segment(bw_im)
                     if seg and hasattr(seg, 'lines') and seg.lines:

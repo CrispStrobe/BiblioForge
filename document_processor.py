@@ -226,6 +226,64 @@ class DocumentProcessor:
                           exc_info=self._debug)
             return None
 
+    def extract_metadata_with_crispembed_ner(self, text: str,
+                                             ner_model: str = "gliner-deberta-q4k",
+                                             lid_model: str = "cld3") -> Optional[Dict[str, str]]:
+        """Extract {title, author, year, language} locally with CrispEmbed's
+        zero-shot NER (GLiNER) + language ID. No LLM/network call. Returns None
+        if CrispEmbed is unavailable or nothing useful is found.
+
+        Bibliographic info clusters at the document start, so we run NER over the
+        leading text (title-page region) rather than the whole document."""
+        if not text or not text.strip():
+            return None
+        try:
+            import crispembed_adapter as ca
+            if not ca.is_available():
+                if self._debug:
+                    logging.debug(f"CrispEmbed NER unavailable: {ca.unavailable_reason()}")
+                return None
+
+            head = text[:3000]  # title-page region
+            result: Dict[str, str] = {'title': '', 'author': '', 'year': '', 'language': ''}
+
+            # Language identification (best-effort).
+            try:
+                lang, conf = ca.get_lid(lid_model).predict(text[:1500])
+                if lang and conf >= 0.5:
+                    result['language'] = lang
+            except Exception as e:
+                if self._debug: logging.debug(f"LID failed: {e}")
+
+            # Zero-shot NER for bibliographic fields.
+            labels = ["author", "book title", "publication year", "publisher"]
+            entities = ca.get_ner(ner_model).extract(head, labels, threshold=0.4)
+
+            def _best(label):
+                cands = [e for e in entities if e.get('label') == label and e.get('text', '').strip()]
+                if not cands:
+                    return ''
+                # Collapse OCR whitespace/newlines into single spaces.
+                return ' '.join(max(cands, key=lambda e: e.get('score', 0))['text'].split())
+
+            result['author'] = _best("author")
+            result['title'] = _best("book title")
+            year_raw = _best("publication year")
+            # Fall back to a 4-digit year in the head if NER missed it.
+            if not year_raw:
+                m = re.search(r'\b(1[5-9]\d{2}|20\d{2})\b', head)
+                year_raw = m.group(1) if m else ''
+            result['year'] = validate_and_fix_year(year_raw) or ''
+
+            if not result['title'] and not result['author']:
+                if self._debug:
+                    logging.debug("CrispEmbed NER found neither title nor author.")
+                return None
+            return result
+        except Exception as e:
+            logging.error(f"extract_metadata_with_crispembed_ner failed: {e}", exc_info=self._debug)
+            return None
+
     def _extract_pdf_metadata(self, file_path: str) -> Dict[str, Any]:
         metadata = {}
         if PdfReader is None:
@@ -649,8 +707,23 @@ class DocumentProcessor:
                     logging.error(f"DS_Proc: {result['error']}", exc_info=debug)
                     result['success'] = False
 
+            # --- 4b. LOCAL NER METADATA (CrispEmbed, no LLM/network) ---
+            metadata_backend = kwargs_from_main.get('metadata_backend', 'llm')
+            if (effective_sort_flag and not final_parsed_llm_meta and result['success']
+                    and result['text'] and metadata_backend in ('crispembed-ner', 'hybrid')):
+                if debug: logging.debug(f"DS_Proc: Trying CrispEmbed NER metadata (backend={metadata_backend}).")
+                ner_meta = self.extract_metadata_with_crispembed_ner(result["text"])
+                if ner_meta:
+                    # Sort the author like the LLM path (direct parse; LLM only if available).
+                    if ner_meta.get('author'):
+                        ner_meta['author'] = self.sort_author_with_retries(
+                            ner_meta['author'], llm_provider_instance, input_file, **kwargs_from_main)
+                    final_parsed_llm_meta = ner_meta
+
             # --- 5. GENERIC LLM METADATA (FALLBACK) ---
-            if effective_sort_flag and not final_parsed_llm_meta and result['success'] and result['text']:
+            # 'crispembed-ner' is NER-only (no LLM fallback); 'hybrid' and 'llm' fall back to the LLM.
+            if (effective_sort_flag and not final_parsed_llm_meta and result['success']
+                    and result['text'] and metadata_backend != 'crispembed-ner'):
                 if llm_provider_instance:
                     if debug: logging.debug("DS_Proc: Falling back to generic LLM metadata extraction from text.")
                     final_parsed_llm_meta = self.process_llm_metadata_with_retries(
@@ -748,11 +821,17 @@ class DocumentProcessor:
 
         llm_provider_instance: Optional[LLMProvider] = None
         effective_sort_flag = sort
+        metadata_backend = kwargs.get('metadata_backend', 'llm')
 
-        if effective_sort_flag:
+        # The local NER backend needs no LLM. Skip provider init entirely so a
+        # missing/unreachable Ollama doesn't disable sorting.
+        if effective_sort_flag and metadata_backend == 'crispembed-ner':
+            if self._debug:
+                logging.debug("process_files: metadata_backend=crispembed-ner — skipping LLM provider init.")
+        elif effective_sort_flag:
             if isinstance(llm_provider_arg, LLMProvider):
                 llm_provider_instance = llm_provider_arg
-                if self._debug: 
+                if self._debug:
                     logging.debug("process_files: Using pre-passed LLMProvider instance.")
             elif isinstance(llm_provider_arg, str) or llm_provider_arg is None:
                 provider_name_str = llm_provider_arg if isinstance(llm_provider_arg, str) else "ollama"
@@ -781,8 +860,13 @@ class DocumentProcessor:
                         logging.debug(f"process_files: LLM provider initialized successfully.")
 
                 except Exception as e:
-                    logging.error(f"Failed to initialize LLM provider '{provider_name_str}' for sorting: {e}. Sorting will be disabled.", exc_info=self._debug)
-                    effective_sort_flag = False 
+                    if metadata_backend == 'hybrid':
+                        # NER runs first and can satisfy metadata without the LLM.
+                        logging.warning(f"LLM provider '{provider_name_str}' unavailable ({e}); "
+                                        f"hybrid backend will rely on CrispEmbed NER only.")
+                    else:
+                        logging.error(f"Failed to initialize LLM provider '{provider_name_str}' for sorting: {e}. Sorting will be disabled.", exc_info=self._debug)
+                        effective_sort_flag = False
             else: 
                 logging.warning(f"Invalid llm_provider_arg type '{type(llm_provider_arg)}' for process_files. Disabling sorting.")
                 effective_sort_flag = False
