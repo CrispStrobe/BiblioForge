@@ -133,11 +133,13 @@ using a **single-pass** `CrispOcrModel.recognize(page)` — one forward pass per
 - [x] **Plumbing verified** end-to-end: `--ocr-method crispembed
       --crispembed-ocr-model parseq-tiny` ran CLI→config→`_init_ocr` (auto-download)
       →`extract_with_crispembed`→`recognize()` returning a `str`, exit 0, no crash.
-- [ ] **Full-model quality pending:** a real single-pass full-page model
-      (`got-ocr2` 750 MB / `internvl2-1b` 600 MB) is too slow to fetch on the
-      current connection; validate accuracy vs tesseract once it's local (SSD /
-      faster net). `parseq-tiny` is line-level, so its full-page output is poor —
-      a model-choice limitation, not an integration bug.
+- [ ] **Full-model quality pending:** validate accuracy vs tesseract once a real
+      full-page model is local. Model notes: the smallest VLM `h2ovl-mississippi-800m`
+      is **auth-gated** (HF 401 — needs a token); non-gated options are `got-ocr2`
+      (apache, 750 MB) and `internvl2-1b` (600 MB), both too slow to complete on
+      the current ~20 MB/min link within a single download window (use SSD / faster
+      net, or resume across runs). `parseq-tiny` is line-level so its full-page
+      output is poor — a model-choice limitation, not an integration bug.
 - [ ] **Architecture note (learned):** the small DBNet+TrOCR pipeline
       (`CrispOcrPipeline`) is a poor fit — it aborts on Metal (`unsupported op
       'CPY'` in DBNet) and is too slow per-region on CPU. Hence single-pass VLM
@@ -157,6 +159,7 @@ Cheaper, offline alternative (or pre-pass) to the LLM metadata step.
       regex fallback; author run through `sort_author_with_retries`).
 - [x] Wired into the sort flow: `crispembed-ner` = NER only; `hybrid` = NER then
       LLM fallback; `llm` = unchanged. Soft-fails to None when CrispEmbed absent.
+      Verified `hybrid` with Ollama down: NER runs, LLM step skipped, exit 0.
 - [x] **Verified** on `changingprofileo0000crow_1.txt`: produced author=`MICHAEL
       BERTRAM CROWE`, year=`1977`, language=`en`, title extracted; full `--sort
       --metadata-backend crispembed-ner` CLI run generated the correct rename
