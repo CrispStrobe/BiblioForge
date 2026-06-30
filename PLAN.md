@@ -204,6 +204,55 @@ Cheaper, offline alternative (or pre-pass) to the LLM metadata step.
 
 ---
 
+## Open items & pending work (consolidated)
+
+Single reference for everything outstanding. Tagged **[CE]** = lives in the
+CrispEmbed repo, **[BF]** = BiblioForge, **[ops]** = repo/release. Nothing here
+is a regression — shipped features (scan cleanup, local NER metadata, merged
+CrispEmbed fixes) all work; these are forward improvements.
+
+### High value / actionable now
+1. **[CE] got-ocr2 output correctness (issue #25).** Loads + runs end-to-end (two
+   crashes fixed in #27) but emits garbage; vision encoder (SAM neck/projector/
+   image-splice) was never validated. Use the per-layer reference diff
+   (`tools/dump_got_ocr_reference.py` + `tests/test_got_ocr_diff.cpp`, keys
+   `vis_layer_N`/`vis_proj_output`/`llm_layer_N`). Standalone handover prompt exists.
+2. **[BF] Render scanned PDFs at native DPI.** BiblioForge rasterizes at a fixed
+   300 DPI, so `--sr` super-resolution almost never triggers (pages always exceed
+   the cap) and the OCR backend over-renders. Detect embedded image DPI (CrispEmbed
+   `pdf_info`) and render at native res, then SR-upscale. Unblocks Phases 3 and 4's
+   real payoff.
+
+### Quick wins
+3. **[CE] Add `GOT_OCR_FORCE_CPU` env** (~5 lines; other engines have one). Lets
+   got-ocr2 run on CPU — also a debugging lever for item 1 (A/B Metal vs CPU).
+4. **[ops] Merge `modularized` → `main`.** The whole integration (~34 commits)
+   lives on `modularized`; BiblioForge's default `main` has none of it yet.
+
+### Medium (deeper / upstream)
+5. **[CE] DBNet detector on Metal** — `unsupported op 'CPY'` abort; only
+   `OCR_DETECT_FORCE_CPU=1` works around it, but per-region TrOCR on CPU is slow.
+   Needs a Metal CPY path or a CPU-default detector. (Handover prompt available.)
+6. **[CE] ggml Metal device-teardown abort** at process exit (alongside torch
+   MPS). Worked around downstream via `os._exit`; a real upstream fix is unsolved.
+7. **[CE] CI install-bundle parity for Android/iOS** — the self-contained artifact
+   fix (#23) only covered the desktop matrix (linux/macos/windows).
+8. **[BF] Scan-cleanup `auto` heuristic** — `auto` currently behaves like `on` in
+   the OCR path; add detection to skip already-clean pages; tune crop thresholds.
+
+### Lower urgency / nice-to-have
+9. **[BF] Richer metadata** — `CrispKIE`/`CrispLiLT` for layout-aware fields; a
+   *true* hybrid that seeds the LLM prompt with NER spans (needs Ollama to validate).
+10. **[BF] Optional CrispEmbed extras** — `CrispLayout` (route tables/formulas to
+    special handling), image restoration (NAFNet/Restormer) for degraded scans.
+11. **[BF] OCR backend quality** — gated on item 1; the CrispEmbed OCR backend
+    stays experimental until a Metal-safe high-accuracy model works. tesseract
+    remains the reliable default.
+12. **[CE] Reframe `got_ocr — DONE`** note in CrispEmbed/PLAN.md: it means perf,
+    not output correctness — keep until item 1 is resolved.
+
+---
+
 ## Conventions / notes
 
 - All CrispEmbed use goes through `crispembed_adapter.py` — no direct `_binding`
