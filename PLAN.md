@@ -117,7 +117,7 @@ existing OCR engine. Improves every OCR method, adds no heavy deps.
   symlink with local fallback) before any download. *Upstream follow-up:* mkdir
   in `crispembed_mgr` before download.
 
-## Phase 4 — CrispEmbed as an OCR backend  🟡 PLUMBING VERIFIED, full-model quality pending
+## Phase 4 — CrispEmbed as an OCR backend  🟡 WORKING (internvl2), got-ocr2 correctness pending
 
 Torch-free alternative to the nanonets/docstrange VLM backends. Implemented as a
 new OCR method inside `PDFExtractor` (reuses rasterization + `_preprocess_ocr_image`),
@@ -133,26 +133,25 @@ using a **single-pass** `CrispOcrModel.recognize(page)` — one forward pass per
 - [x] **Plumbing verified** end-to-end: `--ocr-method crispembed
       --crispembed-ocr-model parseq-tiny` ran CLI→config→`_init_ocr` (auto-download)
       →`extract_with_crispembed`→`recognize()` returning a `str`, exit 0, no crash.
-- [ ] **Full-model quality: BLOCKED upstream (CrispEmbed issue #25).** Tried with
-      a real model now that `got-ocr2` (572 MB) finished downloading — but its
-      `recognize()` aborts: `GGML_ASSERT(ggml_can_repeat(b,a))` in
-      `got_ocr_recognize_raw` (a graph/shape bug, not Metal-specific). DBNet+TrOCR
-      aborts on Metal (`unsupported op 'CPY'`). `h2ovl-mississippi-800m` is
-      auth-gated (HF 401). So the BiblioForge integration is correct and
-      plumbing-verified, but the CrispEmbed OCR engines themselves crash in this
-      build — not a BiblioForge bug.
-- [x] Tried `internvl2-1b` + `--crispembed-ocr-cpu`: **runs without crashing**
-      (12.9 s/page) but the output degenerates into repetition loops (greedy
-      decode w/o repetition penalty — reported on #25). Quality is worse than
-      tesseract on the test page.
-- [x] **Safety fix:** default `--crispembed-ocr-model` changed `got-ocr2` →
-      `internvl2-1b` because got-ocr2's abort is a SIGABRT that kills the whole
-      BiblioForge process mid-run (uncatchable in Python); internvl2-1b degrades
-      gracefully instead. Backend marked **experimental** in README/help.
-- [ ] **Conclusion:** integration is correct and plumbing-verified, but no
-      currently-available CrispEmbed OCR model gives production-quality full-page
-      results in this build. Revisit when #25 is fixed. BiblioForge's built-in OCR
-      remains the reliable path; this backend is opt-in, so nothing is regressed.
+- [x] **Upstream OCR-engine bugs (CrispEmbed #25) investigated & fixed:**
+  - **internvl2 / qwen2vl repetition → FIXED** (CrispEmbed PR #26, merged): greedy
+    decode had no repetition control and looped; added `no_repeat_ngram`=3
+    blocking. internvl2-1b now returns real, varied text instead of loops.
+  - **got-ocr2 two crashes → FIXED** (CrispEmbed PR #27, merged): reversed
+    LayerNorm2d permute (`ggml_can_repeat` assert) and a q8_0 conv-weight reshape
+    that broke Metal CPY block alignment. got-ocr2 now runs end-to-end, **but its
+    output is still garbage** — the vision encoder was never functional and needs
+    reference-activation validation (open follow-up on #25).
+  - **DBNet+TrOCR Metal `CPY`**: still a ggml Metal op gap; not used by default.
+  - `h2ovl-mississippi-800m` is auth-gated (HF 401) — avoid.
+- [x] **Safety fix:** default `--crispembed-ocr-model` is `internvl2-1b` (not the
+      crash-prone `got-ocr2`, whose SIGABRT is uncatchable and would kill the whole
+      run). Backend marked **experimental** in README/help.
+- [x] **Current state:** with PR #26 merged, `--ocr-method crispembed` (default
+      internvl2-1b) produces usable text and no longer loops/crashes. Quality is
+      still below tesseract on clean scans, so BiblioForge's built-in OCR stays the
+      default reliable path; the CrispEmbed backend is opt-in. got-ocr2 quality and
+      a Metal-safe high-accuracy model remain the open items.
 - [ ] **Architecture note (learned):** the small DBNet+TrOCR pipeline
       (`CrispOcrPipeline`) is a poor fit — it aborts on Metal (`unsupported op
       'CPY'` in DBNet) and is too slow per-region on CPU. Hence single-pass VLM
@@ -188,23 +187,20 @@ Cheaper, offline alternative (or pre-pass) to the LLM metadata step.
 - [ ] (Later) `CrispKIE`/`CrispLiLT` for layout-aware structured fields; true
       hybrid that seeds the LLM prompt with NER spans.
 
-## Phase 6 — Polish  (todo)
-
-- [ ] Optional layout detection (`CrispLayout`) to route tables/formulas.
-- [ ] Optional image restoration (NAFNet/Restormer) for degraded scans.
-- [ ] README: enabling CrispEmbed, the GGUF cache + external-SSD convention,
-      `--scan-cleanup` / `--metadata-backend` usage.
-- [ ] Upstream CrispEmbed fixes: cache-dir mkdir before download; Metal device
-      teardown abort; Android/iOS install-bundle parity.
-
 ## Phase 6 — Polish
 
-- [ ] Optional: layout detection (`CrispLayout`, 17 classes) to segment pages /
-      route tables & formulas to specialized handling.
-- [ ] Optional: image restoration (NAFNet/Restormer) for degraded scans.
-- [ ] Docs: README section on enabling CrispEmbed; note the GGUF model cache and
-      the external-SSD symlink convention.
-- [ ] Ensure all new backends remain fully optional (no import → graceful skip).
+- [x] README: "CrispEmbed Acceleration (Optional)" section — setup, the GGUF
+      cache + external-SSD convention, and all new flags (`--scan-cleanup`,
+      `--sr`, `--ocr-method crispembed`, `--metadata-backend`).
+- [x] All backends fully optional (no import → graceful skip) — verified by the
+      clean default-path regression run.
+- [x] Upstream CrispEmbed fixes landed: CI self-contained artifacts (#23),
+      cache-dir mkdir before download (#24), VLM-OCR no-repeat-ngram (#26),
+      got-ocr2 graph crashes (#27).
+- [ ] Optional: layout detection (`CrispLayout`, 17 classes) to route
+      tables/formulas; image restoration (NAFNet/Restormer) for degraded scans.
+- [ ] Upstream follow-ups still open: got-ocr2 vision-encoder correctness (#25),
+      ggml Metal device-teardown abort, Android/iOS install-bundle parity.
 
 ---
 
