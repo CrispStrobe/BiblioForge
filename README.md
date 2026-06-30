@@ -190,6 +190,55 @@ export POE_API_KEY="your-poe-api-key"
 
 On Windows, use `set` or `setx` in Command Prompt, or `$Env:VAR_NAME = "value"` in PowerShell.
 
+## CrispEmbed Acceleration (Optional)
+
+BiblioForge can optionally use the sibling [CrispEmbed](https://github.com/CrispStrobe/CrispEmbed)
+engine — a self-contained C++/ggml document-understanding library (no PyTorch/
+transformers) — for pre-OCR image cleanup, super-resolution, a torch-free OCR
+backend, and fully-local metadata extraction. **Everything is optional**: if
+CrispEmbed isn't present, all of these features are silently no-ops and
+BiblioForge behaves exactly as before.
+
+### Setup
+
+1. Clone and build CrispEmbed as a sibling directory (`../CrispEmbed`):
+   ```bash
+   git clone https://github.com/CrispStrobe/CrispEmbed
+   cd CrispEmbed
+   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCRISPEMBED_BUILD_SHARED=ON \
+         -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON   # macOS; omit Metal flags elsewhere
+   cmake --build build -j8
+   ```
+   BiblioForge auto-discovers `../CrispEmbed/python` + `build/libcrispembed.dylib`.
+   Override the location with `CRISPEMBED_PYTHON_DIR` if your layout differs.
+
+2. Models are GGUF files auto-downloaded on first use into `~/.cache/crispembed`
+   (override with `CRISPEMBED_CACHE_DIR`; a symlink to an external volume with a
+   local fallback is supported).
+
+### Features & flags
+
+| Flag | What it does |
+|------|--------------|
+| `--scan-cleanup {off,auto,on}` | Deskew / crop / whiten each page image before OCR (default `auto`; classical, no model). `--scan-cleanup-binarize {off,otsu,sauvola}` adds binarization. |
+| `--sr {off,auto,on}` | Super-resolve low-resolution pages before OCR. `--sr-engine` (pan/swinir/…), `--sr-min-width`. Default `off`. |
+| `--ocr-method crispembed` | Use a single-pass CrispEmbed VLM as the OCR engine. `--crispembed-ocr-model` (default `got-ocr2`), `--crispembed-ocr-dpi`, `--crispembed-ocr-cpu`. |
+| `--metadata-backend {llm,crispembed-ner,hybrid}` | Metadata source for `--sort`. `crispembed-ner` extracts author/title/year/language **locally** (GLiNER + language ID — no LLM, no network); `hybrid` tries NER first then falls back to the LLM. |
+
+```bash
+# Local, no-LLM sorting: extract metadata with on-device NER and build the rename script
+python BiblioForge.py *.pdf --sort --metadata-backend crispembed-ner
+
+# Improve OCR on skewed/noisy scans
+python BiblioForge.py scan.pdf --force-ocr --scan-cleanup on
+```
+
+> **Note (macOS/Metal):** ggml's Metal backend can abort during process-exit
+> teardown when loaded alongside PyTorch's MPS. BiblioForge works around this by
+> calling `os._exit()` after all work completes when a CrispEmbed Metal engine
+> was used; output is fully written before exit. Use `--crispembed-ocr-cpu` if a
+> specific model hits an unsupported Metal op.
+
 ## Usage Examples
 
 ```bash

@@ -451,6 +451,14 @@ class ExtractionManager:
                     'force_ocr': force_ocr,
                     'extract_tables': extract_tables
                 })
+                # Optional pre-OCR scan cleanup / super-resolution via CrispEmbed
+                # (no-ops if unavailable).
+                if hasattr(extractor, 'set_scan_cleanup'):
+                    extractor.set_scan_cleanup(kwargs.get('scan_cleanup_config'))
+                if hasattr(extractor, 'set_super_resolution'):
+                    extractor.set_super_resolution(kwargs.get('super_resolution_config'))
+                if hasattr(extractor, 'set_crispembed_ocr'):
+                    extractor.set_crispembed_ocr(kwargs.get('crispembed_ocr_config'))
             
             # For Nanonets/DocStrange/LlamaMtmd, pass additional params
             from extractors import NanonetsOCR2Extractor, DocStrangeExtractor, LlamaMtmdVLExtractor  # FIXED: Added LlamaMtmdVLExtractor
